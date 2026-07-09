@@ -169,6 +169,37 @@ class Editor:
                 if e.mesh is not None or e.light is not None
                 or e.environment is not None]
 
+    def _copy_entity_state(self, src, dst) -> None:
+        """Carry per-entity edited state from src onto a freshly instantiated dst.
+
+        Duplication (Ctrl+D) re-instantiates the asset from scratch, so anything
+        tuned afterwards in the Details panel (light overrides) or the material
+        editor (node graph) has to be copied over explicitly. This is the one
+        place that happens, so future per-entity state has a single home.
+        """
+        dst.visible = src.visible
+        dst.casts_shadow = src.casts_shadow
+        dst.collidable = src.collidable
+
+        if src.light is not None and dst.light is not None:
+            # a Flicker overwrites intensity every frame; its captured base is
+            # the value the user actually tuned (see engine.assets._entity_dict)
+            flicker_base = None
+            for b in src.behaviors:
+                if isinstance(b, self.engine_mod.behaviors.Flicker) \
+                        and hasattr(b, "base"):
+                    flicker_base = b.base
+            for key in self.engine_mod.assets._LIGHT_PROPS:
+                if hasattr(src.light, key) and hasattr(dst.light, key):
+                    setattr(dst.light, key, getattr(src.light, key))
+            if flicker_base is not None and hasattr(dst.light, "intensity"):
+                dst.light.intensity = flicker_base
+
+        if src.material is not None and dst.mesh is not None:
+            dst.material = self.engine_mod.MaterialGraph.from_dict(
+                src.material.to_dict())
+            dst.material.apply(dst.mesh)
+
     # ---- transform gizmo: G cycles translate / rotate / scale ----
     _GIZMO_AXES = (((1.0, 0.0, 0.0), (225, 85, 85)),
                    ((0.0, 1.0, 0.0), (105, 215, 105)),
@@ -491,6 +522,7 @@ class Editor:
                                               s.position.z + 0.8)
             t.rotation = self.engine_mod.Vec3(s.rotation.x, s.rotation.y, s.rotation.z)
             t.scale = self.engine_mod.Vec3(s.scale.x, s.scale.y, s.scale.z)
+            self._copy_entity_state(src, dup)
             self.scene.add(dup)
             self.selected = dup
             self.dirty = True
