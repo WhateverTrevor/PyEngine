@@ -54,6 +54,7 @@ class Entity:
         self.light_offset = Vec3()       # light position in local space
         self.casts_shadow = True         # participates as a shadow occluder
         self.collidable = True           # blocks the player (see FlyController)
+        self.environment = None          # Environment (HDRI sky + ambient) carrier
         self.asset_name: str | None = None  # set when spawned from an asset file
 
     def add_behavior(self, behavior: Behavior) -> "Entity":

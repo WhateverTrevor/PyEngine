@@ -76,7 +76,7 @@ def _intersect_nearest(origin, direction, v0, e1, e2) -> float | None:
 def _world_triangles(entity):
     m = entity.transform.matrix()
     wv = entity.mesh.vertices @ m[:3, :3].T + m[:3, 3]
-    tri = wv[entity.mesh.faces]
+    tri = wv[entity.mesh.tri_faces]
     return tri[:, 0], tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
 
 

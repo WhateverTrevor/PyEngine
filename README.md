@@ -22,7 +22,9 @@ py demo.py       # bright playground demo
 | Input | Action |
 |---|---|
 | **RMB (hold)** | mouse look + WASD/Space/Ctrl fly, Shift = fast |
-| **LMB** | select in viewport/outliner; drag assets from the content browser into the world; drag sliders in the Details panel |
+| **LMB** | select in viewport/outliner; drag assets from the content browser into the world; drag the transform gizmo; drag sliders in the Details panel |
+| **, / .** | rotate selection 15° around Y |
+| **- / =** | scale selection down / up 10% |
 | **Z** | focus camera on selection |
 | **Ctrl+D / Del** | duplicate / delete selection |
 | **Ctrl+S** | save scene (`scenes/scene.json`) |
@@ -30,6 +32,12 @@ py demo.py       # bright playground demo
 | **C** | toggle player collision (on by default — walls block you) |
 | **F1 / F2** | wireframe / switch per-pixel <-> flat lighting |
 | **H / Esc** | HUD / quit |
+
+Selecting an entity shows a **transform gizmo** — drag the red/green/blue
+axis arrows to move it along world X/Y/Z. The **+ Import FBX** button in the
+content browser opens a file picker and converts a binary FBX model into a
+regular asset (geometry only; saved to `assets/models/`, appears in the
+browser immediately).
 
 Select any light (viewport or outliner) and the **Details panel** exposes it:
 brightness, RGB color, throw (range), shadow softness, spotlight cone inner
@@ -43,22 +51,46 @@ cursor is free (demo uses LMB *or* RMB; the editor reserves LMB for selection).
 
 ```
 engine/
-  math3d.py     Vec3 + 4x4 matrix builders
-  mesh.py       Mesh + primitives: cube, box, cylinder, icosphere, torus, checkerboard
-  camera.py     perspective camera, world<->screen projection, mouse picking rays
-  lighting.py   DirectionalLight, PointLight, SpotLight, Fog
-  raytrace.py   ray-traced soft shadows + scene picking (Moller-Trumbore, vectorized)
-  scene.py      Scene / Entity / Transform / Behavior (component system)
-  behaviors.py  Spin, Bob, Orbit, Flicker, FlyController, FlashlightController
-  input.py      per-frame keyboard/mouse state, hold-to-capture mouse
-  renderer.py   software renderer: multi-light color accumulation + painter's sort
-  core.py       Engine: window, fixed-timestep loop, HUD, overlay hook, benchmarks
-  assets.py     self-contained JSON assets + scene save/load
-editor.py       world outliner, content browser, drag-drop placement
-assets/*.json   the asset library (drag these into the world)
-scenes/         saved scenes
-demo.py         bright playground demo
+  math3d.py       Vec3 + 4x4 matrix builders
+  mesh.py         quad/tri polygon meshes + primitives (box, cylinder, cone, ...)
+  camera.py       perspective camera, world<->screen projection, picking rays
+  lighting.py     DirectionalLight, PointLight, SpotLight, IES profiles, Fog
+  environment.py  Radiance .hdr (RGBE) I/O + HDRI sky sampling & ambient cube
+  fbx.py          minimal binary FBX parser -> engine assets
+  raytrace.py     ray-traced soft shadows + scene picking (Moller-Trumbore)
+  scene.py        Scene / Entity / Transform / Behavior (component system)
+  behaviors.py    Spin, Bob, Orbit, Flicker, FlyController (+collision), ...
+  input.py        per-frame keyboard/mouse state, hold-to-capture mouse
+  renderer.py     deferred per-pixel + flat shading paths, painter's sort
+  core.py         Engine: window, splash, fixed-timestep loop, HUD, benchmarks
+  assets.py       self-contained JSON assets + scene save/load
+editor.py         outliner, content browser, details panel, gizmo, FBX import
+assets/*.json     the asset library (drag these into the world)
+assets/hdri/      HDR environment maps (.hdr Radiance files)
+assets/models/    imported model geometry (.npz)
+scenes/           saved scenes
+demo.py           bright playground demo
 ```
+
+### Quad meshes
+
+Faces are polygons — quads where the shape allows (box sides, floor squares,
+cylinder walls, torus), triangles elsewhere. Per-face lighting shades each
+quad as one clean panel with no diagonal seam, and face counts drop by
+nearly half. Quads are triangulated internally only for the ray tracer.
+
+### HDRI environment (Sky Sphere)
+
+Drag the **Sky Sphere** asset into a scene and the renderer switches to
+image-based sky and ambient: sky pixels sample the equirectangular HDR map
+along their camera rays (stars, moon glow), and diffuse environment light
+comes from an ambient cube — the HDRI convolved to six cosine-weighted axis
+colors at load, evaluated per face normal, so upward faces catch bluish
+moonlight while undersides stay dark. `engine/environment.py` reads real
+Radiance `.hdr` files (RLE and flat): drop your own HDRI into `assets/hdri/`,
+point an asset's `"environment": {"hdri": ...}` at it, done. The bundled
+`night_sky.hdr` is procedurally generated (see the repo history) with true
+HDR values — the moon is ~5x brighter than white.
 
 ### Per-pixel deferred lighting
 
@@ -143,10 +175,10 @@ updates behaviors on a fixed 60 Hz timestep, decoupled from render rate.
 Known trade-off: painter's sorting is per-face, so interpenetrating geometry
 can occasionally sort wrong — the classic software-rendering compromise.
 
-Measured on this machine at 1440x810: the starter horror scene (6
-shadow-casting lights, flashlight on) runs ~28-33 FPS with per-pixel
-lighting at 1/4 internal resolution, ~38-45 FPS in flat mode; the bright
-demo scene ~53 FPS at 1280x720.
+Measured on this machine at 1440x810: the starter horror scene (HDRI sky, 6
+shadow-casting lights, flashlight on) runs ~27-32 FPS with per-pixel
+lighting at 1/4 internal resolution; the bright demo scene ~68 FPS at
+1280x720 since the quad-mesh switch.
 
 ## Extending it
 

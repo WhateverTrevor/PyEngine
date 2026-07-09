@@ -177,12 +177,21 @@ class Renderer:
                 "depth": depth, "fast_idx": fast_idx, "fast_pts": fast_pts,
                 "clipped": clipped}
 
-    def _directional_base(self, scene, normals):
+    @staticmethod
+    def _scene_environment(scene):
+        for e in scene.entities:
+            if e.environment is not None and e.visible:
+                return e.environment
+        return None
+
+    def _directional_base(self, scene, normals, env=None):
         dl = scene.light
         dl_dir = dl.direction.to_array()
         to_light = -dl_dir / max(np.linalg.norm(dl_dir), 1e-12)
         dl_color = np.asarray(dl.color, dtype=np.float64) / 255.0 * dl.intensity
         lambert = np.clip(normals @ to_light, 0.0, 1.0)
+        if env is not None:  # image-based ambient from the HDRI environment
+            return env.ambient(normals) + dl_color[None, :] * lambert[:, None]
         return dl.ambient + dl_color[None, :] * ((1.0 - dl.ambient) * lambert)[:, None]
 
     # ------------------------------------------------------------------
@@ -198,6 +207,7 @@ class Renderer:
         fog = scene.fog
         fog_color = np.asarray(fog.color, dtype=np.float64) if fog else None
 
+        env = self._scene_environment(scene)
         polys = []
         for entity in scene.entities:
             if entity.mesh is None or not entity.visible:
@@ -208,7 +218,7 @@ class Renderer:
                 continue
             normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
 
-            lum = self._directional_base(scene, normals)
+            lum = self._directional_base(scene, normals, env)
             for info in lights:
                 strength = _face_light_strength(info, normals, centroids)
                 active = strength > 1e-3
@@ -280,6 +290,7 @@ class Renderer:
         lights = _gather_lights(scene)
         self.stats["shadow_lights"] = sum(1 for l in lights if l.light.cast_shadows)
         fog = scene.fog
+        env = self._scene_environment(scene)
 
         # --- collect geometry + per-face attributes across all entities ---
         f_normals, f_centroids, f_albedo, f_base = [], [], [], []
@@ -298,7 +309,7 @@ class Renderer:
             f_normals.append(normals)
             f_centroids.append(centroids)
             f_albedo.append(entity.mesh.face_colors)
-            f_base.append(self._directional_base(scene, normals))
+            f_base.append(self._directional_base(scene, normals, env))
             for li, info in enumerate(lights):
                 if tracer is not None and info.light.cast_shadows:
                     strength = _face_light_strength(info, normals, centroids)
@@ -340,7 +351,27 @@ class Renderer:
         img = pygame.surfarray.array3d(small).astype(np.int32)
         ids = ((img[..., 0] << 16) | (img[..., 1] << 8) | img[..., 2]).reshape(-1)
         vis = np.flatnonzero(ids > 0)
-        frame = cache["sky"].copy()  # uint8 (rw, rh, 3)
+
+        # camera rays (rotated grid cached per view angle)
+        dirs_key = (camera.yaw, camera.pitch)
+        if cache.get("dirs_key") != dirs_key:
+            rot = (rotation_y(camera.yaw) @ rotation_x(camera.pitch))[:3, :3]
+            cache["dirs"] = (cache["grid"].reshape(-1, 3)
+                             @ rot.T.astype(np.float32))
+            cache["dirs_key"] = dirs_key
+
+        if env is not None:  # sky pixels sample the HDRI along their rays
+            frame = np.empty((rw * rh, 3), dtype=np.uint8)
+            sky_idx = np.flatnonzero(ids == 0)
+            if len(sky_idx):
+                d = cache["dirs"][sky_idx]
+                d = d / np.linalg.norm(d, axis=1, keepdims=True)
+                frame[sky_idx] = np.clip(env.sample(d) * 255.0, 0, 255
+                                         ).astype(np.uint8)
+            frame = frame.reshape(rw, rh, 3)
+        else:
+            frame = cache["sky"].copy()  # uint8 (rw, rh, 3)
+
         if len(vis) == 0:
             pygame.surfarray.blit_array(small, frame)
             pygame.transform.scale(small, (w, h), surface)
@@ -350,14 +381,6 @@ class Renderer:
         n = normals[fid]                       # (V, 3)
         p0 = centroids[fid]
         cam = camera.position.to_array().astype(np.float32)
-
-        # camera rays for visible pixels (rotated grid cached per view angle)
-        dirs_key = (camera.yaw, camera.pitch)
-        if cache.get("dirs_key") != dirs_key:
-            rot = (rotation_y(camera.yaw) @ rotation_x(camera.pitch))[:3, :3]
-            cache["dirs"] = (cache["grid"].reshape(-1, 3)
-                             @ rot.T.astype(np.float32))
-            cache["dirs_key"] = dirs_key
         dirs = cache["dirs"][vis]
 
         denom = np.einsum("ij,ij->i", dirs, n)

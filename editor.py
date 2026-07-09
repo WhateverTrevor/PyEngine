@@ -58,6 +58,7 @@ def build_starter_scene(engine, lib):
         e.transform.rotation.y = ry
         return scene.add(e)
 
+    put("Sky Sphere", 0, 0)
     put("Stone Floor", 0, 0)
     for x in (-4.0, 0.0, 4.0):
         put("Wall Segment", x, -8.0)
@@ -86,6 +87,13 @@ def make_icon(engine, asset, size=ICON):
     entity = asset.instantiate()
     surf = pygame.Surface((size, size))
     surf.fill((29, 31, 37))
+    if entity.environment is not None:  # panorama thumbnail, exposure-boosted
+        img = entity.environment.image
+        step = max(1, img.shape[0] // size)
+        small = np.clip(img[::step, ::step] * 255.0 * 6.0, 0, 255).astype(np.uint8)
+        pano = pygame.surfarray.make_surface(np.transpose(small, (1, 0, 2)))
+        pygame.transform.smoothscale(pano, (size, size), surf)
+        return surf
     if entity.mesh is not None:
         mini = engine.Scene(
             light=engine.DirectionalLight(engine.Vec3(-0.5, -0.9, -0.6), ambient=0.42),
@@ -121,6 +129,8 @@ class Editor:
         self.browser_scroll = 0
         self.drag_asset = None
         self.active_slider = None   # index into _details_rows while dragging
+        self.gizmo_drag = None      # {"axis", "start", "press", "dpx", "length"}
+        self.status = ("", 0.0)     # transient message near the content browser
         self.save_flash = 0.0
         self.font = pygame.font.SysFont("consolas,couriernew,monospace", 14)
         self.font_small = pygame.font.SysFont("consolas,couriernew,monospace", 12)
@@ -152,12 +162,87 @@ class Editor:
 
     def _outliner_rows(self):
         return [e for e in self.scene.entities
-                if e.mesh is not None or e.light is not None]
+                if e.mesh is not None or e.light is not None
+                or e.environment is not None]
+
+    # ---- transform gizmo (world-axis translation arrows) ----
+    _GIZMO_AXES = (((1.0, 0.0, 0.0), (225, 85, 85)),
+                   ((0.0, 1.0, 0.0), (105, 215, 105)),
+                   ((0.0, 0.0, 1.0), (95, 145, 250)))
+
+    def _gizmo_handles(self, w, h):
+        """Screen-space axis segments for the selection: [(axis, s0, s1, color)]."""
+        e = self.selected
+        if e is None:
+            return []
+        Vec3 = self.engine_mod.Vec3
+        p = e.transform.position
+        cam = self.camera
+        dist = (p - cam.position).length()
+        length = max(0.6, dist * 0.14)
+        s0 = cam.project(p, w, h)
+        if s0 is None:
+            return []
+        handles = []
+        for axis, color in self._GIZMO_AXES:
+            tip = Vec3(p.x + axis[0] * length, p.y + axis[1] * length,
+                       p.z + axis[2] * length)
+            s1 = cam.project(tip, w, h)
+            if s1 is not None:
+                handles.append((axis, (s0[0], s0[1]), (s1[0], s1[1]),
+                                color, length))
+        return handles
+
+    @staticmethod
+    def _segment_distance(p, a, b):
+        import math as m
+        ax, ay = b[0] - a[0], b[1] - a[1]
+        seg2 = ax * ax + ay * ay
+        if seg2 < 1e-9:
+            return m.hypot(p[0] - a[0], p[1] - a[1])
+        t = max(0.0, min(1.0, ((p[0] - a[0]) * ax + (p[1] - a[1]) * ay) / seg2))
+        return m.hypot(p[0] - (a[0] + ax * t), p[1] - (a[1] + ay * t))
+
+    def _try_grab_gizmo(self, mp, w, h) -> bool:
+        best = None
+        for axis, s0, s1, _color, length in self._gizmo_handles(w, h):
+            d = self._segment_distance(mp, s0, s1)
+            if d < 9.0 and (best is None or d < best[0]):
+                best = (d, axis, s0, s1, length)
+        if best is None:
+            return False
+        _d, axis, s0, s1, length = best
+        p = self.selected.transform.position
+        self.gizmo_drag = {"axis": axis, "start": (p.x, p.y, p.z), "press": mp,
+                           "dpx": (s1[0] - s0[0], s1[1] - s0[1]), "length": length}
+        return True
+
+    def _update_gizmo_drag(self, mp) -> None:
+        g = self.gizmo_drag
+        dx, dy = g["dpx"]
+        seg2 = dx * dx + dy * dy
+        if seg2 < 1e-9:
+            return
+        t = ((mp[0] - g["press"][0]) * dx + (mp[1] - g["press"][1]) * dy) / seg2
+        move = t * g["length"]
+        ax = g["axis"]
+        s = g["start"]
+        self.selected.transform.position = self.engine_mod.Vec3(
+            s[0] + ax[0] * move, s[1] + ax[1] * move, s[2] + ax[2] * move)
+        self.dirty = True
 
     # ---- details panel rows for the selected light ----
     def _details_rows(self):
         e = self.selected
-        if e is None or e.light is None:
+        if e is None:
+            return []
+        if e.environment is not None:
+            env = e.environment
+            return [{"kind": "slider", "label": "env strength", "min": 0.0,
+                     "max": 3.0, "get": lambda: env.strength,
+                     "set": lambda v: setattr(env, "strength", v),
+                     "fmt": "{:.2f}"}]
+        if e.light is None:
             return []
         light = e.light
         Flicker = self.engine_mod.behaviors.Flicker
@@ -253,12 +338,23 @@ class Editor:
             elif drect.collidepoint(mp):
                 self._click_details(mp, drect)
             elif brect.collidepoint(mp):
-                asset = self._tile_at(mp, brect)
-                if asset is not None:
-                    self.drag_asset = asset
+                if self._import_btn_rect(brect).collidepoint(mp):
+                    self._import_fbx_dialog()
+                else:
+                    asset = self._tile_at(mp, brect)
+                    if asset is not None:
+                        self.drag_asset = asset
             else:
                 self.active_slider = None
-                self._click_viewport(mp, w, h)
+                if not self._try_grab_gizmo(mp, w, h):
+                    self._click_viewport(mp, w, h)
+
+        # gizmo drag
+        if self.gizmo_drag is not None:
+            if inp.mouse_held(1) and self.selected is not None:
+                self._update_gizmo_drag(mp)
+            else:
+                self.gizmo_drag = None
 
         # live slider drag
         if self.active_slider is not None:
@@ -304,6 +400,53 @@ class Editor:
             self._focus(self.selected)
         if inp.pressed(pygame.K_c) and self.fly is not None:
             self.fly.collide = not self.fly.collide
+
+        # rotate / scale the selection
+        if self.selected is not None:
+            step = math.pi / 12.0
+            if inp.pressed(pygame.K_COMMA):
+                self.selected.transform.rotation.y += step
+                self.dirty = True
+            if inp.pressed(pygame.K_PERIOD):
+                self.selected.transform.rotation.y -= step
+                self.dirty = True
+            if inp.pressed(pygame.K_MINUS) or inp.pressed(pygame.K_EQUALS):
+                f = 1.1 if inp.pressed(pygame.K_EQUALS) else 1.0 / 1.1
+                sc = self.selected.transform.scale
+                self.selected.transform.scale = self.engine_mod.Vec3(
+                    sc.x * f, sc.y * f, sc.z * f)
+                self.dirty = True
+
+        if self.status[1] > 0:
+            self.status = (self.status[0], self.status[1] - dt)
+
+    def _import_btn_rect(self, brect):
+        import pygame
+        return pygame.Rect(brect.right - 130, brect.y + 4, 120, 20)
+
+    def _import_fbx_dialog(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                title="Import FBX model",
+                filetypes=[("FBX models", "*.fbx"), ("All files", "*.*")])
+            root.destroy()
+        except Exception as ex:
+            self.status = (f"file dialog unavailable: {ex}", 5.0)
+            return
+        if not path:
+            return
+        try:
+            name = self.engine_mod.import_fbx(path, self.lib.directory)
+            self.lib.reload()
+            self.icons[name] = make_icon(self.engine_mod, self.lib.by_name[name])
+            self.status = (f"imported '{name}' — drag it from the browser", 5.0)
+        except Exception as ex:
+            self.status = (f"import failed: {ex}", 6.0)
 
     def _click_details(self, mp, drect) -> None:
         rows = self._details_rows()
@@ -409,10 +552,17 @@ class Editor:
             color = tuple(e.light.color) if e.light.enabled else (70, 70, 70)
             pygame.draw.circle(surf, color, (x, y), 4)
             pygame.draw.circle(surf, color, (x, y), 8, 1)
-        # selection brackets
+        # selection brackets + transform gizmo
         e = self.selected
         if e is None:
             return
+        for axis, s0, s1, color, _length in self._gizmo_handles(w, h):
+            active = (self.gizmo_drag is not None
+                      and self.gizmo_drag["axis"] == axis)
+            c = (255, 255, 255) if active else color
+            pygame.draw.line(surf, c, (int(s0[0]), int(s0[1])),
+                             (int(s1[0]), int(s1[1])), 3)
+            pygame.draw.circle(surf, c, (int(s1[0]), int(s1[1])), 6)
         pt = self.camera.project(e.transform.position, w, h)
         if pt is None:
             return
@@ -455,6 +605,9 @@ class Editor:
             if e.mesh is not None:
                 c = tuple(int(v) for v in e.mesh.face_colors.mean(axis=0))
                 pygame.draw.rect(surf, c, (x, y + 6, 8, 8))
+            if e.environment is not None:
+                pygame.draw.circle(surf, (120, 190, 235), (x + 4, y + 10), 5, 1)
+                pygame.draw.line(surf, (120, 190, 235), (x, y + 10), (x + 8, y + 10))
             x += 12
             if e.light is not None:
                 c = tuple(e.light.color) if e.light.enabled else (80, 80, 80)
@@ -527,6 +680,15 @@ class Editor:
                                  True, TEXT)
         surf.blit(title, (rect.x + 10, rect.y + 6))
         mp = pygame.mouse.get_pos()
+        btn = self._import_btn_rect(rect)
+        pygame.draw.rect(surf, HOVER_BG if btn.collidepoint(mp) else (33, 36, 44),
+                         btn, border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, btn, 1, border_radius=4)
+        label = self.font_small.render("+ Import FBX", True, ACCENT)
+        surf.blit(label, (btn.x + (btn.width - label.get_width()) // 2, btn.y + 4))
+        if self.status[1] > 0:
+            msg = self.font_small.render(self.status[0][:80], True, (235, 210, 140))
+            surf.blit(msg, (btn.x - msg.get_width() - 14, rect.y + 8))
         x = rect.x + 10 - self.browser_scroll
         for asset in self.lib.assets:
             tile = pygame.Rect(x, rect.y + 26, TILE_W, TILE_H - 12)
@@ -614,9 +776,9 @@ def main() -> None:
     eng.renderer.render(pygame.Surface((320, 180)), scene, camera, eng.tracer)
 
     eng.loading_step("opening world", 0.95)
-    eng.hud_text = ("RMB hold: look/fly | LMB: select & drag assets | F flashlight | "
-                    "C collision | Z focus | Ctrl+D dup | Del delete | Ctrl+S save | "
-                    "F2 flat/per-pixel | Esc quit")
+    eng.hud_text = ("RMB: look/fly | LMB: select, drag assets, drag gizmo | "
+                    ", . rotate | - = scale | F flashlight | C collision | Z focus | "
+                    "Ctrl+D dup | Del del | Ctrl+S save | F2 shading | Esc quit")
     eng.run(scene, camera, max_frames=args.frames, screenshot_path=args.screenshot,
             overlay=editor.draw)
 

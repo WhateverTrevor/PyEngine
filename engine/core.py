@@ -149,7 +149,7 @@ class Engine:
 
     def _draw_hud(self, fps: float, scene) -> None:
         stats = self.renderer.stats
-        lines = [f"{fps:5.1f} FPS | {stats['mode']} | {stats['triangles']} tris | "
+        lines = [f"{fps:5.1f} FPS | {stats['mode']} | {stats['triangles']} faces | "
                  f"{stats['shadow_lights']} shadow lights | {len(scene.entities)} entities"]
         if self.hud_text:
             lines.append(self.hud_text)

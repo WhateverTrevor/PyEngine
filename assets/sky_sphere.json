@@ -1,0 +1,5 @@
+{
+  "name": "Sky Sphere",
+  "category": "environment",
+  "environment": {"hdri": "hdri/night_sky.hdr", "strength": 1.0}
+}

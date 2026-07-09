@@ -20,9 +20,12 @@ from __future__ import annotations
 import json
 import os
 
+import numpy as np
+
 from . import behaviors as behaviors_mod
 from . import mesh as mesh_mod
 from .camera import Camera
+from .environment import Environment, load_hdr
 from .lighting import DirectionalLight, Fog, PointLight, SpotLight
 from .math3d import Vec3
 from .scene import Entity, Scene
@@ -65,7 +68,20 @@ class AssetDef:
         if "mesh" in d:
             spec = _tupled(dict(d["mesh"]))
             primitive = spec.pop("primitive")
-            entity.mesh = _MESH_FACTORIES[primitive](**spec)
+            if primitive == "model":  # imported geometry (e.g. FBX -> .npz)
+                data = np.load(os.path.join(os.path.dirname(self.path),
+                                            spec.pop("path")))
+                entity.mesh = mesh_mod.Mesh(
+                    data["vertices"], [tuple(f) for f in data["faces"]],
+                    base_color=spec.get("color", (170, 170, 175)))
+            else:
+                entity.mesh = _MESH_FACTORIES[primitive](**spec)
+
+        if "environment" in d:
+            spec = dict(d["environment"])
+            hdr_path = os.path.join(os.path.dirname(self.path), spec["hdri"])
+            entity.environment = Environment(load_hdr(hdr_path),
+                                             strength=spec.get("strength", 1.0))
 
         if "light" in d:
             spec = _tupled(dict(d["light"]))

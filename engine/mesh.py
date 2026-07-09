@@ -1,8 +1,12 @@
-"""Triangle meshes and procedural primitives.
+"""Polygon meshes (tris + quads) and procedural primitives.
 
-All primitives use counter-clockwise winding viewed from outside; per-face
-normals are derived from the winding, so the renderer's backface culling and
-lighting depend on it being consistent.
+Faces are 3- or 4-sided polygons with counter-clockwise winding viewed from
+outside; quads must be planar and convex. Internally faces are stored padded
+to 4 indices (triangles repeat their last index), so the whole rendering
+pipeline is vectorized over one (M, 4) array; the ray tracer uses a
+triangulated copy (`tri_faces`). Per-face lighting shades each quad as one
+face — walls and floors get one clean shade per panel instead of a diagonal
+tri seam.
 """
 from __future__ import annotations
 
@@ -14,17 +18,33 @@ import numpy as np
 class Mesh:
     def __init__(self, vertices, faces, base_color=(200, 200, 200), face_colors=None):
         self.vertices = np.asarray(vertices, dtype=np.float64)   # (N, 3)
-        self.faces = np.asarray(faces, dtype=np.int32)           # (M, 3)
+        self._polys = [tuple(int(i) for i in f) for f in faces]
         if face_colors is None:
-            face_colors = np.tile(np.asarray(base_color, dtype=np.float64), (len(self.faces), 1))
+            face_colors = np.tile(np.asarray(base_color, dtype=np.float64),
+                                  (len(self._polys), 1))
         self.face_colors = np.asarray(face_colors, dtype=np.float64)  # (M, 3)
+        self._build()
+
+    def _build(self) -> None:
+        padded, tris = [], []
+        for f in self._polys:
+            if len(f) == 4 and f[3] != f[2] and f[3] != f[0]:
+                padded.append(f)
+                tris.append((f[0], f[1], f[2]))
+                tris.append((f[0], f[2], f[3]))
+            else:
+                t = f[:3]
+                padded.append((t[0], t[1], t[2], t[2]))
+                tris.append(t)
+        self.faces = np.asarray(padded, dtype=np.int32)      # (M, 4), tris padded
+        self.tri_faces = np.asarray(tris, dtype=np.int32)    # (T, 3) for ray tracing
         self.normals = self._face_normals()
         self.aabb_min = self.vertices.min(axis=0)
         self.aabb_max = self.vertices.max(axis=0)
         self.bound = float(np.linalg.norm(self.vertices, axis=1).max())
 
     def _face_normals(self) -> np.ndarray:
-        tri = self.vertices[self.faces]
+        tri = self.vertices[self.faces[:, :3]]
         n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
         n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
         return n
@@ -34,42 +54,36 @@ class Mesh:
 
         Only valid for convex meshes centered at the origin.
         """
-        tri = self.vertices[self.faces]
-        centroids = tri.mean(axis=1)
+        centroids = self.vertices[self.faces].mean(axis=1)
         flip = np.einsum("ij,ij->i", self.normals, centroids) < 0.0
-        self.faces[flip] = self.faces[flip][:, ::-1]
-        self.normals = self._face_normals()
+        self._polys = [tuple(reversed(f)) if flipped else f
+                       for f, flipped in zip(self._polys, flip)]
+        self._build()
         return self
-
-
-def cube(size: float = 1.0, color=(200, 200, 200)) -> Mesh:
-    s = size * 0.5
-    v = [(-s, -s, -s), (s, -s, -s), (s, s, -s), (-s, s, -s),
-         (-s, -s, s), (s, -s, s), (s, s, s), (-s, s, s)]
-    f = [(4, 5, 6), (4, 6, 7),   # +z
-         (1, 0, 3), (1, 3, 2),   # -z
-         (0, 4, 7), (0, 7, 3),   # -x
-         (5, 1, 2), (5, 2, 6),   # +x
-         (7, 6, 2), (7, 2, 3),   # +y
-         (0, 1, 5), (0, 5, 4)]   # -y
-    return Mesh(v, f, base_color=color).orient_outward()
 
 
 def box(width: float = 1.0, height: float = 1.0, depth: float = 1.0,
         color=(200, 200, 200)) -> Mesh:
-    """Axis-aligned box centered at the origin (walls, crates, slabs)."""
+    """Axis-aligned box centered at the origin — 6 quad faces."""
     hx, hy, hz = width * 0.5, height * 0.5, depth * 0.5
     v = [(-hx, -hy, -hz), (hx, -hy, -hz), (hx, hy, -hz), (-hx, hy, -hz),
          (-hx, -hy, hz), (hx, -hy, hz), (hx, hy, hz), (-hx, hy, hz)]
-    f = [(4, 5, 6), (4, 6, 7), (1, 0, 3), (1, 3, 2),
-         (0, 4, 7), (0, 7, 3), (5, 1, 2), (5, 2, 6),
-         (7, 6, 2), (7, 2, 3), (0, 1, 5), (0, 5, 4)]
+    f = [(4, 5, 6, 7),   # +z
+         (1, 0, 3, 2),   # -z
+         (0, 4, 7, 3),   # -x
+         (5, 1, 2, 6),   # +x
+         (7, 6, 2, 3),   # +y
+         (0, 1, 5, 4)]   # -y
     return Mesh(v, f, base_color=color).orient_outward()
+
+
+def cube(size: float = 1.0, color=(200, 200, 200)) -> Mesh:
+    return box(size, size, size, color)
 
 
 def cylinder(radius: float = 0.5, height: float = 1.0, segments: int = 12,
              color=(200, 200, 200)) -> Mesh:
-    """Upright cylinder centered at the origin (barrels, pillars, posts)."""
+    """Upright cylinder centered at the origin: quad sides, triangle-fan caps."""
     hy = height * 0.5
     verts = []
     for y in (-hy, hy):
@@ -86,8 +100,8 @@ def cylinder(radius: float = 0.5, height: float = 1.0, segments: int = 12,
         j = (i + 1) % segments
         b0, b1 = i, j
         t0, t1 = segments + i, segments + j
-        faces += [(b0, b1, t1), (b0, t1, t0)]          # side
-        faces += [(bottom_center, b1, b0), (top_center, t0, t1)]  # caps
+        faces.append((b0, b1, t1, t0))                            # side quad
+        faces += [(bottom_center, b1, b0), (top_center, t0, t1)]  # cap tris
     return Mesh(verts, faces, base_color=color).orient_outward()
 
 
@@ -167,7 +181,7 @@ def torus(ring_radius: float = 1.0, tube_radius: float = 0.35,
             b = ((i + 1) % ring_segments) * tube_segments + j
             c = ((i + 1) % ring_segments) * tube_segments + (j + 1) % tube_segments
             d = i * tube_segments + (j + 1) % tube_segments
-            faces += [(a, b, c), (a, c, d)]
+            faces.append((a, b, c, d))
 
     mesh = Mesh(verts, faces, base_color=color)
     # Fix winding once using the analytic outward direction of face 0: from the
@@ -177,14 +191,14 @@ def torus(ring_radius: float = 1.0, tube_radius: float = 0.35,
     ring_point = np.array([centroid[0], 0.0, centroid[2]])
     ring_point *= ring_radius / max(np.linalg.norm(ring_point), 1e-12)
     if float(np.dot(mesh.normals[0], centroid - ring_point)) < 0.0:
-        mesh.faces = mesh.faces[:, ::-1].copy()
-        mesh.normals = mesh._face_normals()
+        mesh._polys = [tuple(reversed(f)) for f in mesh._polys]
+        mesh._build()
     return mesh
 
 
 def checkerboard(squares: int = 24, square_size: float = 2.0,
                  color_a=(95, 98, 104), color_b=(60, 62, 68)) -> Mesh:
-    """Flat ground plane on y=0, centered at the origin, alternating colors."""
+    """Flat ground on y=0, centered at the origin — one quad per square."""
     half = squares * square_size * 0.5
     verts, faces, colors = [], [], []
     for i in range(squares):
@@ -193,8 +207,6 @@ def checkerboard(squares: int = 24, square_size: float = 2.0,
             x1, z1 = x0 + square_size, z0 + square_size
             base = len(verts)
             verts += [(x0, 0.0, z0), (x1, 0.0, z0), (x1, 0.0, z1), (x0, 0.0, z1)]
-            a, b, c, d = base, base + 1, base + 2, base + 3
-            faces += [(a, c, b), (a, d, c)]  # +y winding
-            col = color_a if (i + j) % 2 == 0 else color_b
-            colors += [col, col]
+            faces.append((base, base + 3, base + 2, base + 1))  # +y winding
+            colors.append(color_a if (i + j) % 2 == 0 else color_b)
     return Mesh(verts, faces, face_colors=colors)
