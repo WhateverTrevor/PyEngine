@@ -1,0 +1,5 @@
+{
+  "name": "Monolith",
+  "category": "props",
+  "mesh": {"primitive": "box", "width": 0.9, "height": 2.6, "depth": 0.5, "color": [28, 28, 34]}
+}

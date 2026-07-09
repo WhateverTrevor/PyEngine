@@ -1,0 +1,173 @@
+"""Triangle meshes and procedural primitives.
+
+All primitives use counter-clockwise winding viewed from outside; per-face
+normals are derived from the winding, so the renderer's backface culling and
+lighting depend on it being consistent.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+
+class Mesh:
+    def __init__(self, vertices, faces, base_color=(200, 200, 200), face_colors=None):
+        self.vertices = np.asarray(vertices, dtype=np.float64)   # (N, 3)
+        self.faces = np.asarray(faces, dtype=np.int32)           # (M, 3)
+        if face_colors is None:
+            face_colors = np.tile(np.asarray(base_color, dtype=np.float64), (len(self.faces), 1))
+        self.face_colors = np.asarray(face_colors, dtype=np.float64)  # (M, 3)
+        self.normals = self._face_normals()
+
+    def _face_normals(self) -> np.ndarray:
+        tri = self.vertices[self.faces]
+        n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+        return n
+
+    def orient_outward(self) -> "Mesh":
+        """Flip faces whose normals point toward the origin.
+
+        Only valid for convex meshes centered at the origin.
+        """
+        tri = self.vertices[self.faces]
+        centroids = tri.mean(axis=1)
+        flip = np.einsum("ij,ij->i", self.normals, centroids) < 0.0
+        self.faces[flip] = self.faces[flip][:, ::-1]
+        self.normals = self._face_normals()
+        return self
+
+
+def cube(size: float = 1.0, color=(200, 200, 200)) -> Mesh:
+    s = size * 0.5
+    v = [(-s, -s, -s), (s, -s, -s), (s, s, -s), (-s, s, -s),
+         (-s, -s, s), (s, -s, s), (s, s, s), (-s, s, s)]
+    f = [(4, 5, 6), (4, 6, 7),   # +z
+         (1, 0, 3), (1, 3, 2),   # -z
+         (0, 4, 7), (0, 7, 3),   # -x
+         (5, 1, 2), (5, 2, 6),   # +x
+         (7, 6, 2), (7, 2, 3),   # +y
+         (0, 1, 5), (0, 5, 4)]   # -y
+    return Mesh(v, f, base_color=color).orient_outward()
+
+
+def box(width: float = 1.0, height: float = 1.0, depth: float = 1.0,
+        color=(200, 200, 200)) -> Mesh:
+    """Axis-aligned box centered at the origin (walls, crates, slabs)."""
+    hx, hy, hz = width * 0.5, height * 0.5, depth * 0.5
+    v = [(-hx, -hy, -hz), (hx, -hy, -hz), (hx, hy, -hz), (-hx, hy, -hz),
+         (-hx, -hy, hz), (hx, -hy, hz), (hx, hy, hz), (-hx, hy, hz)]
+    f = [(4, 5, 6), (4, 6, 7), (1, 0, 3), (1, 3, 2),
+         (0, 4, 7), (0, 7, 3), (5, 1, 2), (5, 2, 6),
+         (7, 6, 2), (7, 2, 3), (0, 1, 5), (0, 5, 4)]
+    return Mesh(v, f, base_color=color).orient_outward()
+
+
+def cylinder(radius: float = 0.5, height: float = 1.0, segments: int = 12,
+             color=(200, 200, 200)) -> Mesh:
+    """Upright cylinder centered at the origin (barrels, pillars, posts)."""
+    hy = height * 0.5
+    verts = []
+    for y in (-hy, hy):
+        for i in range(segments):
+            a = 2.0 * math.pi * i / segments
+            verts.append((math.cos(a) * radius, y, math.sin(a) * radius))
+    bottom_center = len(verts)
+    verts.append((0.0, -hy, 0.0))
+    top_center = len(verts)
+    verts.append((0.0, hy, 0.0))
+
+    faces = []
+    for i in range(segments):
+        j = (i + 1) % segments
+        b0, b1 = i, j
+        t0, t1 = segments + i, segments + j
+        faces += [(b0, b1, t1), (b0, t1, t0)]          # side
+        faces += [(bottom_center, b1, b0), (top_center, t0, t1)]  # caps
+    return Mesh(verts, faces, base_color=color).orient_outward()
+
+
+def icosphere(radius: float = 1.0, subdivisions: int = 2, color=(200, 200, 200)) -> Mesh:
+    phi = (1.0 + math.sqrt(5.0)) / 2.0
+    v = [(-1, phi, 0), (1, phi, 0), (-1, -phi, 0), (1, -phi, 0),
+         (0, -1, phi), (0, 1, phi), (0, -1, -phi), (0, 1, -phi),
+         (phi, 0, -1), (phi, 0, 1), (-phi, 0, -1), (-phi, 0, 1)]
+    f = [(0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11),
+         (1, 5, 9), (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8),
+         (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9),
+         (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1)]
+    verts = [np.array(p, dtype=np.float64) for p in v]
+    faces = list(f)
+
+    midpoint_cache: dict[tuple[int, int], int] = {}
+
+    def midpoint(a: int, b: int) -> int:
+        key = (a, b) if a < b else (b, a)
+        if key not in midpoint_cache:
+            verts.append((verts[a] + verts[b]) * 0.5)
+            midpoint_cache[key] = len(verts) - 1
+        return midpoint_cache[key]
+
+    for _ in range(subdivisions):
+        new_faces = []
+        for a, b, c in faces:
+            ab, bc, ca = midpoint(a, b), midpoint(b, c), midpoint(c, a)
+            new_faces += [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
+        faces = new_faces
+
+    arr = np.array(verts)
+    arr = arr / np.linalg.norm(arr, axis=1, keepdims=True) * radius
+    return Mesh(arr, faces, base_color=color).orient_outward()
+
+
+def torus(ring_radius: float = 1.0, tube_radius: float = 0.35,
+          ring_segments: int = 24, tube_segments: int = 14,
+          color=(200, 200, 200)) -> Mesh:
+    verts = []
+    for i in range(ring_segments):
+        u = 2.0 * math.pi * i / ring_segments
+        cu, su = math.cos(u), math.sin(u)
+        for j in range(tube_segments):
+            v = 2.0 * math.pi * j / tube_segments
+            r = ring_radius + tube_radius * math.cos(v)
+            verts.append((r * cu, tube_radius * math.sin(v), r * su))
+
+    faces = []
+    for i in range(ring_segments):
+        for j in range(tube_segments):
+            a = i * tube_segments + j
+            b = ((i + 1) % ring_segments) * tube_segments + j
+            c = ((i + 1) % ring_segments) * tube_segments + (j + 1) % tube_segments
+            d = i * tube_segments + (j + 1) % tube_segments
+            faces += [(a, b, c), (a, c, d)]
+
+    mesh = Mesh(verts, faces, base_color=color)
+    # Fix winding once using the analytic outward direction of face 0: from the
+    # tube's center circle toward the face centroid. Topology is uniform, so one
+    # test decides the whole mesh.
+    centroid = mesh.vertices[mesh.faces[0]].mean(axis=0)
+    ring_point = np.array([centroid[0], 0.0, centroid[2]])
+    ring_point *= ring_radius / max(np.linalg.norm(ring_point), 1e-12)
+    if float(np.dot(mesh.normals[0], centroid - ring_point)) < 0.0:
+        mesh.faces = mesh.faces[:, ::-1].copy()
+        mesh.normals = mesh._face_normals()
+    return mesh
+
+
+def checkerboard(squares: int = 24, square_size: float = 2.0,
+                 color_a=(95, 98, 104), color_b=(60, 62, 68)) -> Mesh:
+    """Flat ground plane on y=0, centered at the origin, alternating colors."""
+    half = squares * square_size * 0.5
+    verts, faces, colors = [], [], []
+    for i in range(squares):
+        for j in range(squares):
+            x0, z0 = i * square_size - half, j * square_size - half
+            x1, z1 = x0 + square_size, z0 + square_size
+            base = len(verts)
+            verts += [(x0, 0.0, z0), (x1, 0.0, z0), (x1, 0.0, z1), (x0, 0.0, z1)]
+            a, b, c, d = base, base + 1, base + 2, base + 3
+            faces += [(a, c, b), (a, d, c)]  # +y winding
+            col = color_a if (i + j) % 2 == 0 else color_b
+            colors += [col, col]
+    return Mesh(verts, faces, face_colors=colors)

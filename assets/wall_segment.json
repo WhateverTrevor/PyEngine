@@ -1,0 +1,5 @@
+{
+  "name": "Wall Segment",
+  "category": "structure",
+  "mesh": {"primitive": "box", "width": 4.0, "height": 3.2, "depth": 0.35, "color": [92, 88, 94]}
+}

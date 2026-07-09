@@ -1,0 +1,5 @@
+{
+  "name": "Crate",
+  "category": "props",
+  "mesh": {"primitive": "cube", "size": 1.3, "color": [133, 94, 50]}
+}

@@ -1,0 +1,7 @@
+{
+  "name": "Ceiling Lamp",
+  "category": "lights",
+  "mesh": {"primitive": "cube", "size": 0.35, "color": [42, 44, 50]},
+  "light": {"type": "point", "color": [180, 200, 255], "intensity": 1.2, "range": 9, "radius": 0.4, "shadow_samples": 8, "offset": [0, -0.3, 0]},
+  "behaviors": [{"type": "Flicker", "amount": 0.55, "speed": 13}]
+}

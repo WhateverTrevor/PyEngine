@@ -1,0 +1,5 @@
+{
+  "name": "Barrel",
+  "category": "props",
+  "mesh": {"primitive": "cylinder", "radius": 0.5, "height": 1.25, "segments": 12, "color": [96, 64, 40]}
+}

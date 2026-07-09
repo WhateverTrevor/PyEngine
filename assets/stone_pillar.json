@@ -1,0 +1,5 @@
+{
+  "name": "Stone Pillar",
+  "category": "structure",
+  "mesh": {"primitive": "cylinder", "radius": 0.38, "height": 3.6, "segments": 10, "color": [105, 102, 112]}
+}

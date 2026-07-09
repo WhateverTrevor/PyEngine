@@ -1,0 +1,7 @@
+{
+  "name": "Ghost",
+  "category": "actors",
+  "casts_shadow": false,
+  "mesh": {"primitive": "icosphere", "radius": 0.8, "subdivisions": 1, "color": [210, 215, 235]},
+  "behaviors": [{"type": "Bob", "amplitude": 0.4, "speed": 0.7}]
+}

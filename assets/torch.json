@@ -1,0 +1,7 @@
+{
+  "name": "Torch",
+  "category": "lights",
+  "mesh": {"primitive": "cylinder", "radius": 0.1, "height": 1.5, "segments": 8, "color": [84, 62, 40]},
+  "light": {"type": "point", "color": [255, 150, 60], "intensity": 2.2, "range": 12, "radius": 0.3, "shadow_samples": 8, "offset": [0, 0.95, 0]},
+  "behaviors": [{"type": "Flicker", "amount": 0.35, "speed": 9}]
+}

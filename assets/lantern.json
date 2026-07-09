@@ -1,0 +1,7 @@
+{
+  "name": "Lantern",
+  "category": "lights",
+  "mesh": {"primitive": "cube", "size": 0.35, "color": [70, 58, 34]},
+  "light": {"type": "point", "color": [255, 190, 90], "intensity": 1.4, "range": 8, "radius": 0.2, "shadow_samples": 6, "offset": [0, 0.05, 0]},
+  "behaviors": [{"type": "Flicker", "amount": 0.2, "speed": 6}]
+}
