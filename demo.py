@@ -79,7 +79,9 @@ def main() -> None:
     eng.hud_text = ("WASD move | Space/Ctrl up/down | Shift fast | "
                     "hold LMB/RMB = mouse look | F1 wireframe | H hud | Esc quit")
 
+    eng.loading_step("building scene", 0.5)
     scene = build_scene(engine)
+    eng.loading_step("opening world", 0.9)
     camera = engine.Camera(position=engine.Vec3(0.0, 4.5, 19.0), pitch=-0.1, fov=70.0)
     scene.add(engine.Entity("player").add_behavior(
         engine.behaviors.FlyController(camera)))

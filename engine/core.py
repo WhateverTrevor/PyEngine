@@ -1,6 +1,7 @@
-"""Engine core: window, fixed-timestep game loop, HUD."""
+"""Engine core: window, splash/loading screen, fixed-timestep game loop, HUD."""
 from __future__ import annotations
 
+import os
 import time
 
 import pygame
@@ -9,12 +10,15 @@ from .input import InputManager
 from .raytrace import ShadowTracer
 from .renderer import Renderer
 
+_SPLASH_SIZE = (460, 260)
+
 
 class Engine:
     def __init__(self, width: int = 1280, height: int = 720, title: str = "PyEngine",
-                 max_fps: int = 120, fixed_dt: float = 1.0 / 60.0):
+                 max_fps: int = 120, fixed_dt: float = 1.0 / 60.0, splash: bool = True):
+        os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
         pygame.init()
-        self.screen = pygame.display.set_mode((width, height))
+        self._size = (width, height)
         pygame.display.set_caption(title)
         self.input = InputManager()
         self.renderer = Renderer()
@@ -24,7 +28,52 @@ class Engine:
         self.show_hud = True
         self.hud_text: str | None = None  # optional controls line, set by the app
         self._font = pygame.font.SysFont("consolas,couriernew,monospace", 15)
+        self._small_font = pygame.font.SysFont("consolas,couriernew,monospace", 12)
+        self._title_font = pygame.font.SysFont("consolas,couriernew,monospace", 32, bold=True)
         self._hud_cache: dict[str, pygame.Surface] = {}
+        self._splash_active = False
+        if splash:
+            self.screen = pygame.display.set_mode(_SPLASH_SIZE, pygame.NOFRAME)
+            self._splash_active = True
+            self.loading_step("starting engine", 0.05)
+        else:
+            self.screen = pygame.display.set_mode(self._size)
+
+    def loading_step(self, message: str, progress: float) -> None:
+        """Advance the startup splash: corner status text + progress bar.
+
+        Call between loading phases (assets, thumbnails, scene, shadows).
+        Becomes a no-op once the main window is open.
+        """
+        if not self._splash_active:
+            return
+        pygame.event.pump()  # keep the window responsive during long steps
+        s = self.screen
+        w, h = s.get_size()
+        s.fill((16, 18, 23))
+        pygame.draw.rect(s, (58, 62, 72), (0, 0, w, h), 1)
+
+        title = self._title_font.render("PyEngine", True, (235, 235, 240))
+        s.blit(title, ((w - title.get_width()) // 2, 72))
+        sub = self._small_font.render("pure-python real-time 3d", True, (120, 124, 134))
+        s.blit(sub, ((w - sub.get_width()) // 2, 76 + title.get_height()))
+
+        bar_x, bar_w, bar_h = 24, w - 48, 6
+        bar_y = h - 46
+        pygame.draw.rect(s, (40, 43, 51), (bar_x, bar_y, bar_w, bar_h), border_radius=3)
+        fill = int(bar_w * min(max(progress, 0.0), 1.0))
+        if fill > 0:
+            pygame.draw.rect(s, (255, 170, 60), (bar_x, bar_y, fill, bar_h),
+                             border_radius=3)
+        status = self._small_font.render(message, True, (150, 154, 163))
+        s.blit(status, (bar_x, bar_y + 13))
+        pygame.display.flip()
+
+    def _end_splash(self) -> None:
+        if self._splash_active:
+            self.loading_step("ready", 1.0)
+            self._splash_active = False
+            self.screen = pygame.display.set_mode(self._size)
 
     def run(self, scene, camera, max_frames: int | None = None,
             screenshot_path: str | None = None, overlay=None) -> None:
@@ -35,6 +84,7 @@ class Engine:
         is called after the 3D render, before flip — used by the editor UI.
         `max_frames` + `screenshot_path` support benchmarking.
         """
+        self._end_splash()
         clock = pygame.time.Clock()
         last = time.perf_counter()
         start_time = last

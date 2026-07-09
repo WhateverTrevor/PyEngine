@@ -120,7 +120,11 @@ class Editor:
         self.save_flash = 0.0
         self.font = pygame.font.SysFont("consolas,couriernew,monospace", 14)
         self.font_small = pygame.font.SysFont("consolas,couriernew,monospace", 12)
-        self.icons = {a.name: make_icon(engine_mod, a) for a in lib.assets}
+        self.icons = {}
+        count = max(len(lib.assets), 1)
+        for i, a in enumerate(lib.assets):
+            eng.loading_step(f"rendering thumbnail: {a.name}", 0.25 + 0.45 * i / count)
+            self.icons[a.name] = make_icon(engine_mod, a)
 
     # ---- layout ----
     def outliner_rect(self, w, h):
@@ -396,10 +400,12 @@ def main() -> None:
     import engine
 
     eng = engine.Engine(args.width, args.height, title="PyEngine Editor")
+    eng.loading_step("loading asset library", 0.12)
     lib = engine.AssetLibrary(os.path.join(BASE_DIR, "assets"))
     camera = engine.Camera(position=engine.Vec3(6.0, 2.6, 9.0), yaw=0.45, pitch=-0.08,
                            far=200.0)
 
+    eng.loading_step("loading scene", 0.18)
     if os.path.exists(args.scene):
         scene = engine.load_scene(args.scene, lib, camera)
     else:
@@ -420,6 +426,13 @@ def main() -> None:
     scene.add(player)
     scene.add(engine.Entity("__editor").add_behavior(EditorBehavior(editor)))
 
+    # trace the static lights' shadows now so the first frame doesn't hitch
+    eng.loading_step("pre-tracing shadows", 0.8)
+    import pygame
+    eng.tracer.refresh(scene)
+    eng.renderer.render(pygame.Surface((320, 180)), scene, camera, eng.tracer)
+
+    eng.loading_step("opening world", 0.95)
     eng.hud_text = ("RMB hold: look/fly | LMB: select & drag assets | F flashlight | "
                     "Z focus | Ctrl+D dup | Del delete | Ctrl+S save | Esc quit")
     eng.run(scene, camera, max_frames=args.frames, screenshot_path=args.screenshot,
