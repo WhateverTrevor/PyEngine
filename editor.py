@@ -21,7 +21,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 OUTLINER_W = 260
 BROWSER_H = 118
+DETAILS_H = 322
 ROW_H = 20
+DETAIL_ROW_H = 24
 TILE_W, TILE_H, ICON = 84, 100, 64
 PANEL_BG = (22, 24, 29)
 PANEL_EDGE = (58, 62, 72)
@@ -113,10 +115,12 @@ class Editor:
         self.scene_path = scene_path
         self.selected = None
         self.flashlight = None      # set by main(); hidden from glyphs
+        self.fly = None             # the viewport FlyController, for C toggle
         self.dirty = False
         self.outliner_scroll = 0
         self.browser_scroll = 0
         self.drag_asset = None
+        self.active_slider = None   # index into _details_rows while dragging
         self.save_flash = 0.0
         self.font = pygame.font.SysFont("consolas,couriernew,monospace", 14)
         self.font_small = pygame.font.SysFont("consolas,couriernew,monospace", 12)
@@ -129,7 +133,12 @@ class Editor:
     # ---- layout ----
     def outliner_rect(self, w, h):
         import pygame
-        return pygame.Rect(w - OUTLINER_W, 0, OUTLINER_W, h - BROWSER_H)
+        return pygame.Rect(w - OUTLINER_W, 0, OUTLINER_W, h - BROWSER_H - DETAILS_H)
+
+    def details_rect(self, w, h):
+        import pygame
+        return pygame.Rect(w - OUTLINER_W, h - BROWSER_H - DETAILS_H,
+                           OUTLINER_W, DETAILS_H)
 
     def browser_rect(self, w, h):
         import pygame
@@ -138,11 +147,87 @@ class Editor:
     def over_ui(self, pos) -> bool:
         w, h = self.eng.screen.get_size()
         return (self.outliner_rect(w, h).collidepoint(pos)
+                or self.details_rect(w, h).collidepoint(pos)
                 or self.browser_rect(w, h).collidepoint(pos))
 
     def _outliner_rows(self):
         return [e for e in self.scene.entities
                 if e.mesh is not None or e.light is not None]
+
+    # ---- details panel rows for the selected light ----
+    def _details_rows(self):
+        e = self.selected
+        if e is None or e.light is None:
+            return []
+        light = e.light
+        Flicker = self.engine_mod.behaviors.Flicker
+        SpotLight = self.engine_mod.SpotLight
+
+        def get_intensity():
+            for b in e.behaviors:
+                if isinstance(b, Flicker) and hasattr(b, "base"):
+                    return b.base
+            return light.intensity
+
+        def set_intensity(v):
+            light.intensity = v
+            for b in e.behaviors:
+                if isinstance(b, Flicker):
+                    b.base = v
+
+        def color_setter(i):
+            def setter(v):
+                c = list(light.color)
+                c[i] = int(v)
+                light.color = tuple(c)
+            return setter
+
+        def slider(label, lo, hi, get, set_, fmt="{:.2f}"):
+            return {"kind": "slider", "label": label, "min": lo, "max": hi,
+                    "get": get, "set": set_, "fmt": fmt}
+
+        rows = [
+            slider("brightness", 0.0, 5.0, get_intensity, set_intensity),
+            slider("red", 0, 255, lambda: light.color[0], color_setter(0), "{:.0f}"),
+            slider("green", 0, 255, lambda: light.color[1], color_setter(1), "{:.0f}"),
+            slider("blue", 0, 255, lambda: light.color[2], color_setter(2), "{:.0f}"),
+            slider("throw", 2.0, 40.0, lambda: light.range,
+                   lambda v: setattr(light, "range", v), "{:.1f}"),
+            slider("shadow soft", 0.02, 1.0, lambda: light.radius,
+                   lambda v: setattr(light, "radius", v)),
+        ]
+        if isinstance(light, SpotLight):
+            rows.append(slider("cone inner", 1.0, 80.0, lambda: light.inner,
+                               lambda v: setattr(light, "inner",
+                                                 min(v, light.outer - 1.0)), "{:.0f}°"))
+            rows.append(slider("penumbra", 2.0, 85.0, lambda: light.outer,
+                               lambda v: setattr(light, "outer",
+                                                 max(v, light.inner + 1.0)), "{:.0f}°"))
+        rows.append({"kind": "cycle", "label": "IES profile",
+                     "get": lambda: light.ies,
+                     "set": lambda v: setattr(light, "ies", v),
+                     "options": self.engine_mod.IES_PROFILES})
+        rows.append({"kind": "toggle", "label": "enabled",
+                     "get": lambda: light.enabled,
+                     "set": lambda v: setattr(light, "enabled", v)})
+        rows.append({"kind": "toggle", "label": "cast shadows",
+                     "get": lambda: light.cast_shadows,
+                     "set": lambda v: setattr(light, "cast_shadows", v)})
+        return rows
+
+    def _detail_row_rect(self, rect, i):
+        import pygame
+        return pygame.Rect(rect.x + 6, rect.y + 56 + i * DETAIL_ROW_H,
+                           rect.width - 12, DETAIL_ROW_H - 2)
+
+    def _slider_track(self, row_rect):
+        return (row_rect.x + 96, row_rect.right - 52)
+
+    def _apply_slider(self, row, row_rect, mx):
+        x0, x1 = self._slider_track(row_rect)
+        f = min(max((mx - x0) / max(x1 - x0, 1), 0.0), 1.0)
+        row["set"](row["min"] + f * (row["max"] - row["min"]))
+        self.dirty = True
 
     # ---- per-frame logic (runs in a fixed update step) ----
     def update(self, engine, dt: float) -> None:
@@ -151,6 +236,7 @@ class Editor:
         mp = inp.mouse_pos
         w, h = engine.screen.get_size()
         orect = self.outliner_rect(w, h)
+        drect = self.details_rect(w, h)
         brect = self.browser_rect(w, h)
         self.save_flash = max(0.0, self.save_flash - dt)
 
@@ -162,13 +248,29 @@ class Editor:
 
         if inp.mouse_button_pressed(1):
             if orect.collidepoint(mp):
+                self.active_slider = None
                 self._click_outliner(mp, orect)
+            elif drect.collidepoint(mp):
+                self._click_details(mp, drect)
             elif brect.collidepoint(mp):
                 asset = self._tile_at(mp, brect)
                 if asset is not None:
                     self.drag_asset = asset
             else:
+                self.active_slider = None
                 self._click_viewport(mp, w, h)
+
+        # live slider drag
+        if self.active_slider is not None:
+            rows = self._details_rows()
+            if inp.mouse_held(1) and self.active_slider < len(rows):
+                row = rows[self.active_slider]
+                if row["kind"] == "slider":
+                    self._apply_slider(row, self._detail_row_rect(drect,
+                                                                  self.active_slider),
+                                       mp[0])
+            else:
+                self.active_slider = None
 
         if self.drag_asset is not None and inp.mouse_button_released(1):
             if not self.over_ui(mp):
@@ -200,6 +302,26 @@ class Editor:
             self.save_flash = 1.5
         if inp.pressed(pygame.K_z) and self.selected is not None:
             self._focus(self.selected)
+        if inp.pressed(pygame.K_c) and self.fly is not None:
+            self.fly.collide = not self.fly.collide
+
+    def _click_details(self, mp, drect) -> None:
+        rows = self._details_rows()
+        i = (mp[1] - (drect.y + 56)) // DETAIL_ROW_H
+        if not (0 <= i < len(rows)):
+            return
+        row = rows[i]
+        if row["kind"] == "slider":
+            self.active_slider = i
+            self._apply_slider(row, self._detail_row_rect(drect, i), mp[0])
+        elif row["kind"] == "cycle":
+            options = row["options"]
+            current = options.index(row["get"]()) if row["get"]() in options else 0
+            row["set"](options[(current + 1) % len(options)])
+            self.dirty = True
+        elif row["kind"] == "toggle":
+            row["set"](not row["get"]())
+            self.dirty = True
 
     def _click_outliner(self, mp, orect) -> None:
         rows = self._outliner_rows()
@@ -260,6 +382,7 @@ class Editor:
         w, h = surf.get_size()
         self._draw_markers(surf, w, h)
         self._draw_outliner(surf, self.outliner_rect(w, h))
+        self._draw_details(surf, self.details_rect(w, h))
         self._draw_browser(surf, self.browser_rect(w, h))
         if self.drag_asset is not None:
             icon = self.icons.get(self.drag_asset.name)
@@ -344,6 +467,58 @@ class Editor:
                                       True, TEXT_DIM)
         surf.blit(hint, (rect.x + 10, rect.bottom - 18))
 
+    def _draw_details(self, surf, rect) -> None:
+        import pygame
+        pygame.draw.rect(surf, PANEL_BG, rect)
+        pygame.draw.line(surf, PANEL_EDGE, rect.topleft, rect.topright)
+        pygame.draw.line(surf, PANEL_EDGE, rect.topleft, rect.bottomleft)
+        surf.blit(self.font.render("Details", True, TEXT), (rect.x + 10, rect.y + 8))
+
+        e = self.selected
+        if e is None:
+            surf.blit(self.font_small.render("select an entity", True, TEXT_DIM),
+                      (rect.x + 10, rect.y + 32))
+            return
+        head = f"{e.name}" + (f"  ({e.asset_name})" if e.asset_name else "")
+        surf.blit(self.font_small.render(head[:34], True, TEXT), (rect.x + 10, rect.y + 28))
+        p = e.transform.position
+        pos_text = f"x {p.x:.1f}  y {p.y:.1f}  z {p.z:.1f}"
+        surf.blit(self.font_small.render(pos_text, True, TEXT_DIM),
+                  (rect.x + 10, rect.y + 42))
+
+        rows = self._details_rows()
+        if not rows:
+            surf.blit(self.font_small.render("no light on this entity", True, TEXT_DIM),
+                      (rect.x + 10, rect.y + 64))
+            return
+        for i, row in enumerate(rows):
+            rr = self._detail_row_rect(rect, i)
+            label = self.font_small.render(row["label"], True, TEXT_DIM)
+            surf.blit(label, (rr.x + 2, rr.y + 5))
+            if row["kind"] == "slider":
+                x0, x1 = self._slider_track(rr)
+                cy = rr.y + rr.height // 2
+                f = (row["get"]() - row["min"]) / (row["max"] - row["min"])
+                f = min(max(f, 0.0), 1.0)
+                pygame.draw.line(surf, (48, 51, 60), (x0, cy), (x1, cy), 4)
+                knob_x = int(x0 + f * (x1 - x0))
+                pygame.draw.line(surf, ACCENT, (x0, cy), (knob_x, cy), 4)
+                pygame.draw.circle(surf, (235, 235, 240), (knob_x, cy), 5)
+                value = self.font_small.render(row["fmt"].format(row["get"]()),
+                                               True, TEXT)
+                surf.blit(value, (x1 + 8, rr.y + 5))
+            elif row["kind"] == "cycle":
+                value = self.font_small.render(f"< {row['get']()} >", True, ACCENT)
+                surf.blit(value, (rr.x + 96, rr.y + 5))
+            elif row["kind"] == "toggle":
+                on = row["get"]()
+                box = pygame.Rect(rr.x + 96, rr.y + 5, 12, 12)
+                pygame.draw.rect(surf, (48, 51, 60), box, border_radius=2)
+                if on:
+                    pygame.draw.rect(surf, ACCENT, box.inflate(-4, -4), border_radius=2)
+                state = self.font_small.render("on" if on else "off", True, TEXT)
+                surf.blit(state, (box.right + 8, rr.y + 5))
+
     def _draw_browser(self, surf, rect) -> None:
         import pygame
         pygame.draw.rect(surf, PANEL_BG, rect)
@@ -392,6 +567,9 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=None)
     parser.add_argument("--screenshot", default=None)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--pixel-scale", type=int, default=4,
+                        help="per-pixel lighting internal resolution divisor "
+                             "(lower = sharper, slower; default 4)")
     args = parser.parse_args()
 
     if args.headless:
@@ -400,6 +578,7 @@ def main() -> None:
     import engine
 
     eng = engine.Engine(args.width, args.height, title="PyEngine Editor")
+    eng.renderer.render_scale = max(1, args.pixel_scale)
     eng.loading_step("loading asset library", 0.12)
     lib = engine.AssetLibrary(os.path.join(BASE_DIR, "assets"))
     camera = engine.Camera(position=engine.Vec3(6.0, 2.6, 9.0), yaw=0.45, pitch=-0.08,
@@ -421,9 +600,11 @@ def main() -> None:
     scene.add(flashlight)
     editor.flashlight = flashlight
 
-    player = engine.Entity("__camera").add_behavior(engine.behaviors.FlyController(
-        camera, look_buttons=(3,), look_guard=lambda pos: not editor.over_ui(pos)))
-    scene.add(player)
+    fly = engine.behaviors.FlyController(
+        camera, look_buttons=(3,), look_guard=lambda pos: not editor.over_ui(pos),
+        collide=True)
+    editor.fly = fly
+    scene.add(engine.Entity("__camera").add_behavior(fly))
     scene.add(engine.Entity("__editor").add_behavior(EditorBehavior(editor)))
 
     # trace the static lights' shadows now so the first frame doesn't hitch
@@ -434,7 +615,8 @@ def main() -> None:
 
     eng.loading_step("opening world", 0.95)
     eng.hud_text = ("RMB hold: look/fly | LMB: select & drag assets | F flashlight | "
-                    "Z focus | Ctrl+D dup | Del delete | Ctrl+S save | Esc quit")
+                    "C collision | Z focus | Ctrl+D dup | Del delete | Ctrl+S save | "
+                    "F2 flat/per-pixel | Esc quit")
     eng.run(scene, camera, max_frames=args.frames, screenshot_path=args.screenshot,
             overlay=editor.draw)
 

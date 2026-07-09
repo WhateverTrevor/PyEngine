@@ -4,11 +4,61 @@ from __future__ import annotations
 import math
 import random
 
+import numpy as np
 import pygame
 
 from .camera import Camera
 from .math3d import Vec3
 from .scene import Behavior, Entity
+
+
+def resolve_collisions(scene, position: Vec3, radius: float) -> Vec3:
+    """Push a sphere out of every collidable entity's oriented bounding box.
+
+    Works in each entity's local space (handles rotated walls), so the sphere
+    slides along surfaces instead of stopping dead.
+    """
+    p = position.to_array()
+    for _ in range(3):  # a few passes settle corner cases
+        moved = False
+        for e in scene.entities:
+            if e.mesh is None or not e.visible or not e.collidable:
+                continue
+            model = e.transform.matrix()
+            s = e.transform.scale
+            reach = e.mesh.bound * max(abs(s.x), abs(s.y), abs(s.z)) + radius
+            if np.linalg.norm(p - model[:3, 3]) > reach:
+                continue
+            try:
+                inv = np.linalg.inv(model)
+            except np.linalg.LinAlgError:
+                continue
+            local = inv[:3, :3] @ p + inv[:3, 3]
+            closest = np.clip(local, e.mesh.aabb_min, e.mesh.aabb_max)
+            world_closest = model[:3, :3] @ closest + model[:3, 3]
+            delta = p - world_closest
+            dist = float(np.linalg.norm(delta))
+            if dist >= radius:
+                continue
+            if dist < 1e-9:
+                # center is inside the box: escape through the nearest face
+                pen_lo = local - e.mesh.aabb_min
+                pen_hi = e.mesh.aabb_max - local
+                axis = int(np.argmin(np.minimum(pen_lo, pen_hi)))
+                closest = local.copy()
+                closest[axis] = (e.mesh.aabb_min[axis] if pen_lo[axis] < pen_hi[axis]
+                                 else e.mesh.aabb_max[axis])
+                world_closest = model[:3, :3] @ closest + model[:3, 3]
+                out = world_closest - p
+                norm = float(np.linalg.norm(out))
+                out = out / norm if norm > 1e-9 else np.array([0.0, 1.0, 0.0])
+                p = world_closest + out * radius
+            else:
+                p = world_closest + delta / dist * radius
+            moved = True
+        if not moved:
+            break
+    return Vec3(*p)
 
 
 class Spin(Behavior):
@@ -88,12 +138,15 @@ class FlyController(Behavior):
     """
 
     def __init__(self, camera: Camera, speed: float = 9.0, sensitivity: float = 0.0025,
-                 look_buttons: tuple[int, ...] = (1, 3), look_guard=None):
+                 look_buttons: tuple[int, ...] = (1, 3), look_guard=None,
+                 collide: bool = True, collide_radius: float = 0.45):
         self.camera = camera
         self.speed = speed
         self.sensitivity = sensitivity
         self.look_buttons = look_buttons
         self.look_guard = look_guard
+        self.collide = collide
+        self.collide_radius = collide_radius
         self._looking = False
 
     def update(self, entity: Entity, dt: float, engine) -> None:
@@ -134,6 +187,9 @@ class FlyController(Behavior):
         if move.length() > 1e-9:
             speed = self.speed * (4.0 if inp.held(pygame.K_LSHIFT) else 1.0)
             cam.position = cam.position + move.normalized() * (speed * dt)
+        if self.collide and getattr(engine, "scene", None) is not None:
+            cam.position = resolve_collisions(engine.scene, cam.position,
+                                              self.collide_radius)
 
 
 class FlashlightController(Behavior):

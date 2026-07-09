@@ -24,13 +24,21 @@ class Transform:
         self.position = position or Vec3()
         self.rotation = rotation or Vec3()   # Euler radians: x=pitch, y=yaw, z=roll
         self.scale = scale or Vec3(1.0, 1.0, 1.0)
+        self._key = None
+        self._mat = None
 
     def matrix(self):
-        return (translation(self.position)
-                @ rotation_y(self.rotation.y)
-                @ rotation_x(self.rotation.x)
-                @ rotation_z(self.rotation.z)
-                @ scaling(self.scale))
+        """4x4 model matrix, memoized (callers must not mutate the result)."""
+        p, r, s = self.position, self.rotation, self.scale
+        key = (p.x, p.y, p.z, r.x, r.y, r.z, s.x, s.y, s.z)
+        if key != self._key:
+            self._mat = (translation(p)
+                         @ rotation_y(r.y)
+                         @ rotation_x(r.x)
+                         @ rotation_z(r.z)
+                         @ scaling(s))
+            self._key = key
+        return self._mat
 
 
 class Entity:
@@ -45,6 +53,7 @@ class Entity:
         self.light = light               # PointLight/SpotLight carried by this entity
         self.light_offset = Vec3()       # light position in local space
         self.casts_shadow = True         # participates as a shadow occluder
+        self.collidable = True           # blocks the player (see FlyController)
         self.asset_name: str | None = None  # set when spawned from an asset file
 
     def add_behavior(self, behavior: Behavior) -> "Entity":

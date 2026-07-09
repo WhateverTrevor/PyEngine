@@ -19,6 +19,9 @@ class Mesh:
             face_colors = np.tile(np.asarray(base_color, dtype=np.float64), (len(self.faces), 1))
         self.face_colors = np.asarray(face_colors, dtype=np.float64)  # (M, 3)
         self.normals = self._face_normals()
+        self.aabb_min = self.vertices.min(axis=0)
+        self.aabb_max = self.vertices.max(axis=0)
+        self.bound = float(np.linalg.norm(self.vertices, axis=1).max())
 
     def _face_normals(self) -> np.ndarray:
         tri = self.vertices[self.faces]
@@ -85,6 +88,30 @@ def cylinder(radius: float = 0.5, height: float = 1.0, segments: int = 12,
         t0, t1 = segments + i, segments + j
         faces += [(b0, b1, t1), (b0, t1, t0)]          # side
         faces += [(bottom_center, b1, b0), (top_center, t0, t1)]  # caps
+    return Mesh(verts, faces, base_color=color).orient_outward()
+
+
+def cone(radius: float = 0.5, length: float = 1.0, segments: int = 12,
+         color=(200, 200, 200)) -> Mesh:
+    """Cone along Z: apex at +length/2, open base ring at -length/2.
+
+    Built as a spotlight housing — the wide end faces -Z, the direction
+    spotlights aim, so rotating the entity aims the housing and beam together.
+    """
+    hz = length * 0.5
+    verts = []
+    for i in range(segments):
+        a = 2.0 * math.pi * i / segments
+        verts.append((math.cos(a) * radius, math.sin(a) * radius, -hz))
+    apex = len(verts)
+    verts.append((0.0, 0.0, hz))
+    base_center = len(verts)
+    verts.append((0.0, 0.0, -hz))
+
+    faces = []
+    for i in range(segments):
+        j = (i + 1) % segments
+        faces += [(i, j, apex), (base_center, j, i)]
     return Mesh(verts, faces, base_color=color).orient_outward()
 
 

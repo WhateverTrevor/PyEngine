@@ -140,7 +140,9 @@ class ShadowTracer:
         key = (entity, light)
         mkey = entity.transform.matrix().tobytes()
         lkey = (round(float(light_pos[0]), 4), round(float(light_pos[1]), 4),
-                round(float(light_pos[2]), 4), light.radius, light.shadow_samples)
+                round(float(light_pos[2]), 4), light.radius, light.shadow_samples,
+                light.range, getattr(light, "inner", 0.0), getattr(light, "outer", 0.0),
+                light.ies)
         cached = self._cache.get(key)
         if cached is not None:
             age = self.frame - cached["frame"]

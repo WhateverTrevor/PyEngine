@@ -22,12 +22,19 @@ py demo.py       # bright playground demo
 | Input | Action |
 |---|---|
 | **RMB (hold)** | mouse look + WASD/Space/Ctrl fly, Shift = fast |
-| **LMB** | select in viewport/outliner; drag assets from the content browser into the world |
+| **LMB** | select in viewport/outliner; drag assets from the content browser into the world; drag sliders in the Details panel |
 | **Z** | focus camera on selection |
 | **Ctrl+D / Del** | duplicate / delete selection |
 | **Ctrl+S** | save scene (`scenes/scene.json`) |
 | **F** | toggle flashlight |
-| **F1 / H / Esc** | wireframe / HUD / quit |
+| **C** | toggle player collision (on by default — walls block you) |
+| **F1 / F2** | wireframe / switch per-pixel <-> flat lighting |
+| **H / Esc** | HUD / quit |
+
+Select any light (viewport or outliner) and the **Details panel** exposes it:
+brightness, RGB color, throw (range), shadow softness, spotlight cone inner
+angle and penumbra, IES profile, enabled, and shadow casting. Edits apply
+live and persist through Ctrl+S.
 
 The mouse is only captured while a look button is held — release and the
 cursor is free (demo uses LMB *or* RMB; the editor reserves LMB for selection).
@@ -53,6 +60,29 @@ scenes/         saved scenes
 demo.py         bright playground demo
 ```
 
+### Per-pixel deferred lighting
+
+The default shading path lights every pixel individually. Depth-sorted
+triangles are filled into a low-resolution *face-ID buffer* (pygame's C
+rasterizer), then numpy reconstructs each pixel's world position by
+intersecting its camera ray with the face's plane and evaluates every light
+per pixel: smooth distance falloff, smooth spotlight cones with adjustable
+penumbra, IES angular profiles, per-pixel fog. The frame is upscaled to the
+window — the chunky internal resolution (`--pixel-scale`, default 1/4) is
+both the performance budget and a deliberate PS1-horror aesthetic. F2 falls
+back to classic flat per-face shading.
+
+Lights carry an **IES profile** — an angular intensity curve like real
+photometric IES files (`uniform`, `spot_soft`, `downlight`, `batwing`),
+sampled against the angle from the light's axis per pixel.
+
+### Collision
+
+The player is a sphere tested against every collidable entity's oriented
+bounding box, resolved in the entity's local space so rotated walls work and
+the player slides along surfaces instead of sticking. `"collidable": false`
+in an asset opts out (the Ghost — you walk right through it).
+
 ### Ray-traced soft shadows
 
 Lights are physical spheres (`radius`), not points. For every face a light
@@ -61,7 +91,8 @@ distributed across the light's sphere and intersects them against all
 shadow-casting geometry (vectorized Moller-Trumbore, rays x triangles in
 chunks). The unblocked fraction is the shadow factor — fully blocked faces go
 dark, partially blocked faces land in the penumbra, so shadow edges are soft.
-Granularity is per *face* (the engine flat-shades), not per pixel.
+Shadow granularity is per *face*; the per-pixel path modulates its smooth
+per-pixel light with these per-face factors.
 
 What keeps it real-time:
 
@@ -112,9 +143,10 @@ updates behaviors on a fixed 60 Hz timestep, decoupled from render rate.
 Known trade-off: painter's sorting is per-face, so interpenetrating geometry
 can occasionally sort wrong — the classic software-rendering compromise.
 
-Measured on this machine: the starter horror scene (21 entities, 5
-shadow-casting lights, flashlight on) runs ~38 FPS at 1440x810; the bright
-demo scene ~56-60 FPS at 1280x720.
+Measured on this machine at 1440x810: the starter horror scene (6
+shadow-casting lights, flashlight on) runs ~28-33 FPS with per-pixel
+lighting at 1/4 internal resolution, ~38-45 FPS in flat mode; the bright
+demo scene ~53 FPS at 1280x720.
 
 ## Extending it
 

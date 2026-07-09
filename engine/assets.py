@@ -31,10 +31,15 @@ _MESH_FACTORIES = {
     "cube": mesh_mod.cube,
     "box": mesh_mod.box,
     "cylinder": mesh_mod.cylinder,
+    "cone": mesh_mod.cone,
     "icosphere": mesh_mod.icosphere,
     "torus": mesh_mod.torus,
     "checkerboard": mesh_mod.checkerboard,
 }
+
+# light attributes the editor can change and scenes persist per entity
+_LIGHT_PROPS = ("intensity", "color", "range", "radius", "inner", "outer",
+                "ies", "enabled", "cast_shadows")
 
 
 def _tupled(spec: dict) -> dict:
@@ -53,6 +58,9 @@ class AssetDef:
         entity = Entity(name or self.name)
         entity.asset_name = self.name
         entity.casts_shadow = d.get("casts_shadow", True)
+        entity.collidable = d.get("collidable", True)
+        if "rotation" in d:
+            entity.transform.rotation = Vec3(*d["rotation"])
 
         if "mesh" in d:
             spec = _tupled(dict(d["mesh"]))
@@ -106,6 +114,22 @@ def _vec(v: Vec3) -> list[float]:
     return [round(v.x, 4), round(v.y, 4), round(v.z, 4)]
 
 
+def _entity_dict(e: Entity) -> dict:
+    d = {"asset": e.asset_name, "name": e.name,
+         "position": _vec(e.transform.position),
+         "rotation": _vec(e.transform.rotation),
+         "scale": _vec(e.transform.scale)}
+    if e.light is not None:
+        light = {k: getattr(e.light, k) for k in _LIGHT_PROPS if hasattr(e.light, k)}
+        light["color"] = list(e.light.color)
+        # a Flicker overwrites intensity every frame; persist its base value
+        for b in e.behaviors:
+            if isinstance(b, behaviors_mod.Flicker) and hasattr(b, "base"):
+                light["intensity"] = b.base
+        d["light"] = light
+    return d
+
+
 def save_scene(scene: Scene, camera: Camera, path: str) -> None:
     dl = scene.light
     data = {
@@ -118,13 +142,8 @@ def save_scene(scene: Scene, camera: Camera, path: str) -> None:
         "sky": ([list(scene.sky[0]), list(scene.sky[1])] if scene.sky else None),
         "background": list(scene.background),
         "enable_shadows": scene.enable_shadows,
-        "entities": [
-            {"asset": e.asset_name, "name": e.name,
-             "position": _vec(e.transform.position),
-             "rotation": _vec(e.transform.rotation),
-             "scale": _vec(e.transform.scale)}
-            for e in scene.entities if e.asset_name is not None
-        ],
+        "entities": [_entity_dict(e) for e in scene.entities
+                     if e.asset_name is not None],
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -153,6 +172,11 @@ def load_scene(path: str, library: AssetLibrary,
         t.position = Vec3(*spec.get("position", [0, 0, 0]))
         t.rotation = Vec3(*spec.get("rotation", [0, 0, 0]))
         t.scale = Vec3(*spec.get("scale", [1, 1, 1]))
+        if "light" in spec and entity.light is not None:
+            for key, value in spec["light"].items():
+                if key in _LIGHT_PROPS:
+                    setattr(entity.light, key,
+                            tuple(value) if key == "color" else value)
         scene.add(entity)
 
     if camera is not None and "camera" in data:

@@ -85,6 +85,7 @@ class Engine:
         `max_frames` + `screenshot_path` support benchmarking.
         """
         self._end_splash()
+        self.scene = scene  # behaviors (e.g. collision) may query the live scene
         clock = pygame.time.Clock()
         last = time.perf_counter()
         start_time = last
@@ -116,6 +117,8 @@ class Engine:
                 # engine hotkeys consume edges alongside behaviors
                 if self.input.pressed(pygame.K_F1):
                     self.renderer.wireframe = not self.renderer.wireframe
+                if self.input.pressed(pygame.K_F2):
+                    self.renderer.per_pixel = not self.renderer.per_pixel
                 if self.input.pressed(pygame.K_h):
                     self.show_hud = not self.show_hud
                 self.input.consume_edges()
@@ -146,7 +149,7 @@ class Engine:
 
     def _draw_hud(self, fps: float, scene) -> None:
         stats = self.renderer.stats
-        lines = [f"{fps:5.1f} FPS | {stats['triangles']} tris | "
+        lines = [f"{fps:5.1f} FPS | {stats['mode']} | {stats['triangles']} tris | "
                  f"{stats['shadow_lights']} shadow lights | {len(scene.entities)} entities"]
         if self.hud_text:
             lines.append(self.hud_text)
