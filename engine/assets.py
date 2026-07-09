@@ -27,6 +27,7 @@ from . import mesh as mesh_mod
 from .camera import Camera
 from .environment import Environment, load_hdr
 from .lighting import DirectionalLight, Fog, PointLight, SpotLight
+from .materials import MaterialGraph
 from .math3d import Vec3
 from .scene import Entity, Scene
 
@@ -71,9 +72,12 @@ class AssetDef:
             if primitive == "model":  # imported geometry (e.g. FBX -> .npz)
                 data = np.load(os.path.join(os.path.dirname(self.path),
                                             spec.pop("path")))
+                face_colors = (data["face_colors"].astype(np.float64)
+                               if "face_colors" in data else None)
                 entity.mesh = mesh_mod.Mesh(
                     data["vertices"], [tuple(f) for f in data["faces"]],
-                    base_color=spec.get("color", (170, 170, 175)))
+                    base_color=spec.get("color", (170, 170, 175)),
+                    face_colors=face_colors)
             else:
                 entity.mesh = _MESH_FACTORIES[primitive](**spec)
 
@@ -143,6 +147,8 @@ def _entity_dict(e: Entity) -> dict:
             if isinstance(b, behaviors_mod.Flicker) and hasattr(b, "base"):
                 light["intensity"] = b.base
         d["light"] = light
+    if e.material is not None:
+        d["material"] = e.material.to_dict()
     return d
 
 
@@ -193,6 +199,9 @@ def load_scene(path: str, library: AssetLibrary,
                 if key in _LIGHT_PROPS:
                     setattr(entity.light, key,
                             tuple(value) if key == "color" else value)
+        if "material" in spec and entity.mesh is not None:
+            entity.material = MaterialGraph.from_dict(spec["material"])
+            entity.material.apply(entity.mesh)
         scene.add(entity)
 
     if camera is not None and "camera" in data:

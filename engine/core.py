@@ -31,6 +31,7 @@ class Engine:
         self._small_font = pygame.font.SysFont("consolas,couriernew,monospace", 12)
         self._title_font = pygame.font.SysFont("consolas,couriernew,monospace", 32, bold=True)
         self._hud_cache: dict[str, pygame.Surface] = {}
+        self.esc_handler = None  # callable returning True to consume an Escape press
         self._splash_active = False
         if splash:
             self.screen = pygame.display.set_mode(_SPLASH_SIZE, pygame.NOFRAME)
@@ -99,7 +100,8 @@ class Engine:
                 if e.type == pygame.QUIT:
                     running = False
                 elif e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
-                    running = False
+                    if not (self.esc_handler is not None and self.esc_handler()):
+                        running = False
             self.input.process(events)
 
             now = time.perf_counter()

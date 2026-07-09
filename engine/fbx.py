@@ -136,12 +136,92 @@ def _global_settings(roots):
     return up_axis, unit_scale
 
 
-def extract_geometry(path: str) -> tuple[np.ndarray, list[tuple]]:
-    """All geometry in the file, merged: (vertices (N,3), polygon index tuples)."""
+_DEFAULT_DIFFUSE = (0.66, 0.67, 0.69)
+
+
+def _material_colors(roots) -> dict[int, tuple]:
+    """Material node id -> linear diffuse color (0..1)."""
+    colors = {}
+    for root in roots:
+        if root.name != "Objects":
+            continue
+        for mat in root.find("Material"):
+            if not mat.props:
+                continue
+            mat_id = int(mat.props[0])
+            color = _DEFAULT_DIFFUSE
+            p70 = mat.first("Properties70")
+            if p70 is not None:
+                for p in p70.find("P"):
+                    if p.props and p.props[0] in ("DiffuseColor", "Diffuse") \
+                            and len(p.props) >= 7:
+                        color = (float(p.props[4]), float(p.props[5]),
+                                 float(p.props[6]))
+                        break
+            colors[mat_id] = color
+    return colors
+
+
+def _connections(roots) -> list[tuple[int, int]]:
+    """(child_id, parent_id) object-object connections."""
+    out = []
+    for root in roots:
+        if root.name != "Connections":
+            continue
+        for c in root.find("C"):
+            if len(c.props) >= 3 and c.props[0] == "OO":
+                out.append((int(c.props[1]), int(c.props[2])))
+    return out
+
+
+def _geometry_materials(geo) -> tuple[list[int] | None, str]:
+    """Per-polygon material indices for a Geometry node, or None."""
+    layer = geo.first("LayerElementMaterial")
+    if layer is None:
+        return None, "AllSame"
+    mapping = "AllSame"
+    mnode = layer.first("MappingInformationType")
+    if mnode is not None and mnode.props:
+        mapping = str(mnode.props[0])
+    arr = layer.first("Materials")
+    if arr is None or not arr.props or not len(arr.props[0]):
+        return None, mapping
+    return [int(v) for v in np.asarray(arr.props[0])], mapping
+
+
+def extract_geometry(path: str):
+    """All geometry in the file, merged.
+
+    Returns (vertices (N,3), polygon index tuples, per-face colors (M,3) 0..1).
+    Face colors come from each geometry's material layer, resolved through the
+    FBX connection graph (geometry -> model <- materials, in connection order).
+    """
     roots, _version = parse_fbx(path)
     up_axis, unit_scale = _global_settings(roots)
+    mat_colors = _material_colors(roots)
+    connections = _connections(roots)
 
-    all_verts, all_faces = [], []
+    # geometry id -> model id, model id -> [material ids in connection order]
+    geo_ids = set()
+    model_ids = set()
+    for root in roots:
+        if root.name != "Objects":
+            continue
+        for geo in root.find("Geometry"):
+            if geo.props:
+                geo_ids.add(int(geo.props[0]))
+        for mdl in root.find("Model"):
+            if mdl.props:
+                model_ids.add(int(mdl.props[0]))
+    geo_to_model: dict[int, int] = {}
+    model_mats: dict[int, list[int]] = {}
+    for child, parent in connections:
+        if child in geo_ids and parent in model_ids:
+            geo_to_model[child] = parent
+        elif child in mat_colors and parent in model_ids:
+            model_mats.setdefault(parent, []).append(child)
+
+    all_verts, all_faces, all_colors = [], [], []
     offset = 0
     for root in roots:
         if root.name != "Objects":
@@ -152,17 +232,36 @@ def extract_geometry(path: str) -> tuple[np.ndarray, list[tuple]]:
                 continue
             verts = np.asarray(vnode.props[0], dtype=np.float64).reshape(-1, 3)
             idx = np.asarray(inode.props[0], dtype=np.int64)
+
+            gid = int(geo.props[0]) if geo.props else -1
+            palette = [mat_colors.get(mid, _DEFAULT_DIFFUSE)
+                       for mid in model_mats.get(geo_to_model.get(gid, -1), [])]
+            mat_idx, _mapping = _geometry_materials(geo)
+
+            def poly_color(poly_i: int) -> tuple:
+                if not palette:
+                    return _DEFAULT_DIFFUSE
+                if mat_idx is None:
+                    return palette[0]
+                i = mat_idx[poly_i] if poly_i < len(mat_idx) else mat_idx[-1]
+                return palette[i] if 0 <= i < len(palette) else palette[0]
+
             poly: list[int] = []
+            poly_i = 0
             for raw in idx:
                 if raw < 0:
                     poly.append(int(~raw))
+                    color = poly_color(poly_i)
                     if len(poly) == 3 or len(poly) == 4:
                         all_faces.append(tuple(i + offset for i in poly))
+                        all_colors.append(color)
                     elif len(poly) > 4:  # fan-split n-gons
                         for k in range(1, len(poly) - 1):
                             all_faces.append((poly[0] + offset, poly[k] + offset,
                                               poly[k + 1] + offset))
+                            all_colors.append(color)
                     poly = []
+                    poly_i += 1
                 else:
                     poly.append(int(raw))
             all_verts.append(verts)
@@ -174,13 +273,13 @@ def extract_geometry(path: str) -> tuple[np.ndarray, list[tuple]]:
     vertices *= unit_scale * 0.01  # FBX native units are centimeters
     if up_axis == 2:  # Z-up -> engine Y-up
         vertices = vertices[:, [0, 2, 1]] * np.array([1.0, 1.0, -1.0])
-    return vertices, all_faces
+    return vertices, all_faces, np.asarray(all_colors, dtype=np.float64)
 
 
 def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
                max_bound: float = 4.0) -> str:
     """Convert an .fbx into a content-browser asset. Returns the asset name."""
-    vertices, faces = extract_geometry(path)
+    vertices, faces, face_colors = extract_geometry(path)
 
     # center on the ground and normalize outlandish scales
     vertices = vertices - vertices.mean(axis=0)
@@ -197,7 +296,9 @@ def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
     padded = [f if len(f) == 4 else (f[0], f[1], f[2], f[2]) for f in faces]
     np.savez_compressed(os.path.join(models_dir, f"{stem}.npz"),
                         vertices=vertices.astype(np.float32),
-                        faces=np.asarray(padded, dtype=np.int32))
+                        faces=np.asarray(padded, dtype=np.int32),
+                        face_colors=np.clip(face_colors * 255.0, 0, 255
+                                            ).astype(np.uint8))
 
     asset = {
         "name": name,

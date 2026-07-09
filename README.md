@@ -33,11 +33,24 @@ py demo.py       # bright playground demo
 | **F1 / F2** | wireframe / switch per-pixel <-> flat lighting |
 | **H / Esc** | HUD / quit |
 
-Selecting an entity shows a **transform gizmo** — drag the red/green/blue
-axis arrows to move it along world X/Y/Z. The **+ Import FBX** button in the
-content browser opens a file picker and converts a binary FBX model into a
-regular asset (geometry only; saved to `assets/models/`, appears in the
-browser immediately).
+Selecting an entity shows a **transform gizmo**; **G** cycles its mode:
+translate (drag the red/green/blue arrows), rotate (drag the projected axis
+rings), scale (drag axis handles, or the center square for uniform scale).
+
+The **+ Import FBX** button in the content browser opens a file picker and
+converts a binary FBX model into a regular asset (saved to `assets/models/`,
+appears in the browser immediately). Material diffuse colors are extracted
+and baked as per-face colors — multi-material models keep their coloring.
+
+![material editor](docs/material_editor.png)
+
+**Material editor** (select a mesh entity, press **M** or click *material*
+in the Details panel): a node-based graph — Color/Position/Normal/Checker/
+Noise/Gradient sources wired through Mix/Multiply into the Output node.
+Drag from an output port to an input port to connect; click a wired input to
+unplug and re-route; drag the sliders inside nodes to tune parameters. Every
+change re-bakes the mesh's per-face colors instantly, so the viewport behind
+the panel is a live preview. Graphs are saved with the scene.
 
 Select any light (viewport or outliner) and the **Details panel** exposes it:
 brightness, RGB color, throw (range), shadow softness, spotlight cone inner
@@ -56,7 +69,8 @@ engine/
   camera.py       perspective camera, world<->screen projection, picking rays
   lighting.py     DirectionalLight, PointLight, SpotLight, IES profiles, Fog
   environment.py  Radiance .hdr (RGBE) I/O + HDRI sky sampling & ambient cube
-  fbx.py          minimal binary FBX parser -> engine assets
+  fbx.py          minimal binary FBX parser (geometry + materials) -> assets
+  materials.py    node-based material graphs, baked to per-face colors
   raytrace.py     ray-traced soft shadows + scene picking (Moller-Trumbore)
   scene.py        Scene / Entity / Transform / Behavior (component system)
   behaviors.py    Spin, Bob, Orbit, Flicker, FlyController (+collision), ...

@@ -129,7 +129,9 @@ class Editor:
         self.browser_scroll = 0
         self.drag_asset = None
         self.active_slider = None   # index into _details_rows while dragging
-        self.gizmo_drag = None      # {"axis", "start", "press", "dpx", "length"}
+        self.gizmo_drag = None      # active gizmo drag state dict
+        self.gizmo_mode = "translate"  # G cycles translate / rotate / scale
+        self.mat_ui = None          # open MaterialEditorUI, or None
         self.status = ("", 0.0)     # transient message near the content browser
         self.save_flash = 0.0
         self.font = pygame.font.SysFont("consolas,couriernew,monospace", 14)
@@ -155,6 +157,8 @@ class Editor:
         return pygame.Rect(0, h - BROWSER_H, w, BROWSER_H)
 
     def over_ui(self, pos) -> bool:
+        if self.mat_ui is not None:
+            return True
         w, h = self.eng.screen.get_size()
         return (self.outliner_rect(w, h).collidepoint(pos)
                 or self.details_rect(w, h).collidepoint(pos)
@@ -165,70 +169,157 @@ class Editor:
                 if e.mesh is not None or e.light is not None
                 or e.environment is not None]
 
-    # ---- transform gizmo (world-axis translation arrows) ----
+    # ---- transform gizmo: G cycles translate / rotate / scale ----
     _GIZMO_AXES = (((1.0, 0.0, 0.0), (225, 85, 85)),
                    ((0.0, 1.0, 0.0), (105, 215, 105)),
                    ((0.0, 0.0, 1.0), (95, 145, 250)))
+    _GIZMO_MODES = ("translate", "rotate", "scale")
 
-    def _gizmo_handles(self, w, h):
-        """Screen-space axis segments for the selection: [(axis, s0, s1, color)]."""
+    def _gizmo_center(self, w, h):
         e = self.selected
         if e is None:
-            return []
-        Vec3 = self.engine_mod.Vec3
+            return None, None, None
         p = e.transform.position
-        cam = self.camera
-        dist = (p - cam.position).length()
+        dist = (p - self.camera.position).length()
         length = max(0.6, dist * 0.14)
-        s0 = cam.project(p, w, h)
+        s0 = self.camera.project(p, w, h)
+        return p, s0, length
+
+    def _gizmo_handles(self, w, h):
+        """Axis segments for translate/scale: [(i, axis, s0, s1, color, length)]."""
+        p, s0, length = self._gizmo_center(w, h)
         if s0 is None:
             return []
+        Vec3 = self.engine_mod.Vec3
         handles = []
-        for axis, color in self._GIZMO_AXES:
+        for i, (axis, color) in enumerate(self._GIZMO_AXES):
             tip = Vec3(p.x + axis[0] * length, p.y + axis[1] * length,
                        p.z + axis[2] * length)
-            s1 = cam.project(tip, w, h)
+            s1 = self.camera.project(tip, w, h)
             if s1 is not None:
-                handles.append((axis, (s0[0], s0[1]), (s1[0], s1[1]),
+                handles.append((i, axis, (s0[0], s0[1]), (s1[0], s1[1]),
                                 color, length))
         return handles
 
+    def _gizmo_rings(self, w, h, steps=28):
+        """Projected axis circles for rotate mode: [(i, axis, points, color)]."""
+        import numpy as np
+        p, s0, length = self._gizmo_center(w, h)
+        if s0 is None:
+            return []
+        Vec3 = self.engine_mod.Vec3
+        radius = length * 0.85
+        rings = []
+        for i, (axis, color) in enumerate(self._GIZMO_AXES):
+            a = np.array(axis, dtype=float)
+            u = np.cross(a, [0.0, 0.0, 1.0])
+            if np.linalg.norm(u) < 1e-6:
+                u = np.cross(a, [0.0, 1.0, 0.0])
+            u /= np.linalg.norm(u)
+            v = np.cross(a, u)
+            pts = []
+            for k in range(steps + 1):
+                t = 2.0 * math.pi * k / steps
+                wp = (u * math.cos(t) + v * math.sin(t)) * radius
+                sp = self.camera.project(Vec3(p.x + wp[0], p.y + wp[1],
+                                              p.z + wp[2]), w, h)
+                pts.append((sp[0], sp[1]) if sp is not None else None)
+            rings.append((i, axis, pts, color))
+        return rings
+
     @staticmethod
     def _segment_distance(p, a, b):
-        import math as m
         ax, ay = b[0] - a[0], b[1] - a[1]
         seg2 = ax * ax + ay * ay
         if seg2 < 1e-9:
-            return m.hypot(p[0] - a[0], p[1] - a[1])
+            return math.hypot(p[0] - a[0], p[1] - a[1])
         t = max(0.0, min(1.0, ((p[0] - a[0]) * ax + (p[1] - a[1]) * ay) / seg2))
-        return m.hypot(p[0] - (a[0] + ax * t), p[1] - (a[1] + ay * t))
+        return math.hypot(p[0] - (a[0] + ax * t), p[1] - (a[1] + ay * t))
 
     def _try_grab_gizmo(self, mp, w, h) -> bool:
+        e = self.selected
+        if e is None:
+            return False
+        mode = self.gizmo_mode
+        t, s = e.transform, e.transform.scale
+        if mode == "rotate":
+            _p, s0, _len = self._gizmo_center(w, h)
+            best = None
+            for i, axis, pts, _c in self._gizmo_rings(w, h):
+                for a, b in zip(pts, pts[1:]):
+                    if a is None or b is None:
+                        continue
+                    d = self._segment_distance(mp, a, b)
+                    if d < 9.0 and (best is None or d < best[0]):
+                        best = (d, i, axis)
+            if best is None:
+                return False
+            _d, i, axis = best
+            to_cam = self.camera.position - t.position
+            toward = (axis[0] * to_cam.x + axis[1] * to_cam.y
+                      + axis[2] * to_cam.z) > 0
+            self.gizmo_drag = {
+                "mode": "rotate", "axis_i": i, "center": (s0[0], s0[1]),
+                "a0": math.atan2(mp[1] - s0[1], mp[0] - s0[0]),
+                "sign": -1.0 if toward else 1.0,
+                "start": (t.rotation.x, t.rotation.y, t.rotation.z)}
+            return True
+
+        handles = self._gizmo_handles(w, h)
+        if mode == "scale":
+            _p, s0, _len = self._gizmo_center(w, h)
+            if s0 is not None and math.hypot(mp[0] - s0[0], mp[1] - s0[1]) < 10:
+                self.gizmo_drag = {"mode": "scale", "axis_i": -1, "press": mp,
+                                   "start": (s.x, s.y, s.z)}
+                return True
         best = None
-        for axis, s0, s1, _color, length in self._gizmo_handles(w, h):
+        for i, axis, s0, s1, _color, length in handles:
             d = self._segment_distance(mp, s0, s1)
             if d < 9.0 and (best is None or d < best[0]):
-                best = (d, axis, s0, s1, length)
+                best = (d, i, axis, s0, s1, length)
         if best is None:
             return False
-        _d, axis, s0, s1, length = best
-        p = self.selected.transform.position
-        self.gizmo_drag = {"axis": axis, "start": (p.x, p.y, p.z), "press": mp,
-                           "dpx": (s1[0] - s0[0], s1[1] - s0[1]), "length": length}
+        _d, i, axis, s0, s1, length = best
+        self.gizmo_drag = {
+            "mode": mode, "axis_i": i, "axis": axis, "press": mp,
+            "dpx": (s1[0] - s0[0], s1[1] - s0[1]), "length": length,
+            "start": ((t.position.x, t.position.y, t.position.z)
+                      if mode == "translate" else (s.x, s.y, s.z))}
         return True
 
     def _update_gizmo_drag(self, mp) -> None:
         g = self.gizmo_drag
+        Vec3 = self.engine_mod.Vec3
+        e = self.selected
+        if g["mode"] == "rotate":
+            cx, cy = g["center"]
+            ang = math.atan2(mp[1] - cy, mp[0] - cx)
+            delta = (ang - g["a0"]) * g["sign"]
+            r = list(g["start"])
+            r[g["axis_i"]] += delta
+            e.transform.rotation = Vec3(*r)
+            self.dirty = True
+            return
+        if g["mode"] == "scale" and g["axis_i"] == -1:
+            factor = max(0.05, 1.0 + (mp[0] - g["press"][0]) * 0.004)
+            s = g["start"]
+            e.transform.scale = Vec3(s[0] * factor, s[1] * factor, s[2] * factor)
+            self.dirty = True
+            return
         dx, dy = g["dpx"]
         seg2 = dx * dx + dy * dy
         if seg2 < 1e-9:
             return
         t = ((mp[0] - g["press"][0]) * dx + (mp[1] - g["press"][1]) * dy) / seg2
-        move = t * g["length"]
-        ax = g["axis"]
-        s = g["start"]
-        self.selected.transform.position = self.engine_mod.Vec3(
-            s[0] + ax[0] * move, s[1] + ax[1] * move, s[2] + ax[2] * move)
+        if g["mode"] == "translate":
+            move = t * g["length"]
+            ax, s = g["axis"], g["start"]
+            e.transform.position = Vec3(s[0] + ax[0] * move, s[1] + ax[1] * move,
+                                        s[2] + ax[2] * move)
+        else:  # per-axis scale
+            s = list(g["start"])
+            s[g["axis_i"]] = s[g["axis_i"]] * max(0.05, 1.0 + t)
+            e.transform.scale = Vec3(*s)
         self.dirty = True
 
     # ---- details panel rows for the selected light ----
@@ -236,14 +327,20 @@ class Editor:
         e = self.selected
         if e is None:
             return []
+        rows = []
+        if e.mesh is not None:
+            rows.append({"kind": "button", "label": "material",
+                         "text": "open node editor  (M)",
+                         "action": lambda: setattr(self, "mat_ui",
+                                                   MaterialEditorUI(self, e))})
         if e.environment is not None:
             env = e.environment
-            return [{"kind": "slider", "label": "env strength", "min": 0.0,
-                     "max": 3.0, "get": lambda: env.strength,
-                     "set": lambda v: setattr(env, "strength", v),
-                     "fmt": "{:.2f}"}]
+            return rows + [{"kind": "slider", "label": "env strength", "min": 0.0,
+                            "max": 3.0, "get": lambda: env.strength,
+                            "set": lambda v: setattr(env, "strength", v),
+                            "fmt": "{:.2f}"}]
         if e.light is None:
-            return []
+            return rows
         light = e.light
         Flicker = self.engine_mod.behaviors.Flicker
         SpotLight = self.engine_mod.SpotLight
@@ -271,7 +368,7 @@ class Editor:
             return {"kind": "slider", "label": label, "min": lo, "max": hi,
                     "get": get, "set": set_, "fmt": fmt}
 
-        rows = [
+        rows += [
             slider("brightness", 0.0, 5.0, get_intensity, set_intensity),
             slider("red", 0, 255, lambda: light.color[0], color_setter(0), "{:.0f}"),
             slider("green", 0, 255, lambda: light.color[1], color_setter(1), "{:.0f}"),
@@ -324,6 +421,12 @@ class Editor:
         drect = self.details_rect(w, h)
         brect = self.browser_rect(w, h)
         self.save_flash = max(0.0, self.save_flash - dt)
+        if self.status[1] > 0:
+            self.status = (self.status[0], self.status[1] - dt)
+
+        if self.mat_ui is not None:  # node editor captures all editor input
+            self.mat_ui.update(engine, dt)
+            return
 
         if inp.wheel:
             if orect.collidepoint(mp):
@@ -400,6 +503,13 @@ class Editor:
             self._focus(self.selected)
         if inp.pressed(pygame.K_c) and self.fly is not None:
             self.fly.collide = not self.fly.collide
+        if inp.pressed(pygame.K_g):
+            modes = self._GIZMO_MODES
+            self.gizmo_mode = modes[(modes.index(self.gizmo_mode) + 1) % len(modes)]
+            self.gizmo_drag = None
+        if inp.pressed(pygame.K_m) and self.selected is not None \
+                and self.selected.mesh is not None:
+            self.mat_ui = MaterialEditorUI(self, self.selected)
 
         # rotate / scale the selection
         if self.selected is not None:
@@ -417,8 +527,12 @@ class Editor:
                     sc.x * f, sc.y * f, sc.z * f)
                 self.dirty = True
 
-        if self.status[1] > 0:
-            self.status = (self.status[0], self.status[1] - dt)
+    def handle_escape(self) -> bool:
+        """Engine Esc hook: closes the material editor instead of quitting."""
+        if self.mat_ui is not None:
+            self.mat_ui.close()
+            return True
+        return False
 
     def _import_btn_rect(self, brect):
         import pygame
@@ -465,6 +579,8 @@ class Editor:
         elif row["kind"] == "toggle":
             row["set"](not row["get"]())
             self.dirty = True
+        elif row["kind"] == "button":
+            row["action"]()
 
     def _click_outliner(self, mp, orect) -> None:
         rows = self._outliner_rows()
@@ -534,6 +650,8 @@ class Editor:
                 ghost.set_alpha(150)
                 mp = eng.input.mouse_pos
                 surf.blit(ghost, (mp[0] - ICON // 2, mp[1] - ICON // 2))
+        if self.mat_ui is not None:
+            self.mat_ui.draw(surf)
 
     def _draw_markers(self, surf, w, h) -> None:
         import numpy as np
@@ -556,13 +674,37 @@ class Editor:
         e = self.selected
         if e is None:
             return
-        for axis, s0, s1, color, _length in self._gizmo_handles(w, h):
-            active = (self.gizmo_drag is not None
-                      and self.gizmo_drag["axis"] == axis)
-            c = (255, 255, 255) if active else color
-            pygame.draw.line(surf, c, (int(s0[0]), int(s0[1])),
-                             (int(s1[0]), int(s1[1])), 3)
-            pygame.draw.circle(surf, c, (int(s1[0]), int(s1[1])), 6)
+        drag = self.gizmo_drag
+        if self.gizmo_mode == "rotate":
+            for i, _axis, pts, color in self._gizmo_rings(w, h):
+                active = drag is not None and drag.get("axis_i") == i
+                c = (255, 255, 255) if active else color
+                for a, b in zip(pts, pts[1:]):
+                    if a is not None and b is not None:
+                        pygame.draw.line(surf, c, (int(a[0]), int(a[1])),
+                                         (int(b[0]), int(b[1])), 2)
+        else:
+            for i, _axis, s0, s1, color, _length in self._gizmo_handles(w, h):
+                active = drag is not None and drag.get("axis_i") == i
+                c = (255, 255, 255) if active else color
+                pygame.draw.line(surf, c, (int(s0[0]), int(s0[1])),
+                                 (int(s1[0]), int(s1[1])), 3)
+                tip = (int(s1[0]), int(s1[1]))
+                if self.gizmo_mode == "translate":
+                    pygame.draw.circle(surf, c, tip, 6)
+                else:
+                    pygame.draw.rect(surf, c, (tip[0] - 5, tip[1] - 5, 10, 10))
+            if self.gizmo_mode == "scale":
+                _p, s0, _l = self._gizmo_center(w, h)
+                if s0 is not None:
+                    active = drag is not None and drag.get("axis_i") == -1
+                    c = (255, 255, 255) if active else (200, 200, 205)
+                    pygame.draw.rect(surf, c, (int(s0[0]) - 6, int(s0[1]) - 6,
+                                               12, 12), 2)
+        _p, s0, _l = self._gizmo_center(w, h)
+        if s0 is not None:
+            mode_label = self.font_small.render(self.gizmo_mode, True, TEXT_DIM)
+            surf.blit(mode_label, (int(s0[0]) + 12, int(s0[1]) + 10))
         pt = self.camera.project(e.transform.position, w, h)
         if pt is None:
             return
@@ -671,6 +813,9 @@ class Editor:
                     pygame.draw.rect(surf, ACCENT, box.inflate(-4, -4), border_radius=2)
                 state = self.font_small.render("on" if on else "off", True, TEXT)
                 surf.blit(state, (box.right + 8, rr.y + 5))
+            elif row["kind"] == "button":
+                value = self.font_small.render(row["text"], True, ACCENT)
+                surf.blit(value, (rr.x + 96, rr.y + 5))
 
     def _draw_browser(self, surf, rect) -> None:
         import pygame
@@ -704,6 +849,248 @@ class Editor:
                 surf.blit(label, (x + (TILE_W - label.get_width()) // 2,
                                   rect.y + 30 + ICON + 3))
             x += TILE_W + 8
+
+
+NODE_W = 150
+
+
+class MaterialEditorUI:
+    """Node-based material editor: drag ports to connect, drag params to tune.
+
+    The graph bakes to the entity mesh's per-face colors on every change, so
+    the 3D viewport behind the panel is a live preview.
+    """
+
+    PALETTE = ("color", "position", "normal", "checker", "noise",
+               "gradient", "mix", "multiply")
+
+    def __init__(self, editor: Editor, entity):
+        self.editor = editor
+        self.entity = entity
+        if entity.material is None:
+            entity.material = editor.engine_mod.MaterialGraph()
+        self.graph = entity.material
+        self.drag_node = None    # (node_id, grab_dx, grab_dy)
+        self.drag_link = None    # source node id while dragging a new wire
+        self.drag_param = None   # (node_id, param_name)
+        self._spawn_i = 0
+
+    def close(self) -> None:
+        self.editor.mat_ui = None
+
+    # ---- geometry ----
+    def rect(self, w, h):
+        import pygame
+        return pygame.Rect(30, 30, w - OUTLINER_W - 60, h - BROWSER_H - 60)
+
+    def node_rect(self, nid, panel):
+        import pygame
+        node = self.graph.nodes[nid]
+        inputs, params = self.editor.engine_mod.NODE_DEFS[node["type"]]
+        height = 24 + len(inputs) * 18 + len(node["params"]) * 18 + 6
+        return pygame.Rect(int(panel.x + node["pos"][0]),
+                           int(panel.y + node["pos"][1]), NODE_W, height)
+
+    def input_pos(self, nid, index, panel):
+        r = self.node_rect(nid, panel)
+        return (r.x, r.y + 24 + index * 18 + 9)
+
+    def output_pos(self, nid, panel):
+        r = self.node_rect(nid, panel)
+        return (r.right, r.y + r.height // 2)
+
+    def _param_row(self, nid, j, panel):
+        import pygame
+        node = self.graph.nodes[nid]
+        inputs, _ = self.editor.engine_mod.NODE_DEFS[node["type"]]
+        r = self.node_rect(nid, panel)
+        return pygame.Rect(r.x + 6, r.y + 24 + (len(inputs) + j) * 18,
+                           NODE_W - 12, 16)
+
+    def _palette_rects(self, panel):
+        import pygame
+        out = []
+        x = panel.x + 10
+        for t in self.PALETTE:
+            w = 24 + 7 * len(t)
+            out.append((t, pygame.Rect(x, panel.y + 6, w, 20)))
+            x += w + 6
+        return out
+
+    # ---- interaction ----
+    def apply(self) -> None:
+        self.graph.apply(self.entity.mesh)
+        self.editor.dirty = True
+
+    def update(self, engine, dt: float) -> None:
+        import pygame
+        inp = engine.input
+        mp = inp.mouse_pos
+        w, h = engine.screen.get_size()
+        panel = self.rect(w, h)
+
+        if inp.pressed(pygame.K_m):
+            self.close()
+            return
+        if inp.mouse_button_pressed(1):
+            self._press(mp, panel)
+        if inp.mouse_held(1):
+            if self.drag_node is not None:
+                nid, dx, dy = self.drag_node
+                if nid in self.graph.nodes:
+                    self.graph.nodes[nid]["pos"] = [mp[0] - panel.x - dx,
+                                                    mp[1] - panel.y - dy]
+            if self.drag_param is not None:
+                nid, pname = self.drag_param
+                if nid in self.graph.nodes:
+                    node = self.graph.nodes[nid]
+                    inputs, _ = self.editor.engine_mod.NODE_DEFS[node["type"]]
+                    j = list(node["params"]).index(pname)
+                    rr = self._param_row(nid, j, panel)
+                    lo, hi = self.editor.engine_mod.PARAM_RANGES.get(pname, (0, 1))
+                    f = min(max((mp[0] - (rr.x + 46)) / max(rr.width - 52, 1), 0.0), 1.0)
+                    node["params"][pname] = lo + f * (hi - lo)
+                    self.apply()
+        else:
+            if self.drag_link is not None:
+                self._finish_link(mp, panel)
+            self.drag_node = self.drag_param = self.drag_link = None
+
+    def _press(self, mp, panel) -> None:
+        import pygame
+        close = pygame.Rect(panel.right - 26, panel.y + 5, 20, 20)
+        if close.collidepoint(mp):
+            self.close()
+            return
+        for t, r in self._palette_rects(panel):
+            if r.collidepoint(mp):
+                self._spawn_i += 1
+                self.graph.add(t, (30 + (self._spawn_i % 5) * 40,
+                                   60 + (self._spawn_i % 7) * 30))
+                return
+        NODE_DEFS = self.editor.engine_mod.NODE_DEFS
+        for nid in reversed(list(self.graph.nodes)):
+            node = self.graph.nodes[nid]
+            r = self.node_rect(nid, panel)
+            # output port
+            ox, oy = self.output_pos(nid, panel)
+            if node["type"] != "output" and math.hypot(mp[0] - ox, mp[1] - oy) < 9:
+                self.drag_link = nid
+                return
+            # input ports: click to unplug (and grab the wire), or nothing
+            inputs, _ = NODE_DEFS[node["type"]]
+            for i, name in enumerate(inputs):
+                ix, iy = self.input_pos(nid, i, panel)
+                if math.hypot(mp[0] - ix, mp[1] - iy) < 9:
+                    src = self.graph.link_into(nid, name)
+                    if src is not None:
+                        self.graph.disconnect(nid, name)
+                        self.drag_link = src  # re-route the existing wire
+                        self.apply()
+                    return
+            if not r.collidepoint(mp):
+                continue
+            # delete button
+            if node["type"] != "output" and pygame.Rect(
+                    r.right - 18, r.y + 3, 15, 15).collidepoint(mp):
+                self.graph.remove(nid)
+                self.apply()
+                return
+            # param rows
+            for j, pname in enumerate(node["params"]):
+                if self._param_row(nid, j, panel).collidepoint(mp):
+                    self.drag_param = (nid, pname)
+                    return
+            # body drag
+            self.drag_node = (nid, mp[0] - r.x, mp[1] - r.y)
+            return
+
+    def _finish_link(self, mp, panel) -> None:
+        NODE_DEFS = self.editor.engine_mod.NODE_DEFS
+        for nid, node in self.graph.nodes.items():
+            inputs, _ = NODE_DEFS[node["type"]]
+            for i, name in enumerate(inputs):
+                ix, iy = self.input_pos(nid, i, panel)
+                if math.hypot(mp[0] - ix, mp[1] - iy) < 12:
+                    if self.graph.connect(self.drag_link, nid, name):
+                        self.apply()
+                    return
+
+    # ---- drawing ----
+    def draw(self, surf) -> None:
+        import pygame
+        w, h = surf.get_size()
+        panel = self.rect(w, h)
+        pygame.draw.rect(surf, (18, 20, 25), panel)
+        pygame.draw.rect(surf, PANEL_EDGE, panel, 1)
+        title = self.editor.font.render(
+            f"Material — {self.entity.name}   (drag ports to wire, M/Esc close)",
+            True, TEXT)
+        surf.blit(title, (panel.x + 10, panel.bottom - 24))
+        for t, r in self._palette_rects(panel):
+            hov = r.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(surf, HOVER_BG if hov else (30, 33, 40), r,
+                             border_radius=4)
+            lab = self.editor.font_small.render("+" + t, True, TEXT)
+            surf.blit(lab, (r.x + 6, r.y + 4))
+        close = pygame.Rect(panel.right - 26, panel.y + 5, 20, 20)
+        pygame.draw.rect(surf, (60, 34, 34), close, border_radius=4)
+        x_lab = self.editor.font_small.render("X", True, (230, 160, 160))
+        surf.blit(x_lab, (close.x + 7, close.y + 4))
+
+        NODE_DEFS = self.editor.engine_mod.NODE_DEFS
+        # wires
+        for src, dst, name in self.graph.links:
+            if src not in self.graph.nodes or dst not in self.graph.nodes:
+                continue
+            inputs, _ = NODE_DEFS[self.graph.nodes[dst]["type"]]
+            if name not in inputs:
+                continue
+            a = self.output_pos(src, panel)
+            b = self.input_pos(dst, inputs.index(name), panel)
+            mid = ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
+            pygame.draw.lines(surf, (150, 160, 185), False,
+                              [a, (a[0] + 18, a[1]), mid, (b[0] - 18, b[1]), b], 2)
+        if self.drag_link is not None:
+            a = self.output_pos(self.drag_link, panel)
+            pygame.draw.line(surf, ACCENT, a, pygame.mouse.get_pos(), 2)
+
+        # nodes
+        for nid, node in self.graph.nodes.items():
+            r = self.node_rect(nid, panel)
+            pygame.draw.rect(surf, (33, 36, 44), r, border_radius=5)
+            pygame.draw.rect(surf, (70, 75, 88), r, 1, border_radius=5)
+            name = self.editor.font_small.render(node["type"], True, TEXT)
+            surf.blit(name, (r.x + 8, r.y + 5))
+            if node["type"] != "output":
+                pygame.draw.line(surf, (120, 80, 80), (r.right - 16, r.y + 6),
+                                 (r.right - 7, r.y + 15), 2)
+                pygame.draw.line(surf, (120, 80, 80), (r.right - 7, r.y + 6),
+                                 (r.right - 16, r.y + 15), 2)
+                ox, oy = self.output_pos(nid, panel)
+                pygame.draw.circle(surf, (210, 190, 120), (ox, oy), 5)
+            inputs, _ = NODE_DEFS[node["type"]]
+            for i, iname in enumerate(inputs):
+                ix, iy = self.input_pos(nid, i, panel)
+                pygame.draw.circle(surf, (140, 170, 210), (ix, iy), 5)
+                lab = self.editor.font_small.render(iname, True, TEXT_DIM)
+                surf.blit(lab, (ix + 10, iy - 7))
+            for j, (pname, value) in enumerate(node["params"].items()):
+                rr = self._param_row(nid, j, panel)
+                lab = self.editor.font_small.render(pname, True, TEXT_DIM)
+                surf.blit(lab, (rr.x, rr.y + 2))
+                lo, hi = self.editor.engine_mod.PARAM_RANGES.get(pname, (0, 1))
+                f = min(max((value - lo) / max(hi - lo, 1e-9), 0.0), 1.0)
+                track_x0, track_x1 = rr.x + 46, rr.right - 6
+                cy = rr.y + 8
+                pygame.draw.line(surf, (52, 56, 66), (track_x0, cy), (track_x1, cy), 3)
+                kx = int(track_x0 + f * (track_x1 - track_x0))
+                pygame.draw.line(surf, ACCENT, (track_x0, cy), (kx, cy), 3)
+                pygame.draw.circle(surf, (230, 230, 235), (kx, cy), 4)
+            if node["type"] == "color":
+                p = node["params"]
+                sw = (int(p["r"] * 255), int(p["g"] * 255), int(p["b"] * 255))
+                pygame.draw.rect(surf, sw, (r.x + 60, r.y + 4, 40, 12))
 
 
 class EditorBehavior:
@@ -776,9 +1163,10 @@ def main() -> None:
     eng.renderer.render(pygame.Surface((320, 180)), scene, camera, eng.tracer)
 
     eng.loading_step("opening world", 0.95)
-    eng.hud_text = ("RMB: look/fly | LMB: select, drag assets, drag gizmo | "
-                    ", . rotate | - = scale | F flashlight | C collision | Z focus | "
-                    "Ctrl+D dup | Del del | Ctrl+S save | F2 shading | Esc quit")
+    eng.esc_handler = editor.handle_escape
+    eng.hud_text = ("RMB: look/fly | LMB: select, drag assets & gizmo | G gizmo mode | "
+                    "M material | F flashlight | C collision | Z focus | Ctrl+D dup | "
+                    "Del del | Ctrl+S save | F2 shading | Esc quit")
     eng.run(scene, camera, max_frames=args.frames, screenshot_path=args.screenshot,
             overlay=editor.draw)
 
