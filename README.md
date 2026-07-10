@@ -19,28 +19,64 @@ py demo.py       # bright playground demo
 
 ### Editor controls
 
+A **menu bar** (File / Edit / Window / Help) runs across the top of the
+window. Click a title to open its dropdown, click an item to run it, click
+anywhere else to close it — **Help > Controls** opens an in-editor overlay
+with this same list.
+
 | Input | Action |
 |---|---|
-| **RMB (hold)** | mouse look + WASD/Space/Ctrl fly, Shift = fast |
-| **LMB** | select in viewport/outliner; drag assets from the content browser into the world; drag the transform gizmo; drag sliders in the Details panel |
+| **RMB (hold)** | mouse look + fly: WASD move, Q/E or Space/Ctrl down/up, Shift = fast, wheel = fly speed. Unreal-style: these movement keys only act while RMB is held |
+| **LMB** | select in viewport/outliner; drag assets from the content browser into the world; drag the transform gizmo; drag sliders in the Details panel; drag a panel's title bar to move/dock/float it |
+| **W / E / R** | transform gizmo mode: translate / rotate / scale (only while not looking) |
 | **, / .** | rotate selection 15° around Y |
 | **- / =** | scale selection down / up 10% |
-| **Z** | focus camera on selection |
+| **F** | focus camera on selection (only while not looking) |
 | **Ctrl+D / Del** | duplicate / delete selection |
-| **Ctrl+S** | save scene (`scenes/scene.json`) |
-| **F** | toggle flashlight |
+| **Ctrl+S** | save scene |
+| **L** | toggle flashlight |
 | **C** | toggle player collision (on by default — walls block you) |
+| **M** | open/close the material editor for the selected mesh |
 | **F1 / F2** | wireframe / switch per-pixel <-> flat lighting |
-| **H / Esc** | HUD / quit |
+| **H** | toggle HUD |
+| **Esc** | close an open menu/dialog, else deselect, else quit |
 
-Selecting an entity shows a **transform gizmo**; **G** cycles its mode:
+Selecting an entity shows a **transform gizmo** in the mode set by W/E/R:
 translate (drag the red/green/blue arrows), rotate (drag the projected axis
 rings), scale (drag axis handles, or the center square for uniform scale).
 
-The **+ Import FBX** button in the content browser opens a file picker and
-converts a binary FBX model into a regular asset (saved to `assets/models/`,
-appears in the browser immediately). Material diffuse colors are extracted
-and baked as per-face colors — multi-material models keep their coloring.
+**File**: New Scene, Open Scene..., Save, Save As..., Import FBX..., Exit.
+**Edit**: Duplicate, Delete, Focus Selection — the same code path the
+hotkeys use. **Window**: show/hide the Outliner, Details, and Content
+Browser panels (checkmarked when visible), open **Settings...**, or
+**Reset Layout** to restore the default arrangement.
+
+#### Dockable panels
+
+The Outliner, Details, and Content Browser are panels with a draggable
+18px title bar. Drop one within 48px of the left or right edge to dock it
+there (260px wide, panels docked to the same side split the vertical space
+between them evenly); the Content Browser docks to the bottom edge instead
+(118px tall, full width between any side docks). Drop anywhere else and the
+panel floats at that position, keeping its current size. Floating panels
+draw on top of the viewport and the clicked one comes to front. The
+material editor is floating-only, with the same draggable title bar.
+Layout, visibility, and floating positions persist to `settings.json`
+(per-user, gitignored) and reload on the next launch.
+
+#### Settings (Window > Settings)
+
+A floating panel with resolution presets (1280x720, 1440x810, 1600x900,
+1920x1080 — applied immediately via `Engine.set_resolution`), a pixel-scale
+slider (1-6, lower = sharper per-pixel lighting, slower), and a max-FPS
+slider (30-240). All three persist to `settings.json`; CLI flags
+(`--width`/`--height`/`--pixel-scale`) still win over the saved values.
+
+The **+ Import FBX** button in the content browser (or **File > Import
+FBX...**) opens a file picker and converts a binary FBX model into a
+regular asset (saved to `assets/models/`, appears in the browser
+immediately). Material diffuse colors are extracted and baked as per-face
+colors — multi-material models keep their coloring.
 
 ![material editor](docs/material_editor.png)
 
@@ -58,7 +94,8 @@ angle and penumbra, IES profile, enabled, and shadow casting. Edits apply
 live and persist through Ctrl+S.
 
 The mouse is only captured while a look button is held — release and the
-cursor is free (demo uses LMB *or* RMB; the editor reserves LMB for selection).
+cursor is free (demo uses LMB *or* RMB; the editor reserves LMB for selection
+and panel/UI interaction, so looking is RMB-only).
 
 ## Architecture
 
@@ -76,13 +113,16 @@ engine/
   behaviors.py    Spin, Bob, Orbit, Flicker, FlyController (+collision), ...
   input.py        per-frame keyboard/mouse state, hold-to-capture mouse
   renderer.py     deferred per-pixel + flat shading paths, painter's sort
-  core.py         Engine: window, splash, fixed-timestep loop, HUD, benchmarks
+  core.py         Engine: window, splash, fixed-timestep loop, HUD, benchmarks,
+                  set_resolution
   assets.py       self-contained JSON assets + scene save/load
-editor.py         outliner, content browser, details panel, gizmo, FBX import
+editor.py         menu bar, dockable outliner/details/content-browser panels,
+                  settings dialog, gizmo, material editor, FBX import
 assets/*.json     the asset library (drag these into the world)
 assets/hdri/      HDR environment maps (.hdr Radiance files)
 assets/models/    imported model geometry (.npz)
 scenes/           saved scenes
+settings.json     per-user editor window/panel-layout state (gitignored)
 demo.py           bright playground demo
 ```
 

@@ -1,29 +1,39 @@
-"""PyEngine Editor — world outliner, content browser, drag-and-drop placement.
+"""PyEngine Editor — menu bar, dockable panels, outliner, content browser.
 
     py editor.py                     open scenes/scene.json (or a starter scene)
     py editor.py --scene my.json     work on a specific scene file
 
-Controls:
-    RMB hold        mouse look + WASD/Space/Ctrl fly (Shift = fast)
-    LMB             select in viewport / outliner; drag assets from the browser
-    Z               focus camera on selection
+Controls (Help > Controls in the editor shows the full list):
+    RMB hold        mouse look + WASD/QE/Space/Ctrl fly (Unreal-style: these
+                    movement keys only act while RMB is held), Shift = fast
+    LMB             select in viewport/outliner; drag assets; drag the gizmo;
+                    drag panel title bars to move/dock/float them
+    W/E/R           gizmo translate/rotate/scale (only while not looking)
+    F               focus camera on selection (only while not looking)
     Ctrl+D          duplicate selection        Del  delete selection
-    Ctrl+S          save scene                 F    toggle flashlight
-    F1 wireframe    H toggle HUD               Esc  quit
+    Ctrl+S          save scene                 L    toggle flashlight
+    F1 wireframe    H toggle HUD               Esc  close UI / deselect / quit
 """
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 
-OUTLINER_W = 260
-BROWSER_H = 118
-DETAILS_H = 322
+MENU_H = 26
+PANEL_TITLE_H = 18
+EDGE_SNAP = 48
+
+OUTLINER_W = 260          # docked left/right panel width
+BROWSER_H = 118           # docked bottom panel height
+DETAILS_H = 322           # default floating height for the details panel
 ROW_H = 20
 DETAIL_ROW_H = 24
+DETAILS_ROWS_TOP = 34     # y-offset (within a panel's content rect) of row 0
 TILE_W, TILE_H, ICON = 84, 100, 64
 PANEL_BG = (22, 24, 29)
 PANEL_EDGE = (58, 62, 72)
@@ -32,6 +42,32 @@ TEXT_DIM = (140, 143, 152)
 SELECT_BG = (47, 66, 102)
 HOVER_BG = (36, 39, 47)
 ACCENT = (255, 170, 60)
+
+PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
+    "outliner": (OUTLINER_W, 360),
+    "details": (OUTLINER_W, DETAILS_H),
+    "browser": (760, BROWSER_H),
+}
+RESOLUTIONS = ((1280, 720), (1440, 810), (1600, 900), (1920, 1080))
+SETTINGS_SIZE = (380, 190)
+
+
+def load_settings() -> dict:
+    if not os.path.exists(SETTINGS_PATH):
+        return {}
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
 
 
 def base_height(entity) -> float:
@@ -113,6 +149,14 @@ def make_icon(engine, asset, size=ICON):
 
 
 class Editor:
+    _MENU_NAMES = ("File", "Edit", "Window", "Help")
+    _WINDOW_PANEL_LABELS = {"Outliner": "outliner", "Details": "details",
+                            "Content Browser": "browser"}
+    _MENU_HOTKEYS = {
+        "File": {"Save": "Ctrl+S"},
+        "Edit": {"Duplicate": "Ctrl+D", "Delete": "Del", "Focus Selection": "F"},
+    }
+
     def __init__(self, engine_mod, eng, scene, camera, lib, scene_path):
         import pygame
         self.engine_mod = engine_mod
@@ -130,10 +174,25 @@ class Editor:
         self.drag_asset = None
         self.active_slider = None   # index into _details_rows while dragging
         self.gizmo_drag = None      # active gizmo drag state dict
-        self.gizmo_mode = "translate"  # G cycles translate / rotate / scale
+        self.gizmo_mode = "translate"  # W/E/R select translate / rotate / scale
         self.mat_ui = None          # open MaterialEditorUI, or None
         self.status = ("", 0.0)     # transient message near the content browser
         self.save_flash = 0.0
+
+        # ---- dockable panel state ----
+        self.dock_order = {"left": [], "right": ["outliner", "details"],
+                           "bottom": ["browser"]}
+        self.floating = []          # panel ids currently floating, z-order (front=last)
+        self.panel_visible = {"outliner": True, "details": True, "browser": True}
+        self.float_rect = {}        # panel id -> pygame.Rect, used only while floating
+        self.panel_drag = None      # {"id","dx","dy","w","h"} while dragging a title bar
+
+        # ---- menu bar / dialogs ----
+        self.open_menu = None       # name of the open dropdown, or None
+        self.settings_open = False
+        self.settings_drag = None   # "pixel" / "max_fps" while dragging a settings slider
+        self.show_controls_overlay = False
+
         self.font = pygame.font.SysFont("consolas,couriernew,monospace", 14)
         self.font_small = pygame.font.SysFont("consolas,couriernew,monospace", 12)
         self.icons = {}
@@ -142,27 +201,99 @@ class Editor:
             eng.loading_step(f"rendering thumbnail: {a.name}", 0.25 + 0.45 * i / count)
             self.icons[a.name] = make_icon(engine_mod, a)
 
-    # ---- layout ----
-    def outliner_rect(self, w, h):
+    # ---- layout: the single source of truth for panel/viewport rects ----
+    def _float_rect_for(self, pid, w, h):
         import pygame
-        return pygame.Rect(w - OUTLINER_W, 0, OUTLINER_W, h - BROWSER_H - DETAILS_H)
+        r = self.float_rect.get(pid)
+        if r is None:
+            fw, fh = PANEL_DEFAULT_FLOAT[pid]
+            r = pygame.Rect(max(0, (w - fw) // 2), MENU_H + 40, fw, fh)
+            self.float_rect[pid] = r
+        r.width = min(r.width, max(160, w - 20))
+        r.height = min(r.height, max(100, h - MENU_H - 20))
+        r.x = min(max(r.x, 0), max(0, w - r.width))
+        r.y = min(max(r.y, MENU_H), max(MENU_H, h - r.height))
+        return r
 
-    def details_rect(self, w, h):
+    def _layout(self, w, h):
         import pygame
-        return pygame.Rect(w - OUTLINER_W, h - BROWSER_H - DETAILS_H,
-                           OUTLINER_W, DETAILS_H)
+        menu = pygame.Rect(0, 0, w, MENU_H)
+        left_ids = [p for p in self.dock_order["left"] if self.panel_visible.get(p, True)]
+        right_ids = [p for p in self.dock_order["right"] if self.panel_visible.get(p, True)]
+        bottom_ids = [p for p in self.dock_order["bottom"] if self.panel_visible.get(p, True)]
+        left_w = OUTLINER_W if left_ids else 0
+        right_w = OUTLINER_W if right_ids else 0
+        bottom_h = BROWSER_H if bottom_ids else 0
+        top = MENU_H
+        stack_bottom = h - bottom_h
+        panels = {}
 
-    def browser_rect(self, w, h):
+        def stack(ids, x, width):
+            n = len(ids)
+            if n == 0:
+                return
+            avail = max(0, stack_bottom - top)
+            share = avail // n
+            y = top
+            for i, pid in enumerate(ids):
+                hh = share if i < n - 1 else avail - share * (n - 1)
+                panels[pid] = pygame.Rect(x, y, width, max(0, hh))
+                y += hh
+
+        stack(left_ids, 0, left_w)
+        stack(right_ids, w - right_w, right_w)
+        if bottom_ids:
+            bw_total = max(0, w - left_w - right_w)
+            n = len(bottom_ids)
+            share = bw_total // n
+            x = left_w
+            for i, pid in enumerate(bottom_ids):
+                ww = share if i < n - 1 else bw_total - share * (n - 1)
+                panels[pid] = pygame.Rect(x, stack_bottom, max(0, ww), bottom_h)
+                x += ww
+
+        for pid in ("outliner", "details", "browser"):
+            if not self.panel_visible.get(pid, True) or pid in panels:
+                continue
+            panels[pid] = self._float_rect_for(pid, w, h)
+
+        viewport = pygame.Rect(left_w, top, max(0, w - left_w - right_w),
+                               max(0, stack_bottom - top))
+        return {"menu": menu, "viewport": viewport, "panels": panels,
+                "left_w": left_w, "right_w": right_w, "bottom_h": bottom_h}
+
+    def _panel_content_rect(self, pid, layout):
         import pygame
-        return pygame.Rect(0, h - BROWSER_H, w, BROWSER_H)
+        r = layout["panels"].get(pid)
+        if r is None:
+            return None
+        return pygame.Rect(r.x, r.y + PANEL_TITLE_H, r.width,
+                           max(0, r.height - PANEL_TITLE_H))
+
+    def _hit_panel(self, pos, layout):
+        panels = layout["panels"]
+        for pid in reversed(self.floating):
+            r = panels.get(pid)
+            if r is not None and r.collidepoint(pos):
+                return pid
+        for pid, r in panels.items():
+            if pid in self.floating:
+                continue
+            if r.collidepoint(pos):
+                return pid
+        return None
 
     def over_ui(self, pos) -> bool:
-        if self.mat_ui is not None:
+        if self.mat_ui is not None or self.settings_open:
+            return True
+        if pos[1] < MENU_H:
             return True
         w, h = self.eng.screen.get_size()
-        return (self.outliner_rect(w, h).collidepoint(pos)
-                or self.details_rect(w, h).collidepoint(pos)
-                or self.browser_rect(w, h).collidepoint(pos))
+        if self.open_menu is not None:
+            drop, _rows = self._dropdown_geom(self.open_menu, w)
+            if drop.collidepoint(pos):
+                return True
+        return self._hit_panel(pos, self._layout(w, h)) is not None
 
     def _outliner_rows(self):
         return [e for e in self.scene.entities
@@ -200,11 +331,10 @@ class Editor:
                 src.material.to_dict())
             dst.material.apply(dst.mesh)
 
-    # ---- transform gizmo: G cycles translate / rotate / scale ----
+    # ---- transform gizmo: W/E/R select translate / rotate / scale ----
     _GIZMO_AXES = (((1.0, 0.0, 0.0), (225, 85, 85)),
                    ((0.0, 1.0, 0.0), (105, 215, 105)),
                    ((0.0, 0.0, 1.0), (95, 145, 250)))
-    _GIZMO_MODES = ("translate", "rotate", "scale")
 
     def _gizmo_center(self, w, h):
         e = self.selected
@@ -430,7 +560,7 @@ class Editor:
 
     def _detail_row_rect(self, rect, i):
         import pygame
-        return pygame.Rect(rect.x + 6, rect.y + 56 + i * DETAIL_ROW_H,
+        return pygame.Rect(rect.x + 6, rect.y + DETAILS_ROWS_TOP + i * DETAIL_ROW_H,
                            rect.width - 12, DETAIL_ROW_H - 2)
 
     def _slider_track(self, row_rect):
@@ -442,129 +572,348 @@ class Editor:
         row["set"](row["min"] + f * (row["max"] - row["min"]))
         self.dirty = True
 
-    # ---- per-frame logic (runs in a fixed update step) ----
-    def update(self, engine, dt: float) -> None:
+    # ---- menu bar ----
+    def _menu_title_rects(self, w):
+        import pygame
+        rects = {}
+        x = 8
+        for name in self._MENU_NAMES:
+            tw = self.font_small.size(name)[0] + 20
+            rects[name] = pygame.Rect(x, 0, tw, MENU_H)
+            x += tw
+        return rects
+
+    def _menu_defs(self):
+        return {
+            "File": [
+                ("New Scene", self._new_scene, True),
+                ("Open Scene...", self._open_scene_dialog, True),
+                ("Save", self._save_scene, True),
+                ("Save As...", self._save_scene_as_dialog, True),
+                ("Import FBX...", self._import_fbx_dialog, True),
+                ("Exit", self._quit, True),
+            ],
+            "Edit": [
+                ("Duplicate", self._duplicate_selected, True),
+                ("Delete", self._delete_selected, True),
+                ("Focus Selection", self._focus_selection, True),
+            ],
+            "Window": [
+                ("Outliner", lambda: self._toggle_panel("outliner"), True),
+                ("Details", lambda: self._toggle_panel("details"), True),
+                ("Content Browser", lambda: self._toggle_panel("browser"), True),
+                ("Settings...", self._open_settings, True),
+                ("Reset Layout", self._reset_layout, True),
+            ],
+            "Help": [
+                ("Controls", self._toggle_controls, True),
+                ("About", self._show_about, True),
+            ],
+        }
+
+    def _dropdown_geom(self, name, w):
+        import pygame
+        items = self._menu_defs()[name]
+        tr = self._menu_title_rects(w)[name]
+        item_h = 22
+        width = 210
+        x, y = tr.x, MENU_H
+        dropdown_rect = pygame.Rect(x, y, width, 6 + item_h * len(items))
+        rows = []
+        for i, (label, action, enabled) in enumerate(items):
+            r = pygame.Rect(x + 2, y + 3 + i * item_h, width - 4, item_h)
+            rows.append((label, r, action, enabled))
+        return dropdown_rect, rows
+
+    def _handle_menu_click(self, mp, w) -> bool:
+        title_rects = self._menu_title_rects(w)
+        if self.open_menu is not None:
+            _drop, rows = self._dropdown_geom(self.open_menu, w)
+            for _label, r, action, enabled in rows:
+                if r.collidepoint(mp):
+                    self.open_menu = None
+                    if enabled:
+                        action()
+                    return True
+            for name, r in title_rects.items():
+                if r.collidepoint(mp):
+                    self.open_menu = None if name == self.open_menu else name
+                    return True
+            self.open_menu = None
+            return True
+        for name, r in title_rects.items():
+            if r.collidepoint(mp):
+                self.open_menu = name
+                return True
+        return False
+
+    # ---- panel docking / floating ----
+    def _dock_panel(self, pid, side) -> None:
+        for s in ("left", "right", "bottom"):
+            if pid in self.dock_order[s]:
+                self.dock_order[s].remove(pid)
+        if pid in self.floating:
+            self.floating.remove(pid)
+        if side == "float":
+            self.floating.append(pid)
+        else:
+            self.dock_order[side].append(pid)
+        self._save_settings()
+
+    def _begin_panel_drag(self, pid, mp, rect) -> None:
+        self.panel_drag = {"id": pid, "dx": mp[0] - rect.x, "dy": mp[1] - rect.y,
+                           "w": rect.width, "h": rect.height}
+
+    def _finish_panel_drag(self, mp, w, h) -> None:
+        import pygame
+        g = self.panel_drag
+        pid = g["id"]
+        gx, gy = mp[0] - g["dx"], mp[1] - g["dy"]
+        if pid in ("outliner", "details") and mp[0] <= EDGE_SNAP:
+            self._dock_panel(pid, "left")
+        elif pid in ("outliner", "details") and mp[0] >= w - EDGE_SNAP:
+            self._dock_panel(pid, "right")
+        elif pid == "browser" and mp[1] >= h - EDGE_SNAP:
+            self._dock_panel(pid, "bottom")
+        else:
+            self.float_rect[pid] = pygame.Rect(gx, gy, g["w"], g["h"])
+            self._dock_panel(pid, "float")
+            self._float_rect_for(pid, w, h)  # clamp on-screen
+        self.panel_drag = None
+
+    def _toggle_panel(self, pid) -> None:
+        self.panel_visible[pid] = not self.panel_visible.get(pid, True)
+        self._save_settings()
+
+    def _reset_layout(self) -> None:
+        self.dock_order = {"left": [], "right": ["outliner", "details"],
+                           "bottom": ["browser"]}
+        self.floating = []
+        self.panel_visible = {"outliner": True, "details": True, "browser": True}
+        self.float_rect = {}
+        self._save_settings()
+
+    # ---- settings dialog ----
+    def _open_settings(self) -> None:
+        self.settings_open = True
+        self.settings_drag = None
+
+    def _toggle_controls(self) -> None:
+        self.show_controls_overlay = not self.show_controls_overlay
+
+    def _show_about(self) -> None:
+        self.status = ("PyEngine 0.1 — pure-Python real-time 3D engine", 4.0)
+
+    def _settings_rect(self, w, h):
+        import pygame
+        sw, sh = SETTINGS_SIZE
+        return pygame.Rect((w - sw) // 2, max(MENU_H + 20, (h - sh) // 2), sw, sh)
+
+    def _settings_res_buttons(self, rect):
+        import pygame
+        out = []
+        x, y = rect.x + 12, rect.y + 54
+        bw, bh, gap = 82, 24, 8
+        for rw, rh in RESOLUTIONS:
+            out.append(((rw, rh), pygame.Rect(x, y, bw, bh)))
+            x += bw + gap
+        return out
+
+    def _settings_slider_row(self, rect, which):
+        import pygame
+        y = rect.y + (92 if which == "pixel" else 126)
+        return pygame.Rect(rect.x + 12, y, rect.width - 24, 24)
+
+    def _settings_slider_track(self, row):
+        return (row.x + 100, row.right - 50)
+
+    def _apply_settings_slider(self, which, row, mx) -> None:
+        x0, x1 = self._settings_slider_track(row)
+        f = min(max((mx - x0) / max(x1 - x0, 1), 0.0), 1.0)
+        if which == "pixel":
+            v = int(round(1 + f * 5))
+            self.eng.renderer.render_scale = max(1, v)
+        else:
+            v = int(round(30 + f * 210))
+            self.eng.max_fps = max(1, v)
+
+    def _update_settings(self, engine, w, h) -> None:
         import pygame
         inp = engine.input
         mp = inp.mouse_pos
-        w, h = engine.screen.get_size()
-        orect = self.outliner_rect(w, h)
-        drect = self.details_rect(w, h)
-        brect = self.browser_rect(w, h)
-        self.save_flash = max(0.0, self.save_flash - dt)
-        if self.status[1] > 0:
-            self.status = (self.status[0], self.status[1] - dt)
-
-        if self.mat_ui is not None:  # node editor captures all editor input
-            self.mat_ui.update(engine, dt)
-            return
-
-        if inp.wheel:
-            if orect.collidepoint(mp):
-                self.outliner_scroll = max(0, self.outliner_scroll - int(inp.wheel) * 3)
-            elif brect.collidepoint(mp):
-                self.browser_scroll = max(0, self.browser_scroll - int(inp.wheel) * 70)
-
+        rect = self._settings_rect(w, h)
+        close = pygame.Rect(rect.right - 26, rect.y + 5, 20, 20)
         if inp.mouse_button_pressed(1):
-            if orect.collidepoint(mp):
-                self.active_slider = None
-                self._click_outliner(mp, orect)
-            elif drect.collidepoint(mp):
-                self._click_details(mp, drect)
-            elif brect.collidepoint(mp):
-                if self._import_btn_rect(brect).collidepoint(mp):
-                    self._import_fbx_dialog()
-                else:
-                    asset = self._tile_at(mp, brect)
-                    if asset is not None:
-                        self.drag_asset = asset
+            if close.collidepoint(mp):
+                self.settings_open = False
+                return
+            for (rw, rh), btn in self._settings_res_buttons(rect):
+                if btn.collidepoint(mp):
+                    self.eng.set_resolution(rw, rh)
+                    self._save_settings()
+                    return
+            for which in ("pixel", "max_fps"):
+                row = self._settings_slider_row(rect, which)
+                if row.collidepoint(mp):
+                    self.settings_drag = which
+                    self._apply_settings_slider(which, row, mp[0])
+                    return
+        if self.settings_drag is not None:
+            if inp.mouse_held(1):
+                row = self._settings_slider_row(rect, self.settings_drag)
+                self._apply_settings_slider(self.settings_drag, row, mp[0])
             else:
-                self.active_slider = None
-                if not self._try_grab_gizmo(mp, w, h):
-                    self._click_viewport(mp, w, h)
+                self.settings_drag = None
+                self._save_settings()
 
-        # gizmo drag
-        if self.gizmo_drag is not None:
-            if inp.mouse_held(1) and self.selected is not None:
-                self._update_gizmo_drag(mp)
-            else:
-                self.gizmo_drag = None
+    # ---- settings.json persistence ----
+    def _settings_dict(self) -> dict:
+        w, h = self.eng.screen.get_size()
+        return {
+            "width": w, "height": h,
+            "pixel_scale": int(self.eng.renderer.render_scale),
+            "max_fps": int(self.eng.max_fps),
+            "panel_visible": dict(self.panel_visible),
+            "dock_order": {side: list(ids) for side, ids in self.dock_order.items()},
+            "floating": list(self.floating),
+            "float_rect": {pid: [r.x, r.y, r.width, r.height]
+                          for pid, r in self.float_rect.items()},
+        }
 
-        # live slider drag
-        if self.active_slider is not None:
-            rows = self._details_rows()
-            if inp.mouse_held(1) and self.active_slider < len(rows):
-                row = rows[self.active_slider]
-                if row["kind"] == "slider":
-                    self._apply_slider(row, self._detail_row_rect(drect,
-                                                                  self.active_slider),
-                                       mp[0])
-            else:
-                self.active_slider = None
+    def _save_settings(self) -> None:
+        save_settings(self._settings_dict())
 
-        if self.drag_asset is not None and inp.mouse_button_released(1):
-            if not self.over_ui(mp):
-                self._place_asset(self.drag_asset, mp, w, h)
-            self.drag_asset = None
+    def _apply_layout_settings(self, data: dict) -> None:
+        import pygame
+        valid = {"outliner", "details", "browser"}
+        dock_order = data.get("dock_order", {})
+        left = [p for p in dock_order.get("left", []) if p in ("outliner", "details")]
+        right = [p for p in dock_order.get("right", []) if p in ("outliner", "details")]
+        bottom = [p for p in dock_order.get("bottom", []) if p == "browser"]
+        floating = [p for p in data.get("floating", []) if p in valid]
+        placed = left + right + bottom + floating
+        if set(placed) != valid or len(placed) != len(valid):
+            return  # partial/corrupt layout data: keep the built-in default
+        self.dock_order = {"left": left, "right": right, "bottom": bottom}
+        self.floating = floating
+        pv = data.get("panel_visible", {})
+        for pid in valid:
+            if pid in pv:
+                self.panel_visible[pid] = bool(pv[pid])
+        for pid, v in data.get("float_rect", {}).items():
+            if pid in valid and isinstance(v, list) and len(v) == 4:
+                self.float_rect[pid] = pygame.Rect(*v)
 
-        ctrl = inp.held(pygame.K_LCTRL) or inp.held(pygame.K_RCTRL)
-        if inp.pressed(pygame.K_DELETE) and self.selected is not None \
-                and self.selected.asset_name is not None:
-            self.scene.remove(self.selected)
-            self.selected = None
-            self.dirty = True
-        if ctrl and inp.pressed(pygame.K_d) and self.selected is not None \
-                and self.selected.asset_name is not None:
-            src = self.selected
-            dup = self.lib.instantiate(src.asset_name)
-            t, s = dup.transform, src.transform
-            t.position = self.engine_mod.Vec3(s.position.x + 0.8, s.position.y,
-                                              s.position.z + 0.8)
-            t.rotation = self.engine_mod.Vec3(s.rotation.x, s.rotation.y, s.rotation.z)
-            t.scale = self.engine_mod.Vec3(s.scale.x, s.scale.y, s.scale.z)
-            self._copy_entity_state(src, dup)
-            self.scene.add(dup)
-            self.selected = dup
-            self.dirty = True
-        if ctrl and inp.pressed(pygame.K_s):
-            os.makedirs(os.path.dirname(self.scene_path) or ".", exist_ok=True)
-            self.engine_mod.save_scene(self.scene, self.camera, self.scene_path)
-            self.dirty = False
-            self.save_flash = 1.5
-        if inp.pressed(pygame.K_z) and self.selected is not None:
-            self._focus(self.selected)
-        if inp.pressed(pygame.K_c) and self.fly is not None:
-            self.fly.collide = not self.fly.collide
-        if inp.pressed(pygame.K_g):
-            modes = self._GIZMO_MODES
-            self.gizmo_mode = modes[(modes.index(self.gizmo_mode) + 1) % len(modes)]
-            self.gizmo_drag = None
-        if inp.pressed(pygame.K_m) and self.selected is not None \
-                and self.selected.mesh is not None:
-            self.mat_ui = MaterialEditorUI(self, self.selected)
+    # ---- File / Edit menu actions (shared with hotkeys) ----
+    def _duplicate_selected(self) -> None:
+        src = self.selected
+        if src is None or src.asset_name is None:
+            return
+        Vec3 = self.engine_mod.Vec3
+        dup = self.lib.instantiate(src.asset_name)
+        t, s = dup.transform, src.transform
+        t.position = Vec3(s.position.x + 0.8, s.position.y, s.position.z + 0.8)
+        t.rotation = Vec3(s.rotation.x, s.rotation.y, s.rotation.z)
+        t.scale = Vec3(s.scale.x, s.scale.y, s.scale.z)
+        self._copy_entity_state(src, dup)
+        self.scene.add(dup)
+        self.selected = dup
+        self.dirty = True
 
-        # rotate / scale the selection
+    def _delete_selected(self) -> None:
+        if self.selected is None or self.selected.asset_name is None:
+            return
+        self.scene.remove(self.selected)
+        self.selected = None
+        self.dirty = True
+
+    def _focus_selection(self) -> None:
         if self.selected is not None:
-            step = math.pi / 12.0
-            if inp.pressed(pygame.K_COMMA):
-                self.selected.transform.rotation.y += step
-                self.dirty = True
-            if inp.pressed(pygame.K_PERIOD):
-                self.selected.transform.rotation.y -= step
-                self.dirty = True
-            if inp.pressed(pygame.K_MINUS) or inp.pressed(pygame.K_EQUALS):
-                f = 1.1 if inp.pressed(pygame.K_EQUALS) else 1.0 / 1.1
-                sc = self.selected.transform.scale
-                self.selected.transform.scale = self.engine_mod.Vec3(
-                    sc.x * f, sc.y * f, sc.z * f)
-                self.dirty = True
+            self._focus(self.selected)
 
-    def handle_escape(self) -> bool:
-        """Engine Esc hook: closes the material editor instead of quitting."""
-        if self.mat_ui is not None:
-            self.mat_ui.close()
-            return True
-        return False
+    def _save_scene(self) -> None:
+        os.makedirs(os.path.dirname(self.scene_path) or ".", exist_ok=True)
+        self.engine_mod.save_scene(self.scene, self.camera, self.scene_path)
+        self.dirty = False
+        self.save_flash = 1.5
+
+    def _quit(self) -> None:
+        import pygame
+        pygame.event.post(pygame.event.Event(pygame.QUIT))
+
+    def _replace_scene_content(self, new_scene) -> None:
+        """Mutate the LIVE scene in place with new_scene's content.
+
+        Engine.run() holds the Scene object passed to it in a local variable
+        and behaviors/renderer iterate that exact object, so New/Open Scene
+        can't just rebind self.scene — the entity list has to be cleared and
+        refilled, and the editor-owned entities (flashlight, __camera,
+        __editor — identified by asset_name is None) carried over untouched.
+        """
+        editor_owned = [e for e in self.scene.entities if e.asset_name is None]
+        self.scene.entities.clear()
+        self.scene.entities.extend(new_scene.entities)
+        self.scene.entities.extend(editor_owned)
+        self.scene.light = new_scene.light
+        self.scene.fog = new_scene.fog
+        self.scene.sky = new_scene.sky
+        self.scene.background = new_scene.background
+        self.scene.enable_shadows = new_scene.enable_shadows
+        self.selected = None
+        self.dirty = False
+
+    def _new_scene(self) -> None:
+        Vec3 = self.engine_mod.Vec3
+        self._replace_scene_content(self.engine_mod.Scene())
+        self.scene_path = os.path.join(BASE_DIR, "scenes", "untitled.json")
+        self.camera.position = Vec3(6.0, 2.6, 9.0)
+        self.camera.yaw, self.camera.pitch = 0.45, -0.08
+        self.dirty = True
+        self.status = ("new scene", 3.0)
+
+    def _open_scene_dialog(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                title="Open scene", initialdir=os.path.join(BASE_DIR, "scenes"),
+                filetypes=[("Scene files", "*.json"), ("All files", "*.*")])
+            root.destroy()
+        except Exception as ex:
+            self.status = (f"file dialog unavailable: {ex}", 5.0)
+            return
+        if not path:
+            return
+        try:
+            loaded = self.engine_mod.load_scene(path, self.lib, self.camera)
+        except Exception as ex:
+            self.status = (f"open failed: {ex}", 6.0)
+            return
+        self._replace_scene_content(loaded)
+        self.scene_path = path
+        self.status = (f"opened '{os.path.basename(path)}'", 3.0)
+
+    def _save_scene_as_dialog(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.asksaveasfilename(
+                title="Save scene as", initialdir=os.path.join(BASE_DIR, "scenes"),
+                defaultextension=".json", filetypes=[("Scene files", "*.json")])
+            root.destroy()
+        except Exception as ex:
+            self.status = (f"file dialog unavailable: {ex}", 5.0)
+            return
+        if not path:
+            return
+        self.scene_path = path
+        self._save_scene()
 
     def _import_btn_rect(self, brect):
         import pygame
@@ -594,15 +943,158 @@ class Editor:
         except Exception as ex:
             self.status = (f"import failed: {ex}", 6.0)
 
-    def _click_details(self, mp, drect) -> None:
+    # ---- per-frame logic (runs in a fixed update step) ----
+    def update(self, engine, dt: float) -> None:
+        import pygame
+        inp = engine.input
+        mp = inp.mouse_pos
+        w, h = engine.screen.get_size()
+        self.save_flash = max(0.0, self.save_flash - dt)
+        if self.status[1] > 0:
+            self.status = (self.status[0], self.status[1] - dt)
+
+        if self.mat_ui is not None:  # node editor captures all editor input
+            self.mat_ui.update(engine, dt)
+            return
+        if self.settings_open:      # settings dialog captures all editor input
+            self._update_settings(engine, w, h)
+            return
+
+        layout = self._layout(w, h)
+        looking = self.fly is not None and self.fly.looking
+
+        if inp.wheel and not looking:
+            target = self._hit_panel(mp, layout)
+            if target == "outliner":
+                self.outliner_scroll = max(0, self.outliner_scroll - int(inp.wheel) * 3)
+            elif target == "browser":
+                self.browser_scroll = max(0, self.browser_scroll - int(inp.wheel) * 70)
+
+        if inp.mouse_button_pressed(1):
+            if not self._handle_menu_click(mp, w):
+                target = self._hit_panel(mp, layout)
+                if target is not None:
+                    if target in self.floating:
+                        self.floating.remove(target)
+                        self.floating.append(target)
+                    rect = layout["panels"][target]
+                    title_rect = pygame.Rect(rect.x, rect.y, rect.width, PANEL_TITLE_H)
+                    if title_rect.collidepoint(mp):
+                        self._begin_panel_drag(target, mp, rect)
+                    else:
+                        content = self._panel_content_rect(target, layout)
+                        self._route_panel_click(target, mp, content)
+                elif layout["viewport"].collidepoint(mp):
+                    self.active_slider = None
+                    if not self._try_grab_gizmo(mp, w, h):
+                        self._click_viewport(mp, w, h)
+
+        if self.panel_drag is not None and not inp.mouse_held(1):
+            self._finish_panel_drag(mp, w, h)
+
+        # gizmo drag
+        if self.gizmo_drag is not None:
+            if inp.mouse_held(1) and self.selected is not None:
+                self._update_gizmo_drag(mp)
+            else:
+                self.gizmo_drag = None
+
+        # live slider drag (details panel)
+        if self.active_slider is not None:
+            rows = self._details_rows()
+            content = self._panel_content_rect("details", layout)
+            if inp.mouse_held(1) and content is not None and self.active_slider < len(rows):
+                row = rows[self.active_slider]
+                if row["kind"] == "slider":
+                    self._apply_slider(row, self._detail_row_rect(content,
+                                                                   self.active_slider),
+                                       mp[0])
+            else:
+                self.active_slider = None
+
+        if self.drag_asset is not None and inp.mouse_button_released(1):
+            if not self.over_ui(mp):
+                self._place_asset(self.drag_asset, mp, w, h)
+            self.drag_asset = None
+
+        ctrl = inp.held(pygame.K_LCTRL) or inp.held(pygame.K_RCTRL)
+        if inp.pressed(pygame.K_DELETE):
+            self._delete_selected()
+        if ctrl and inp.pressed(pygame.K_d):
+            self._duplicate_selected()
+        if ctrl and inp.pressed(pygame.K_s):
+            self._save_scene()
+        if inp.pressed(pygame.K_f) and not looking:
+            self._focus_selection()
+        if inp.pressed(pygame.K_c) and self.fly is not None:
+            self.fly.collide = not self.fly.collide
+        if not looking:
+            if inp.pressed(pygame.K_w):
+                self.gizmo_mode, self.gizmo_drag = "translate", None
+            elif inp.pressed(pygame.K_e):
+                self.gizmo_mode, self.gizmo_drag = "rotate", None
+            elif inp.pressed(pygame.K_r):
+                self.gizmo_mode, self.gizmo_drag = "scale", None
+        if inp.pressed(pygame.K_m) and self.selected is not None \
+                and self.selected.mesh is not None:
+            self.mat_ui = MaterialEditorUI(self, self.selected)
+
+        # rotate / scale the selection
+        if self.selected is not None:
+            step = math.pi / 12.0
+            if inp.pressed(pygame.K_COMMA):
+                self.selected.transform.rotation.y += step
+                self.dirty = True
+            if inp.pressed(pygame.K_PERIOD):
+                self.selected.transform.rotation.y -= step
+                self.dirty = True
+            if inp.pressed(pygame.K_MINUS) or inp.pressed(pygame.K_EQUALS):
+                f = 1.1 if inp.pressed(pygame.K_EQUALS) else 1.0 / 1.1
+                sc = self.selected.transform.scale
+                self.selected.transform.scale = self.engine_mod.Vec3(
+                    sc.x * f, sc.y * f, sc.z * f)
+                self.dirty = True
+
+    def handle_escape(self) -> bool:
+        """Engine Esc hook: dropdown/settings, then material editor, then
+        deselect, and only then let the engine quit."""
+        if self.open_menu is not None:
+            self.open_menu = None
+            return True
+        if self.settings_open:
+            self.settings_open = False
+            return True
+        if self.mat_ui is not None:
+            self.mat_ui.close()
+            return True
+        if self.selected is not None:
+            self.selected = None
+            return True
+        return False
+
+    def _route_panel_click(self, pid, mp, content) -> None:
+        if pid == "outliner":
+            self.active_slider = None
+            self._click_outliner(mp, content)
+        elif pid == "details":
+            self._click_details(mp, content)
+        elif pid == "browser":
+            if self._import_btn_rect(content).collidepoint(mp):
+                self._import_fbx_dialog()
+            else:
+                asset = self._tile_at(mp, content)
+                if asset is not None:
+                    self.drag_asset = asset
+
+    def _click_details(self, mp, rect) -> None:
         rows = self._details_rows()
-        i = (mp[1] - (drect.y + 56)) // DETAIL_ROW_H
+        i = (mp[1] - (rect.y + DETAILS_ROWS_TOP)) // DETAIL_ROW_H
         if not (0 <= i < len(rows)):
             return
         row = rows[i]
         if row["kind"] == "slider":
             self.active_slider = i
-            self._apply_slider(row, self._detail_row_rect(drect, i), mp[0])
+            self._apply_slider(row, self._detail_row_rect(rect, i), mp[0])
         elif row["kind"] == "cycle":
             options = row["options"]
             current = options.index(row["get"]()) if row["get"]() in options else 0
@@ -614,10 +1106,10 @@ class Editor:
         elif row["kind"] == "button":
             row["action"]()
 
-    def _click_outliner(self, mp, orect) -> None:
+    def _click_outliner(self, mp, rect) -> None:
         rows = self._outliner_rows()
-        i = (mp[1] - orect.y - 30) // ROW_H + self.outliner_scroll
-        if 0 <= mp[1] - orect.y - 30 and 0 <= i < len(rows):
+        i = (mp[1] - rect.y - 6) // ROW_H + self.outliner_scroll
+        if 0 <= mp[1] - rect.y - 6 and 0 <= i < len(rows):
             self.selected = rows[i]
 
     def _tile_at(self, mp, brect):
@@ -671,10 +1163,39 @@ class Editor:
         import pygame
         surf = eng.screen
         w, h = surf.get_size()
+        layout = self._layout(w, h)
         self._draw_markers(surf, w, h)
-        self._draw_outliner(surf, self.outliner_rect(w, h))
-        self._draw_details(surf, self.details_rect(w, h))
-        self._draw_browser(surf, self.browser_rect(w, h))
+
+        # backdrop so gaps between a side dock and the bottom dock (if both
+        # are present) read as UI, not a hole showing the 3D scene through
+        if layout["left_w"]:
+            pygame.draw.rect(surf, PANEL_BG,
+                             pygame.Rect(0, MENU_H, layout["left_w"], h - MENU_H))
+        if layout["right_w"]:
+            pygame.draw.rect(surf, PANEL_BG, pygame.Rect(
+                w - layout["right_w"], MENU_H, layout["right_w"], h - MENU_H))
+        if layout["bottom_h"]:
+            pygame.draw.rect(surf, PANEL_BG, pygame.Rect(
+                layout["left_w"], h - layout["bottom_h"],
+                w - layout["left_w"] - layout["right_w"], layout["bottom_h"]))
+
+        panels = dict(layout["panels"])
+        drag_pid = self.panel_drag["id"] if self.panel_drag else None
+        if drag_pid is not None and drag_pid in panels:
+            mp = eng.input.mouse_pos
+            g = self.panel_drag
+            panels[drag_pid] = pygame.Rect(mp[0] - g["dx"], mp[1] - g["dy"],
+                                           g["w"], g["h"])
+
+        for pid in ("outliner", "details", "browser"):
+            if pid in panels and pid not in self.floating and pid != drag_pid:
+                self._draw_panel(surf, pid, panels[pid])
+        for pid in self.floating:
+            if pid in panels and pid != drag_pid:
+                self._draw_panel(surf, pid, panels[pid])
+        if drag_pid is not None and drag_pid in panels:
+            self._draw_panel(surf, drag_pid, panels[drag_pid])
+
         if self.drag_asset is not None:
             icon = self.icons.get(self.drag_asset.name)
             if icon is not None:
@@ -682,8 +1203,159 @@ class Editor:
                 ghost.set_alpha(150)
                 mp = eng.input.mouse_pos
                 surf.blit(ghost, (mp[0] - ICON // 2, mp[1] - ICON // 2))
+
+        self._draw_menu_bar(surf, w)
+        if self.show_controls_overlay:
+            self._draw_controls_overlay(surf, w, h)
+        if self.settings_open:
+            self._draw_settings(surf, w, h)
         if self.mat_ui is not None:
             self.mat_ui.draw(surf)
+
+    def _panel_title(self, pid) -> str:
+        if pid == "outliner":
+            if self.save_flash > 0:
+                return "World Outliner — saved ✓"
+            name = os.path.basename(self.scene_path) + (" *" if self.dirty else "")
+            return f"World Outliner — {name}"
+        if pid == "details":
+            return "Details"
+        return "Content Browser"
+
+    def _draw_panel(self, surf, pid, rect) -> None:
+        import pygame
+        pygame.draw.rect(surf, PANEL_BG, rect)
+        pygame.draw.rect(surf, PANEL_EDGE, rect, 1)
+        title_rect = pygame.Rect(rect.x, rect.y, rect.width, PANEL_TITLE_H)
+        pygame.draw.rect(surf, (30, 33, 40), title_rect)
+        pygame.draw.line(surf, PANEL_EDGE, (rect.x, rect.y + PANEL_TITLE_H),
+                         (rect.right, rect.y + PANEL_TITLE_H))
+        lab = self.font_small.render(self._panel_title(pid)[:44], True, TEXT)
+        surf.blit(lab, (rect.x + 8, rect.y + 3))
+        content = pygame.Rect(rect.x, rect.y + PANEL_TITLE_H, rect.width,
+                              max(0, rect.height - PANEL_TITLE_H))
+        if pid == "outliner":
+            self._draw_outliner(surf, content)
+        elif pid == "details":
+            self._draw_details(surf, content)
+        elif pid == "browser":
+            self._draw_browser(surf, content)
+
+    def _draw_menu_bar(self, surf, w) -> None:
+        import pygame
+        bar = pygame.Rect(0, 0, w, MENU_H)
+        pygame.draw.rect(surf, (26, 28, 34), bar)
+        pygame.draw.line(surf, PANEL_EDGE, (0, MENU_H), (w, MENU_H))
+        mp = pygame.mouse.get_pos()
+        title_rects = self._menu_title_rects(w)
+        for name, r in title_rects.items():
+            if name == self.open_menu:
+                pygame.draw.rect(surf, SELECT_BG, r)
+            elif r.collidepoint(mp):
+                pygame.draw.rect(surf, HOVER_BG, r)
+            lab = self.font_small.render(name, True, TEXT)
+            surf.blit(lab, (r.x + 10, r.y + 6))
+
+        if self.open_menu is None:
+            return
+        checks = self._WINDOW_PANEL_LABELS if self.open_menu == "Window" else {}
+        hints = self._MENU_HOTKEYS.get(self.open_menu, {})
+        drop, rows = self._dropdown_geom(self.open_menu, w)
+        pygame.draw.rect(surf, (24, 26, 32), drop)
+        pygame.draw.rect(surf, PANEL_EDGE, drop, 1)
+        for label, r, _action, enabled in rows:
+            if r.collidepoint(mp):
+                pygame.draw.rect(surf, HOVER_BG, r)
+            color = TEXT if enabled else TEXT_DIM
+            if label in checks:
+                pid = checks[label]
+                box = pygame.Rect(r.x + 4, r.y + 5, 12, 12)
+                pygame.draw.rect(surf, (48, 51, 60), box, border_radius=2)
+                if self.panel_visible.get(pid, True):
+                    pygame.draw.rect(surf, ACCENT, box.inflate(-4, -4), border_radius=2)
+                surf.blit(self.font_small.render(label, True, color), (r.x + 22, r.y + 4))
+            else:
+                surf.blit(self.font_small.render(label, True, color), (r.x + 8, r.y + 4))
+            hint = hints.get(label)
+            if hint:
+                hl = self.font_small.render(hint, True, TEXT_DIM)
+                surf.blit(hl, (r.right - hl.get_width() - 8, r.y + 4))
+
+    _CONTROLS_LINES = (
+        "RMB (hold) - mouse look + fly: WASD move, Q/E or Space/Ctrl down/up, "
+        "wheel = fly speed, Shift = fast",
+        "LMB - select / drag assets & gizmo / drag panel title bars to move them",
+        "W / E / R - gizmo mode: translate / rotate / scale  (only while not looking)",
+        ", / . - rotate selection 15 deg        - / = - scale selection",
+        "F - focus camera on selection  (only while not looking)",
+        "Ctrl+D - duplicate selection           Del - delete selection",
+        "Ctrl+S - save scene",
+        "L - toggle flashlight                  C - toggle player collision",
+        "M - open material editor for the selected mesh",
+        "F1 - wireframe   F2 - per-pixel/flat shading   H - toggle HUD",
+        "Esc - close menu/dialog, else deselect, else quit",
+    )
+
+    def _draw_controls_overlay(self, surf, w, h) -> None:
+        import pygame
+        pad, line_h = 16, 20
+        box_w = min(w - 80, 640)
+        box_h = pad * 2 + 28 + len(self._CONTROLS_LINES) * line_h
+        rect = pygame.Rect((w - box_w) // 2, max(MENU_H + 10, (h - box_h) // 2),
+                           box_w, box_h)
+        shade = pygame.Surface((w, h), pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 140))
+        surf.blit(shade, (0, 0))
+        pygame.draw.rect(surf, PANEL_BG, rect, border_radius=6)
+        pygame.draw.rect(surf, PANEL_EDGE, rect, 1, border_radius=6)
+        surf.blit(self.font.render("Controls", True, TEXT), (rect.x + pad, rect.y + pad))
+        y = rect.y + pad + 28
+        for line in self._CONTROLS_LINES:
+            surf.blit(self.font_small.render(line, True, TEXT_DIM), (rect.x + pad, y))
+            y += line_h
+
+    def _draw_settings(self, surf, w, h) -> None:
+        import pygame
+        rect = self._settings_rect(w, h)
+        pygame.draw.rect(surf, PANEL_BG, rect, border_radius=6)
+        pygame.draw.rect(surf, PANEL_EDGE, rect, 1, border_radius=6)
+        surf.blit(self.font.render("Settings", True, TEXT), (rect.x + 12, rect.y + 8))
+        close = pygame.Rect(rect.right - 26, rect.y + 5, 20, 20)
+        mp = pygame.mouse.get_pos()
+        pygame.draw.rect(surf, (60, 34, 34) if not close.collidepoint(mp) else (90, 44, 44),
+                         close, border_radius=4)
+        surf.blit(self.font_small.render("X", True, (230, 160, 160)),
+                  (close.x + 7, close.y + 4))
+
+        surf.blit(self.font_small.render("Resolution", True, TEXT_DIM),
+                  (rect.x + 12, rect.y + 38))
+        cur_size = self.eng.screen.get_size()
+        for (rw, rh), btn in self._settings_res_buttons(rect):
+            active = (cur_size == (rw, rh))
+            pygame.draw.rect(surf, SELECT_BG if active else (33, 36, 44), btn,
+                             border_radius=4)
+            pygame.draw.rect(surf, PANEL_EDGE, btn, 1, border_radius=4)
+            lab = self.font_small.render(f"{rw}x{rh}", True, TEXT)
+            surf.blit(lab, (btn.x + (btn.width - lab.get_width()) // 2, btn.y + 5))
+
+        self._draw_settings_slider(surf, rect, "pixel", "pixel scale",
+                                   self.eng.renderer.render_scale, 1, 6)
+        self._draw_settings_slider(surf, rect, "max_fps", "max fps",
+                                   self.eng.max_fps, 30, 240)
+
+    def _draw_settings_slider(self, surf, rect, which, label, value, lo, hi) -> None:
+        import pygame
+        row = self._settings_slider_row(rect, which)
+        surf.blit(self.font_small.render(label, True, TEXT_DIM), (row.x, row.y + 5))
+        x0, x1 = self._settings_slider_track(row)
+        cy = row.y + row.height // 2
+        f = min(max((value - lo) / (hi - lo), 0.0), 1.0)
+        pygame.draw.line(surf, (48, 51, 60), (x0, cy), (x1, cy), 4)
+        kx = int(x0 + f * (x1 - x0))
+        pygame.draw.line(surf, ACCENT, (x0, cy), (kx, cy), 4)
+        pygame.draw.circle(surf, (235, 235, 240), (kx, cy), 5)
+        surf.blit(self.font_small.render(str(int(round(value))), True, TEXT),
+                  (x1 + 8, row.y + 5))
 
     def _draw_markers(self, surf, w, h) -> None:
         import numpy as np
@@ -756,19 +1428,12 @@ class Editor:
 
     def _draw_outliner(self, surf, rect) -> None:
         import pygame
-        pygame.draw.rect(surf, PANEL_BG, rect)
-        pygame.draw.line(surf, PANEL_EDGE, rect.topleft, rect.bottomleft)
-        name = os.path.basename(self.scene_path) + (" *" if self.dirty else "")
-        if self.save_flash > 0:
-            name = "saved ✓"
-        title = self.font.render(f"World Outliner — {name}", True, TEXT)
-        surf.blit(title, (rect.x + 10, rect.y + 8))
-
         rows = self._outliner_rows()
-        visible = (rect.height - 30 - 22) // ROW_H
+        top_pad = 6
+        visible = max(0, (rect.height - top_pad - 20)) // ROW_H
         self.outliner_scroll = max(0, min(self.outliner_scroll, max(0, len(rows) - visible)))
         mp = pygame.mouse.get_pos()
-        y = rect.y + 30
+        y = rect.y + top_pad
         for e in rows[self.outliner_scroll:self.outliner_scroll + visible]:
             row = pygame.Rect(rect.x + 1, y, rect.width - 2, ROW_H)
             if e is self.selected:
@@ -790,33 +1455,28 @@ class Editor:
             text = self.font.render(e.name[:24], True, TEXT)
             surf.blit(text, (x, y + 3))
             y += ROW_H
-        hint = self.font_small.render("Del del · Ctrl+D dup · Z focus · Ctrl+S save",
+        hint = self.font_small.render("Del delete · Ctrl+D dup · F focus · Ctrl+S save",
                                       True, TEXT_DIM)
         surf.blit(hint, (rect.x + 10, rect.bottom - 18))
 
     def _draw_details(self, surf, rect) -> None:
         import pygame
-        pygame.draw.rect(surf, PANEL_BG, rect)
-        pygame.draw.line(surf, PANEL_EDGE, rect.topleft, rect.topright)
-        pygame.draw.line(surf, PANEL_EDGE, rect.topleft, rect.bottomleft)
-        surf.blit(self.font.render("Details", True, TEXT), (rect.x + 10, rect.y + 8))
-
         e = self.selected
         if e is None:
             surf.blit(self.font_small.render("select an entity", True, TEXT_DIM),
-                      (rect.x + 10, rect.y + 32))
+                      (rect.x + 10, rect.y + 8))
             return
         head = f"{e.name}" + (f"  ({e.asset_name})" if e.asset_name else "")
-        surf.blit(self.font_small.render(head[:34], True, TEXT), (rect.x + 10, rect.y + 28))
+        surf.blit(self.font_small.render(head[:34], True, TEXT), (rect.x + 10, rect.y + 6))
         p = e.transform.position
         pos_text = f"x {p.x:.1f}  y {p.y:.1f}  z {p.z:.1f}"
         surf.blit(self.font_small.render(pos_text, True, TEXT_DIM),
-                  (rect.x + 10, rect.y + 42))
+                  (rect.x + 10, rect.y + 20))
 
         rows = self._details_rows()
         if not rows:
             surf.blit(self.font_small.render("no light on this entity", True, TEXT_DIM),
-                      (rect.x + 10, rect.y + 64))
+                      (rect.x + 10, rect.y + DETAILS_ROWS_TOP + 8))
             return
         for i, row in enumerate(rows):
             rr = self._detail_row_rect(rect, i)
@@ -851,11 +1511,6 @@ class Editor:
 
     def _draw_browser(self, surf, rect) -> None:
         import pygame
-        pygame.draw.rect(surf, PANEL_BG, rect)
-        pygame.draw.line(surf, PANEL_EDGE, rect.topleft, rect.topright)
-        title = self.font.render("Content Browser — drag into the world  (assets/)",
-                                 True, TEXT)
-        surf.blit(title, (rect.x + 10, rect.y + 6))
         mp = pygame.mouse.get_pos()
         btn = self._import_btn_rect(rect)
         pygame.draw.rect(surf, HOVER_BG if btn.collidepoint(mp) else (33, 36, 44),
@@ -864,8 +1519,8 @@ class Editor:
         label = self.font_small.render("+ Import FBX", True, ACCENT)
         surf.blit(label, (btn.x + (btn.width - label.get_width()) // 2, btn.y + 4))
         if self.status[1] > 0:
-            msg = self.font_small.render(self.status[0][:80], True, (235, 210, 140))
-            surf.blit(msg, (btn.x - msg.get_width() - 14, rect.y + 8))
+            msg = self.font_small.render(self.status[0][:60], True, (235, 210, 140))
+            surf.blit(msg, (rect.x + 10, rect.y + 6))
         x = rect.x + 10 - self.browser_scroll
         for asset in self.lib.assets:
             tile = pygame.Rect(x, rect.y + 26, TILE_W, TILE_H - 12)
@@ -890,11 +1545,13 @@ class MaterialEditorUI:
     """Node-based material editor: drag ports to connect, drag params to tune.
 
     The graph bakes to the entity mesh's per-face colors on every change, so
-    the 3D viewport behind the panel is a live preview.
+    the 3D viewport behind the panel is a live preview. Floating only — drag
+    its 18px title bar to move it, click X (or M/Esc) to close.
     """
 
     PALETTE = ("color", "position", "normal", "checker", "noise",
                "gradient", "mix", "multiply")
+    DEFAULT_SIZE = (900, 560)
 
     def __init__(self, editor: Editor, entity):
         self.editor = editor
@@ -902,9 +1559,12 @@ class MaterialEditorUI:
         if entity.material is None:
             entity.material = editor.engine_mod.MaterialGraph()
         self.graph = entity.material
+        self.pos = [60, 50]
+        self.size = list(self.DEFAULT_SIZE)
         self.drag_node = None    # (node_id, grab_dx, grab_dy)
         self.drag_link = None    # source node id while dragging a new wire
         self.drag_param = None   # (node_id, param_name)
+        self.drag_title = None   # (grab_dx, grab_dy) while dragging the title bar
         self._spawn_i = 0
 
     def close(self) -> None:
@@ -913,7 +1573,18 @@ class MaterialEditorUI:
     # ---- geometry ----
     def rect(self, w, h):
         import pygame
-        return pygame.Rect(30, 30, w - OUTLINER_W - 60, h - BROWSER_H - 60)
+        sw = min(self.size[0], max(300, w - 40))
+        sh = min(self.size[1], max(200, h - 40))
+        x = min(max(self.pos[0], 0), max(0, w - sw))
+        y = min(max(self.pos[1], MENU_H), max(MENU_H, h - sh))
+        self.pos = [x, y]
+        return pygame.Rect(x, y, sw, sh)
+
+    def content_rect(self, w, h):
+        import pygame
+        outer = self.rect(w, h)
+        return pygame.Rect(outer.x, outer.y + PANEL_TITLE_H, outer.width,
+                           max(0, outer.height - PANEL_TITLE_H))
 
     def node_rect(self, nid, panel):
         import pygame
@@ -959,14 +1630,26 @@ class MaterialEditorUI:
         inp = engine.input
         mp = inp.mouse_pos
         w, h = engine.screen.get_size()
-        panel = self.rect(w, h)
+        outer = self.rect(w, h)
+        panel = self.content_rect(w, h)
+        title_bar = pygame.Rect(outer.x, outer.y, outer.width, PANEL_TITLE_H)
+        close = pygame.Rect(outer.right - 24, outer.y + 2, 16, 16)
 
         if inp.pressed(pygame.K_m):
             self.close()
             return
         if inp.mouse_button_pressed(1):
-            self._press(mp, panel)
+            if close.collidepoint(mp):
+                self.close()
+                return
+            if title_bar.collidepoint(mp):
+                self.drag_title = (mp[0] - outer.x, mp[1] - outer.y)
+            else:
+                self._press(mp, panel)
         if inp.mouse_held(1):
+            if self.drag_title is not None:
+                dx, dy = self.drag_title
+                self.pos = [mp[0] - dx, mp[1] - dy]
             if self.drag_node is not None:
                 nid, dx, dy = self.drag_node
                 if nid in self.graph.nodes:
@@ -986,14 +1669,10 @@ class MaterialEditorUI:
         else:
             if self.drag_link is not None:
                 self._finish_link(mp, panel)
-            self.drag_node = self.drag_param = self.drag_link = None
+            self.drag_node = self.drag_param = self.drag_link = self.drag_title = None
 
     def _press(self, mp, panel) -> None:
         import pygame
-        close = pygame.Rect(panel.right - 26, panel.y + 5, 20, 20)
-        if close.collidepoint(mp):
-            self.close()
-            return
         for t, r in self._palette_rects(panel):
             if r.collidepoint(mp):
                 self._spawn_i += 1
@@ -1052,23 +1731,29 @@ class MaterialEditorUI:
     def draw(self, surf) -> None:
         import pygame
         w, h = surf.get_size()
-        panel = self.rect(w, h)
-        pygame.draw.rect(surf, (18, 20, 25), panel)
-        pygame.draw.rect(surf, PANEL_EDGE, panel, 1)
-        title = self.editor.font.render(
+        outer = self.rect(w, h)
+        panel = self.content_rect(w, h)
+        pygame.draw.rect(surf, (18, 20, 25), outer)
+        pygame.draw.rect(surf, PANEL_EDGE, outer, 1)
+        title_bar = pygame.Rect(outer.x, outer.y, outer.width, PANEL_TITLE_H)
+        pygame.draw.rect(surf, (30, 33, 40), title_bar)
+        pygame.draw.line(surf, PANEL_EDGE, (outer.x, outer.y + PANEL_TITLE_H),
+                         (outer.right, outer.y + PANEL_TITLE_H))
+        title = self.editor.font_small.render(
             f"Material — {self.entity.name}   (drag ports to wire, M/Esc close)",
             True, TEXT)
-        surf.blit(title, (panel.x + 10, panel.bottom - 24))
+        surf.blit(title, (outer.x + 8, outer.y + 3))
+        close = pygame.Rect(outer.right - 24, outer.y + 2, 16, 16)
+        pygame.draw.rect(surf, (60, 34, 34), close, border_radius=3)
+        x_lab = self.editor.font_small.render("X", True, (230, 160, 160))
+        surf.blit(x_lab, (close.x + 4, close.y + 1))
+
         for t, r in self._palette_rects(panel):
             hov = r.collidepoint(pygame.mouse.get_pos())
             pygame.draw.rect(surf, HOVER_BG if hov else (30, 33, 40), r,
                              border_radius=4)
             lab = self.editor.font_small.render("+" + t, True, TEXT)
             surf.blit(lab, (r.x + 6, r.y + 4))
-        close = pygame.Rect(panel.right - 26, panel.y + 5, 20, 20)
-        pygame.draw.rect(surf, (60, 34, 34), close, border_radius=4)
-        x_lab = self.editor.font_small.render("X", True, (230, 160, 160))
-        surf.blit(x_lab, (close.x + 7, close.y + 4))
 
         NODE_DEFS = self.editor.engine_mod.NODE_DEFS
         # wires
@@ -1142,24 +1827,33 @@ class EditorBehavior:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PyEngine editor")
-    parser.add_argument("--width", type=int, default=1440)
-    parser.add_argument("--height", type=int, default=810)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--scene", default=os.path.join(BASE_DIR, "scenes", "scene.json"))
     parser.add_argument("--frames", type=int, default=None)
     parser.add_argument("--screenshot", default=None)
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--pixel-scale", type=int, default=4,
+    parser.add_argument("--pixel-scale", type=int, default=None,
                         help="per-pixel lighting internal resolution divisor "
-                             "(lower = sharper, slower; default 4)")
+                             "(lower = sharper, slower; default 4, or from "
+                             "settings.json if present)")
     args = parser.parse_args()
 
     if args.headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
 
     import engine
+    import pygame
 
-    eng = engine.Engine(args.width, args.height, title="PyEngine Editor")
-    eng.renderer.render_scale = max(1, args.pixel_scale)
+    settings = load_settings()
+    width = args.width if args.width is not None else settings.get("width", 1440)
+    height = args.height if args.height is not None else settings.get("height", 810)
+    pixel_scale = (args.pixel_scale if args.pixel_scale is not None
+                   else settings.get("pixel_scale", 4))
+    max_fps = settings.get("max_fps", 120)
+
+    eng = engine.Engine(width, height, title="PyEngine Editor", max_fps=max_fps)
+    eng.renderer.render_scale = max(1, pixel_scale)
     eng.loading_step("loading asset library", 0.12)
     lib = engine.AssetLibrary(os.path.join(BASE_DIR, "assets"))
     camera = engine.Camera(position=engine.Vec3(6.0, 2.6, 9.0), yaw=0.45, pitch=-0.08,
@@ -1172,33 +1866,33 @@ def main() -> None:
         scene = build_starter_scene(engine, lib)
 
     editor = Editor(engine, eng, scene, camera, lib, args.scene)
+    editor._apply_layout_settings(settings)
 
     flashlight = engine.Entity("flashlight", light=engine.SpotLight(
         color=(255, 244, 214), intensity=2.0, range=24.0, radius=0.25,
         inner=13.0, outer=27.0, shadow_samples=2, shadow_interval=2))
     flashlight.casts_shadow = False
-    flashlight.add_behavior(engine.behaviors.FlashlightController(camera))
+    flashlight.add_behavior(engine.behaviors.FlashlightController(camera, toggle_key=pygame.K_l))
     scene.add(flashlight)
     editor.flashlight = flashlight
 
     fly = engine.behaviors.FlyController(
         camera, look_buttons=(3,), look_guard=lambda pos: not editor.over_ui(pos),
-        collide=True)
+        collide=True, move_requires_look=True)
     editor.fly = fly
     scene.add(engine.Entity("__camera").add_behavior(fly))
     scene.add(engine.Entity("__editor").add_behavior(EditorBehavior(editor)))
 
     # trace the static lights' shadows now so the first frame doesn't hitch
     eng.loading_step("pre-tracing shadows", 0.8)
-    import pygame
     eng.tracer.refresh(scene)
     eng.renderer.render(pygame.Surface((320, 180)), scene, camera, eng.tracer)
 
     eng.loading_step("opening world", 0.95)
     eng.esc_handler = editor.handle_escape
-    eng.hud_text = ("RMB: look/fly | LMB: select, drag assets & gizmo | G gizmo mode | "
-                    "M material | F flashlight | C collision | Z focus | Ctrl+D dup | "
-                    "Del del | Ctrl+S save | F2 shading | Esc quit")
+    eng.hud_text = ("RMB: look/fly (WASD/QE/Space/Ctrl, wheel=speed) | LMB: select/gizmo/panels | "
+                    "W/E/R gizmo mode | M material | L flashlight | C collision | F focus | "
+                    "Ctrl+D dup | Del delete | Ctrl+S save | F1/F2 shading | H hud | Esc back/quit")
     eng.run(scene, camera, max_frames=args.frames, screenshot_path=args.screenshot,
             overlay=editor.draw)
 

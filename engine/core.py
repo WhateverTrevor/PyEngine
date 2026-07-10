@@ -76,6 +76,16 @@ class Engine:
             self._splash_active = False
             self.screen = pygame.display.set_mode(self._size)
 
+    def set_resolution(self, width: int, height: int) -> None:
+        """Resize the window (e.g. from an editor Settings panel).
+
+        The renderer's deferred-pass cache and HUD text cache key off the
+        current screen size already, so they self-invalidate next frame —
+        no further bookkeeping needed here.
+        """
+        self._size = (width, height)
+        self.screen = pygame.display.set_mode(self._size)
+
     def run(self, scene, camera, max_frames: int | None = None,
             screenshot_path: str | None = None, overlay=None) -> None:
         """Run the game loop until quit.

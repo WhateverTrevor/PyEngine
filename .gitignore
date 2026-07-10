@@ -6,3 +6,6 @@ __pycache__/
 # Editor/OS noise
 Thumbs.db
 .DS_Store
+
+# Per-user editor settings (window size, panel layout, ...)
+settings.json
