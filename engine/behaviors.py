@@ -133,13 +133,17 @@ class FlyController(Behavior):
 
     The mouse is captured only while one of `look_buttons` is held (default:
     left or right button); releasing the button frees the cursor. WASD moves
-    along the view direction, Space/Ctrl move vertically, Shift is fast.
+    along the view direction, Q/E and Space/Ctrl move down/up, Shift is fast.
     `look_guard(mouse_pos)` can veto engaging a look (e.g. over editor UI).
+    With `move_requires_look=True` (Unreal viewport behavior), all movement
+    keys only act while `looking` is True. While looking, the scroll wheel
+    adjusts fly speed instead of whatever it normally controls.
     """
 
     def __init__(self, camera: Camera, speed: float = 9.0, sensitivity: float = 0.0025,
                  look_buttons: tuple[int, ...] = (1, 3), look_guard=None,
-                 collide: bool = True, collide_radius: float = 0.45):
+                 collide: bool = True, collide_radius: float = 0.45,
+                 move_requires_look: bool = False):
         self.camera = camera
         self.speed = speed
         self.sensitivity = sensitivity
@@ -147,43 +151,47 @@ class FlyController(Behavior):
         self.look_guard = look_guard
         self.collide = collide
         self.collide_radius = collide_radius
-        self._looking = False
+        self.move_requires_look = move_requires_look
+        self.looking = False
 
     def update(self, entity: Entity, dt: float, engine) -> None:
         inp = engine.input
 
-        if not self._looking:
+        if not self.looking:
             for b in self.look_buttons:
                 if inp.mouse_button_pressed(b) and (
                         self.look_guard is None or self.look_guard(inp.mouse_pos)):
-                    self._looking = True
+                    self.looking = True
                     inp.set_captured(True)
                     break
-        if self._looking and not any(inp.mouse_held(b) for b in self.look_buttons):
-            self._looking = False
+        if self.looking and not any(inp.mouse_held(b) for b in self.look_buttons):
+            self.looking = False
             inp.set_captured(False)
 
         cam = self.camera
-        if self._looking:
+        if self.looking:
             cam.yaw -= inp.mouse_dx * self.sensitivity
             cam.pitch -= inp.mouse_dy * self.sensitivity
             limit = math.radians(89.0)
             cam.pitch = max(-limit, min(limit, cam.pitch))
+            if inp.wheel:
+                self.speed = min(max(self.speed * (1.15 ** inp.wheel), 1.0), 80.0)
 
         move = Vec3()
-        fwd, right = cam.forward(), cam.right()
-        if inp.held(pygame.K_w):
-            move = move + fwd
-        if inp.held(pygame.K_s):
-            move = move - fwd
-        if inp.held(pygame.K_d):
-            move = move + right
-        if inp.held(pygame.K_a):
-            move = move - right
-        if inp.held(pygame.K_SPACE):
-            move = move + Vec3(0, 1, 0)
-        if inp.held(pygame.K_LCTRL):
-            move = move - Vec3(0, 1, 0)
+        if self.looking or not self.move_requires_look:
+            fwd, right = cam.forward(), cam.right()
+            if inp.held(pygame.K_w):
+                move = move + fwd
+            if inp.held(pygame.K_s):
+                move = move - fwd
+            if inp.held(pygame.K_d):
+                move = move + right
+            if inp.held(pygame.K_a):
+                move = move - right
+            if inp.held(pygame.K_SPACE) or inp.held(pygame.K_e):
+                move = move + Vec3(0, 1, 0)
+            if inp.held(pygame.K_LCTRL) or inp.held(pygame.K_q):
+                move = move - Vec3(0, 1, 0)
         if move.length() > 1e-9:
             speed = self.speed * (4.0 if inp.held(pygame.K_LSHIFT) else 1.0)
             cam.position = cam.position + move.normalized() * (speed * dt)

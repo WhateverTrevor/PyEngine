@@ -270,7 +270,9 @@ class Renderer:
             grid[..., 1] = ys[None, :]
             grid[..., 2] = -1.0
             cache = {"size": (rw, rh), "grid": grid,
-                     "surf": pygame.Surface((rw, rh)), "sky": None, "skykey": None}
+                     "surf": pygame.Surface((rw, rh)),
+                     "surf2": pygame.Surface((rw, rh)),
+                     "sky": None, "skykey": None}
             self._defer_cache = cache
         small = cache["surf"]
 
@@ -330,11 +332,22 @@ class Renderer:
         polys.sort(key=lambda p: p[0], reverse=True)
         self.stats["triangles"] = len(polys)
 
+        # Two painter fills of the same polys, opposite order, give the two
+        # depth-ambiguous candidates for any pixel covered by >=1 face:
+        # `small` (far-to-near draw) lands on the centroid-NEAREST face,
+        # `small2` (near-to-far draw) lands on the centroid-FARTHEST face.
+        # Where they agree the painter order was unambiguous; where they
+        # differ we resolve with an exact ray-plane test below.
         small.fill((0, 0, 0))  # id 0 = sky
+        small2 = cache["surf2"]
+        small2.fill((0, 0, 0))
         draw = pygame.draw.polygon
         for _, fid, pts in polys:
             c = fid + 1
             draw(small, ((c >> 16) & 255, (c >> 8) & 255, c & 255), pts)
+        for _, fid, pts in reversed(polys):
+            c = fid + 1
+            draw(small2, ((c >> 16) & 255, (c >> 8) & 255, c & 255), pts)
 
         if offset == 0:
             pygame.surfarray.blit_array(small, cache["sky"].astype(np.uint8))
@@ -376,19 +389,42 @@ class Renderer:
             pygame.surfarray.blit_array(small, frame)
             pygame.transform.scale(small, (w, h), surface)
             return
-        fid = ids[vis] - 1
-
-        n = normals[fid]                       # (V, 3)
-        p0 = centroids[fid]
+        fid_a = ids[vis] - 1                   # centroid-nearest candidate
         cam = camera.position.to_array().astype(np.float32)
         dirs = cache["dirs"][vis]
 
-        denom = np.einsum("ij,ij->i", dirs, n)
-        tnum = np.einsum("ij,ij->i", p0 - cam[None, :], n)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            t = tnum / denom
-        t = np.clip(np.nan_to_num(t, nan=far, posinf=far, neginf=far),
-                    near, far).astype(np.float32)
+        def _ray_plane_t(face_idx, ray_dirs):
+            n = normals[face_idx]
+            p0 = centroids[face_idx]
+            denom = np.einsum("ij,ij->i", ray_dirs, n)
+            tnum = np.einsum("ij,ij->i", p0 - cam[None, :], n)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                tt = tnum / denom
+            return np.clip(np.nan_to_num(tt, nan=far, posinf=far, neginf=far),
+                           near, far).astype(np.float32)
+
+        fid, t = fid_a, _ray_plane_t(fid_a, dirs)
+
+        # Decode buffer B only at the already-visible pixels (not the full
+        # frame) -- cheaper than decoding then indexing.
+        px2 = pygame.surfarray.array3d(small2).reshape(-1, 3)[vis].astype(np.int32)
+        fid_b = ((px2[:, 0] << 16) | (px2[:, 1] << 8) | px2[:, 2]) - 1
+
+        # Only pixels where the two painter fills disagree are truly
+        # depth-ambiguous (>=2 overlapping faces); resolve those exactly.
+        diff = np.flatnonzero(fid_a != fid_b)
+        if diff.size:
+            fb = fid_b[diff]
+            t_b = _ray_plane_t(fb, dirs[diff])
+            pick_b = t_b < t[diff]
+            if pick_b.any():
+                sel = diff[pick_b]
+                fid = fid.copy()
+                fid[sel] = fb[pick_b]
+                t = t.copy()
+                t[sel] = t_b[pick_b]
+
+        n = normals[fid]                       # (V, 3)
         pos = cam[None, :] + dirs * t[:, None]
 
         lum = base[fid].copy()

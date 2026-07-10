@@ -76,7 +76,7 @@ def main() -> None:
     import engine  # after the SDL driver decision, since importing initializes pygame
 
     eng = engine.Engine(args.width, args.height, title="PyEngine Demo")
-    eng.hud_text = ("WASD move | Space/Ctrl up/down | Shift fast | "
+    eng.hud_text = ("WASD move | Q/E or Space/Ctrl up/down | Shift fast | "
                     "hold LMB/RMB = mouse look | F1 wireframe | H hud | Esc quit")
 
     eng.loading_step("building scene", 0.5)
