@@ -62,6 +62,13 @@ agent that judges it before anything is committed.
 
 ## Gotchas that have bitten before
 
+- moderngl is an OPTIONAL dependency (GPU renderer, `engine/gl_renderer.py`);
+  everything must keep working without it. After `pygame.display.set_mode()`
+  resizes an OPENGL window, moderngl's `ctx.screen` caches a stale size —
+  pass explicit `viewport=` to reads and re-set `ctx.viewport` after resizes.
+- A user's `settings.json` (per-user, gitignored) overrides resolution and
+  pixel_scale — delete or ignore it when benchmarking, or numbers lie.
+
 - pygame/numpy surfarray axes are (width, height, 3), not (h, w).
 - PowerShell 5.1 mangles embedded double quotes in native-command args.
 - Fixed-timestep loop can run update 0 or 2 times per rendered frame —

@@ -2,8 +2,10 @@
 
 A compact real-time 3D game engine and world editor written in pure Python,
 using **numpy** for the vectorized transform/lighting/ray-tracing pipeline and
-**pygame** (SDL) only as a window/rasterization backend. No OpenGL — the 3D
-pipeline itself is all Python.
+**pygame** (SDL) as the window/input backend. The default renderer is pure
+Python (no OpenGL); an optional GPU backend (OpenGL 3.3 via `moderngl`)
+mirrors the same lighting model in GLSL for a large FPS win — see
+[GPU rendering](#gpu-rendering).
 
 | Editor | Demo |
 |---|---|
@@ -13,8 +15,10 @@ pipeline itself is all Python.
 
 ```
 py -m pip install pygame numpy
+py -m pip install moderngl   # optional: enables the GPU renderer
 py editor.py     # world editor with the survival-horror starter scene
 py demo.py       # bright playground demo
+py editor.py --gpu   /   --cpu   # force a renderer (default: auto)
 ```
 
 ### Editor controls
@@ -37,7 +41,7 @@ with this same list.
 | **L** | toggle flashlight |
 | **C** | toggle player collision (on by default — walls block you) |
 | **M** | open/close the material editor for the selected mesh |
-| **F1 / F2** | wireframe / switch per-pixel <-> flat lighting |
+| **F1 / F2** | wireframe / switch per-pixel <-> flat lighting (F2 is a no-op on the GPU renderer — flat vs. per-pixel is a software-only concept) |
 | **H** | toggle HUD |
 | **Esc** | close an open menu/dialog, else deselect, else quit |
 
@@ -68,9 +72,13 @@ Layout, visibility, and floating positions persist to `settings.json`
 
 A floating panel with resolution presets (1280x720, 1440x810, 1600x900,
 1920x1080 — applied immediately via `Engine.set_resolution`), a pixel-scale
-slider (1-6, lower = sharper per-pixel lighting, slower), and a max-FPS
-slider (30-240). All three persist to `settings.json`; CLI flags
-(`--width`/`--height`/`--pixel-scale`) still win over the saved values.
+slider (1-6, lower = sharper per-pixel lighting, slower — hidden while the
+GPU renderer is active, since it only affects the software per-pixel pass), a
+max-FPS slider (30-240), and a **Renderer: GPU / CPU** toggle. The renderer
+choice takes effect on the *next launch* (live switching mid-session is out
+of scope); everything else persists and applies immediately. CLI flags
+(`--width`/`--height`/`--pixel-scale`/`--gpu`/`--cpu`) still win over the
+saved values.
 
 The **+ Import FBX** button in the content browser (or **File > Import
 FBX...**) opens a file picker and converts a binary FBX model into a
@@ -112,9 +120,13 @@ engine/
   scene.py        Scene / Entity / Transform / Behavior (component system)
   behaviors.py    Spin, Bob, Orbit, Flicker, FlyController (+collision), ...
   input.py        per-frame keyboard/mouse state, hold-to-capture mouse
-  renderer.py     deferred per-pixel + flat shading paths, painter's sort
+  renderer.py     software renderer: deferred per-pixel + flat shading paths,
+                  painter's sort
+  gl_renderer.py  optional GPU renderer (OpenGL 3.3 core via moderngl):
+                  same lighting model in GLSL, ray-traced shadow factors
+                  from raytrace.py uploaded as a per-face texture
   core.py         Engine: window, splash, fixed-timestep loop, HUD, benchmarks,
-                  set_resolution
+                  set_resolution, GPU context lifecycle + software fallback
   assets.py       self-contained JSON assets + scene save/load
 editor.py         menu bar, dockable outliner/details/content-browser panels,
                   settings dialog, gizmo, material editor, FBX import
@@ -233,6 +245,63 @@ Measured on this machine at 1440x810: the starter horror scene (HDRI sky, 6
 shadow-casting lights, flashlight on) runs ~27-32 FPS with per-pixel
 lighting at 1/4 internal resolution; the bright demo scene ~68 FPS at
 1280x720 since the quad-mesh switch.
+
+### GPU rendering
+
+`moderngl` is an **optional** dependency (`py -m pip install moderngl`).
+When present, `Engine(gpu="auto")` (the default for both apps) opens an
+OpenGL 3.3 core window instead of a plain software surface and renders every
+frame through `engine/gl_renderer.py` — a GLSL port of the same lighting
+model as `renderer.py` (ambient/ambient-cube, directional light, up to 16
+point/spot lights with distance falloff, spotlight cones, and IES profiles),
+running per-fragment with a real depth buffer instead of the software
+renderer's painter's-sort + face-ID buffer. Measured on this machine: the
+demo scene goes from ~56 FPS (software, default per-pixel path) to ~115 FPS
+GPU (both capped at `max_fps=120`, so GPU is closer to the cap than the raw
+ratio suggests); scenes bottlenecked on the software renderer's per-pixel
+pass see a much larger win. `--gpu`/`--cpu` force a renderer from the
+command line;
+`--headless` always forces software, since the SDL dummy driver used for
+headless/CI runs has no GL surface to attach to.
+
+**What stays on the CPU even in GPU mode:**
+
+- **Shadows** — `raytrace.ShadowTracer` still ray-casts per face against the
+  triangle soup every frame (same caching/amortization as the software
+  path); the GPU renderer uploads the resulting per-face factors as a small
+  texture and samples it by a global face id in the fragment shader. Shadow
+  quality/cost is therefore identical between the two renderers — the GPU
+  gets you faster *shading*, not faster *shadow tracing*.
+- **Mouse picking** (`raytrace.pick_entity`) and **collision**
+  (`behaviors.FlyController`'s sphere-vs-OBB test) — both are ray/geometry
+  math against the same triangle soup, independent of how pixels get shaded.
+
+**UI in GPU mode:** the editor/HUD keep drawing with pygame exactly as in
+software mode — `Engine.screen` becomes a transparent overlay surface that
+gets composited over the 3D frame each tick as an alpha-blended fullscreen
+quad, so none of the editor/HUD code needed to change.
+
+**Known limitations:**
+
+- Max **16 dynamic point/spot lights** per frame (extras are silently
+  dropped, sorted by scene order); the software renderer has no such cap.
+- Fog distance is the true Euclidean camera-to-fragment distance (matching
+  the software renderer's *per-pixel* path); the software renderer's *flat*
+  path instead fogs by view-space linear depth. The two software paths
+  already disagree with each other here, so the GPU renderer matching the
+  more precise of the two seemed the right call.
+- Resizing the GPU window (Settings dialog) recreates GL-side size-dependent
+  objects (viewport, UI overlay texture) but keeps the existing GL context;
+  this path is exercised by `set_resolution` but wasn't soak-tested under
+  heavy interactive resizing.
+- The GPU path was verified against an NVIDIA RTX 5070 Ti; other vendors'
+  GL 3.3 core drivers should work (nothing vendor-specific is used) but
+  weren't tested.
+
+**Fallback:** any failure anywhere along the GPU path (missing `moderngl`,
+no GL 3.3 driver, context creation failure) is caught, prints one warning
+line, and the window is recreated without the `OPENGL` flag — the rest of
+the engine behaves exactly as if `gpu=False` had been passed.
 
 ## Extending it
 

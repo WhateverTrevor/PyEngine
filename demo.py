@@ -1,8 +1,9 @@
 """PyEngine demo: a lit, fogged scene you can fly through in real time.
 
-    py demo.py                          interactive
+    py demo.py                          interactive (GPU if available, else CPU)
     py demo.py --frames 300             benchmark 300 frames, print avg FPS
     py demo.py --frames 60 --headless --screenshot out.png
+    py demo.py --gpu / --cpu            force the OpenGL or software renderer
 """
 from __future__ import annotations
 
@@ -68,14 +69,26 @@ def main() -> None:
     parser.add_argument("--screenshot", default=None, help="save last frame to this path")
     parser.add_argument("--headless", action="store_true",
                         help="render without a window (SDL dummy driver)")
+    parser.add_argument("--gpu", action="store_true",
+                        help="force the GPU (moderngl) renderer")
+    parser.add_argument("--cpu", action="store_true",
+                        help="force the software renderer")
     args = parser.parse_args()
 
     if args.headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
 
+    gpu_mode = "auto"
+    if args.gpu:
+        gpu_mode = True
+    elif args.cpu:
+        gpu_mode = False
+    if args.headless:
+        gpu_mode = False  # the SDL dummy driver has no GL surface to attach to
+
     import engine  # after the SDL driver decision, since importing initializes pygame
 
-    eng = engine.Engine(args.width, args.height, title="PyEngine Demo")
+    eng = engine.Engine(args.width, args.height, title="PyEngine Demo", gpu=gpu_mode)
     eng.hud_text = ("WASD move | Q/E or Space/Ctrl up/down | Shift fast | "
                     "hold LMB/RMB = mouse look | F1 wireframe | H hud | Esc quit")
 
