@@ -9,3 +9,6 @@ Thumbs.db
 
 # Per-user editor settings (window size, panel layout, ...)
 settings.json
+
+# Transient agent worktrees
+.claude/worktrees/

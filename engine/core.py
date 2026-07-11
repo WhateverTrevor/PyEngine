@@ -1,12 +1,17 @@
 """Engine core: window, splash/loading screen, fixed-timestep game loop, HUD.
 
-Rendering backend: software (numpy, always available) or GPU (OpenGL 3.3
-core via moderngl, optional). GPU mode keeps `self.screen` alive as an
-SRCALPHA pygame Surface used purely as a UI overlay canvas -- all existing
-HUD/editor drawing code targets it unchanged -- and composites it over the
-3D frame each tick as an alpha-blended fullscreen quad. See gl_renderer.py
-for the GPU pipeline itself; this file only owns window/context lifecycle
-and the per-frame composite.
+Rendering backend: software (numpy, always available), OpenGL 3.3 core via
+moderngl ("gl", optional), or DirectX 12 / Vulkan via wgpu-py ("dx12" /
+"vulkan", optional) -- see `api` on `Engine.__init__`. GL mode keeps
+`self.screen` alive as an SRCALPHA pygame Surface used purely as a UI
+overlay canvas -- all existing HUD/editor drawing code targets it unchanged
+-- and composites it over the 3D frame each tick as an alpha-blended
+fullscreen quad. wgpu mode is simpler: `WgpuRenderer` renders offscreen and
+this file reads the frame back and blits it straight into `self.screen` (a
+normal, non-OPENGL window surface), so HUD/editor drawing works exactly as
+in software mode -- no compositing pass. See gl_renderer.py / wgpu_renderer.py
+for the GPU pipelines themselves; this file only owns window/context
+lifecycle, the api fallback chain, and the per-frame composite/blit.
 """
 from __future__ import annotations
 
@@ -42,20 +47,33 @@ void main() { fragColor = texture(tex, v_uv); }
 class Engine:
     def __init__(self, width: int = 1280, height: int = 720, title: str = "PyEngine",
                  max_fps: int = 120, fixed_dt: float = 1.0 / 60.0, splash: bool = True,
-                 gpu: "str | bool" = "auto"):
-        """`gpu`: "auto" (try GPU unless SDL_VIDEODRIVER=dummy), True (force
-        try, raise-free -- falls back on any failure), or False (software
-        only). GPU window/context creation is deferred to `_end_splash()` (or
+                 api: str = "auto", gpu: "str | bool | None" = None):
+        """`api`: "auto" (try "gl", falling back toward "cpu"; headless/dummy
+        driver always forces "cpu"), "cpu" (software only), "gl" (OpenGL 3.3
+        via moderngl), "dx12" / "vulkan" (WebGPU via wgpu-py, see
+        wgpu_renderer.py). Each GPU choice falls back one step at a time,
+        toward "gl" then "cpu", printing one warning line per step on
+        failure -- see `_init_display`.
+
+        `gpu` is a DEPRECATED alias for `api`, kept for old call sites:
+        True -> "auto", False -> "cpu", any string -> passed through as-is.
+        It takes precedence over `api` when given (so old `gpu=True/False`
+        callers don't need to change anything).
+
+        GPU window/context creation is deferred to `_end_splash()` (or
         immediately if `splash=False`) since the splash screen is a plain
         software surface."""
+        if gpu is not None:
+            api = "auto" if gpu is True else "cpu" if gpu is False else gpu
         os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
         pygame.init()
         self._size = (width, height)
         pygame.display.set_caption(title)
         self.input = InputManager()
         self.renderer = Renderer()
-        self.gl_renderer = None          # GLRenderer, or None in software mode
-        self._gpu_mode = gpu
+        self.gl_renderer = None          # GLRenderer, or None unless api ended up "gl"
+        self.wgpu_renderer = None        # WgpuRenderer, or None unless api ended up dx12/vulkan
+        self._api_mode = api
         self._gl_ctx = None
         self._ui_prog = self._ui_vbo = self._ui_vao = self._ui_tex = None
         self.tracer = ShadowTracer()
@@ -124,14 +142,26 @@ class Engine:
         pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
 
     def _init_display(self) -> None:
-        """Open the real window: GPU (moderngl) if requested/available, else
-        software. Any failure along the GPU path (missing moderngl, no GL
-        3.3 driver, etc.) prints one line and falls back — the window gets
-        recreated without the OPENGL flag so the software path is untouched.
-        """
-        want_gpu = self._gpu_mode is True or (
-            self._gpu_mode == "auto" and os.environ.get("SDL_VIDEODRIVER") != "dummy")
-        if want_gpu:
+        """Open the real window per `self._api_mode`, falling back one step
+        at a time -- requested api -> "gl" -> "cpu" -- printing one warning
+        line per failed step. Headless/dummy-driver runs always force "cpu"
+        (no GL surface or wgpu adapter is expected to make sense there)."""
+        headless = os.environ.get("SDL_VIDEODRIVER") == "dummy"
+        want = "cpu" if headless else self._api_mode
+        if want == "auto":
+            want = "gl"
+
+        if want in ("dx12", "vulkan"):
+            try:
+                self._create_wgpu_window(want)
+                return
+            except Exception as ex:
+                print(f"{want} renderer unavailable ({ex!r}); "
+                      f"falling back to the OpenGL renderer.")
+                self.wgpu_renderer = None
+                want = "gl"
+
+        if want == "gl":
             try:
                 self._create_gpu_window()
                 return
@@ -139,7 +169,14 @@ class Engine:
                 print(f"GPU renderer unavailable ({ex!r}); "
                       f"falling back to the software renderer.")
                 self.gl_renderer = None
+
         self.screen = pygame.display.set_mode(self._size)
+
+    def _create_wgpu_window(self, backend: str) -> None:
+        from .wgpu_renderer import WgpuRenderer
+
+        self.wgpu_renderer = WgpuRenderer(backend)  # raises -> caller falls back to gl/cpu
+        self.screen = pygame.display.set_mode(self._size)  # plain window, no OPENGL flag
 
     def _create_gpu_window(self) -> None:
         import moderngl
@@ -199,11 +236,14 @@ class Engine:
 
         The renderer's deferred-pass cache and HUD text cache key off the
         current screen size already, so they self-invalidate next frame —
-        no further bookkeeping needed here. In GPU mode the window is
+        no further bookkeeping needed here. In GL mode the window is
         re-created with the GL attributes/flags and the UI overlay surface
         + texture are rebuilt at the new size; the GL viewport is set
         explicitly afterward since SDL does not update it on a resize (nor,
-        empirically, does moderngl.Context.screen's cached size).
+        empirically, does moderngl.Context.screen's cached size). In wgpu
+        mode (and software mode) the window is just a plain surface, so
+        re-creating it is enough -- `WgpuRenderer._ensure_size` rebuilds its
+        size-dependent offscreen textures lazily on the next `render()` call.
         """
         self._size = (width, height)
         if self.gl_renderer is not None:
@@ -260,7 +300,11 @@ class Engine:
                     self.renderer.wireframe = not self.renderer.wireframe
                     if self.gl_renderer is not None:
                         self.gl_renderer.wireframe = self.renderer.wireframe
-                if self.input.pressed(pygame.K_F2) and self.gl_renderer is None:
+                    # wgpu_renderer.wireframe exists but is a documented,
+                    # harmless no-op (see wgpu_renderer.py) -- F1 has no
+                    # visible effect on the dx12/vulkan backends.
+                if (self.input.pressed(pygame.K_F2) and self.gl_renderer is None
+                        and self.wgpu_renderer is None):
                     self.renderer.per_pixel = not self.renderer.per_pixel  # software-only
                 if self.input.pressed(pygame.K_h):
                     self.show_hud = not self.show_hud
@@ -279,6 +323,19 @@ class Engine:
                 if overlay is not None:
                     overlay(self)
                 self._composite_gpu_overlay()
+            elif self.wgpu_renderer is not None:
+                self.wgpu_renderer.render(scene, camera, self._size, tracer)
+                # offscreen frame -> CPU readback -> blit into the real
+                # window surface (see wgpu_renderer.py's module docstring
+                # for why this design and its cost); HUD/overlay then draw
+                # on self.screen exactly as in software mode.
+                frame = self.wgpu_renderer.read_frame()
+                surf = pygame.image.frombuffer(frame, self._size, "RGBA")
+                self.screen.blit(surf, (0, 0))
+                if self.show_hud:
+                    self._draw_hud(clock.get_fps(), scene)
+                if overlay is not None:
+                    overlay(self)
             else:
                 self.renderer.render(self.screen, scene, camera, tracer)
                 if self.show_hud:
@@ -296,16 +353,30 @@ class Engine:
 
         elapsed = time.perf_counter() - start_time
         if max_frames is not None and elapsed > 0:
-            stats = self.gl_renderer.stats if self.gl_renderer is not None else self.renderer.stats
+            stats = self._active_stats()
             print(f"{frames} frames in {elapsed:.2f}s -> {frames / elapsed:.1f} FPS avg "
                   f"({stats['triangles']} triangles in final frame)")
         pygame.quit()
 
+    def _active_stats(self) -> dict:
+        """The currently-active renderer's stats dict (mode/triangles/
+        shadow_lights) -- whichever of gl_renderer/wgpu_renderer/renderer is
+        actually running, not whichever api was requested."""
+        if self.gl_renderer is not None:
+            return self.gl_renderer.stats
+        if self.wgpu_renderer is not None:
+            return self.wgpu_renderer.stats
+        return self.renderer.stats
+
     def _save_screenshot(self, path: str) -> None:
         if self.gl_renderer is None:
+            # both software mode and wgpu mode already have the full
+            # composited frame sitting in self.screen (wgpu blits its
+            # offscreen readback there every tick -- see run()), so a plain
+            # surface save just works for either.
             pygame.image.save(self.screen, path)
             return
-        # self.screen is only the UI overlay in GPU mode -- read the composited
+        # self.screen is only the UI overlay in GL mode -- read the composited
         # frame back from the default framebuffer instead. glReadPixels rows
         # are bottom-up, so flip before saving. An explicit viewport avoids a
         # moderngl quirk where ctx.screen's cached size goes stale after a
@@ -317,7 +388,7 @@ class Engine:
         pygame.image.save(surf, path)
 
     def _draw_hud(self, fps: float, scene) -> None:
-        stats = self.gl_renderer.stats if self.gl_renderer is not None else self.renderer.stats
+        stats = self._active_stats()
         lines = [f"{fps:5.1f} FPS | {stats['mode']} | {stats['triangles']} faces | "
                  f"{stats['shadow_lights']} shadow lights | {len(scene.entities)} entities"]
         if self.hud_text:

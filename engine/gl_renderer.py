@@ -27,6 +27,7 @@ import math
 import moderngl
 import numpy as np
 
+from .gpu_geometry import _build_color, _build_geometry, _entity_world_faces, _scene_environment
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
 from .renderer import _face_light_strength, _gather_lights
@@ -202,52 +203,6 @@ void main() {
     }
 }
 """
-
-
-# ---------------------------------------------------------------------------
-# geometry helpers
-# ---------------------------------------------------------------------------
-def _build_geometry(mesh):
-    """Non-indexed (T*3, ...) vertex soup in LOCAL space + per-triangle face id."""
-    faces = mesh.faces  # (M, 4) int32, padded per Mesh._build
-    is_tri = (faces[:, 3] == faces[:, 2]) | (faces[:, 3] == faces[:, 0])
-    tri1 = faces[:, (0, 1, 2)]
-    face_id1 = np.arange(len(faces), dtype=np.int64)
-    tri2 = faces[~is_tri][:, (0, 2, 3)]
-    face_id2 = face_id1[~is_tri]
-    tri_idx = np.concatenate([tri1, tri2], axis=0)
-    face_id_tri = np.concatenate([face_id1, face_id2], axis=0)
-
-    pos = mesh.vertices[tri_idx].reshape(-1, 3).astype(np.float32)
-    nrm = np.repeat(mesh.normals[face_id_tri].astype(np.float32), 3, axis=0)
-    fid = np.repeat(face_id_tri.astype(np.float32), 3)
-    return pos, nrm, fid, face_id_tri, int(len(faces))
-
-
-def _build_color(mesh, face_id_tri) -> np.ndarray:
-    return np.repeat((mesh.face_colors[face_id_tri] / 255.0).astype(np.float32), 3, axis=0)
-
-
-def _entity_world_faces(entity):
-    """World-space per-face centroids + normals, mirroring _entity_geometry."""
-    mesh = entity.mesh
-    model = entity.transform.matrix()
-    verts_world = mesh.vertices @ model[:3, :3].T + model[:3, 3]
-    try:
-        normal_mat = np.linalg.inv(model[:3, :3]).T
-    except np.linalg.LinAlgError:
-        normal_mat = np.eye(3)
-    normals_world = mesh.normals @ normal_mat.T
-    normals_world /= np.maximum(np.linalg.norm(normals_world, axis=1, keepdims=True), 1e-12)
-    centroids_world = verts_world[mesh.faces].mean(axis=1)
-    return centroids_world, normals_world
-
-
-def _scene_environment(scene):
-    for e in scene.entities:
-        if e.environment is not None and e.visible:
-            return e.environment
-    return None
 
 
 def _projection(camera, w: int, h: int) -> np.ndarray:

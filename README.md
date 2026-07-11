@@ -3,9 +3,9 @@
 A compact real-time 3D game engine and world editor written in pure Python,
 using **numpy** for the vectorized transform/lighting/ray-tracing pipeline and
 **pygame** (SDL) as the window/input backend. The default renderer is pure
-Python (no OpenGL); an optional GPU backend (OpenGL 3.3 via `moderngl`)
-mirrors the same lighting model in GLSL for a large FPS win — see
-[GPU rendering](#gpu-rendering).
+Python (no OpenGL); two optional GPU backends mirror the same lighting model
+for a large FPS win — OpenGL 3.3 via `moderngl`, or DirectX 12 / Vulkan via
+`wgpu-py` — see [GPU rendering](#gpu-rendering).
 
 | Editor | Demo |
 |---|---|
@@ -15,10 +15,12 @@ mirrors the same lighting model in GLSL for a large FPS win — see
 
 ```
 py -m pip install pygame numpy
-py -m pip install moderngl   # optional: enables the GPU renderer
+py -m pip install moderngl   # optional: enables the OpenGL renderer
+py -m pip install wgpu       # optional: enables the DirectX 12 / Vulkan renderer
 py editor.py     # world editor with the survival-horror starter scene
 py demo.py       # bright playground demo
-py editor.py --gpu   /   --cpu   # force a renderer (default: auto)
+py editor.py --api dx12          # force a backend: cpu / gl / dx12 / vulkan (default: auto)
+py editor.py --gpu   /   --cpu   # aliases for --api gl / --api cpu
 ```
 
 ### Editor controls
@@ -41,7 +43,7 @@ with this same list.
 | **L** | toggle flashlight |
 | **C** | toggle player collision (on by default — walls block you) |
 | **M** | open/close the material editor for the selected mesh |
-| **F1 / F2** | wireframe / switch per-pixel <-> flat lighting (F2 is a no-op on the GPU renderer — flat vs. per-pixel is a software-only concept) |
+| **F1 / F2** | wireframe / switch per-pixel <-> flat lighting (F2 is a no-op on any GPU renderer — flat vs. per-pixel is a software-only concept; F1 is also a no-op specifically on the dx12/vulkan backend — see [GPU rendering](#gpu-rendering)) |
 | **H** | toggle HUD |
 | **Esc** | close an open menu/dialog, else deselect, else quit |
 
@@ -72,13 +74,17 @@ Layout, visibility, and floating positions persist to `settings.json`
 
 A floating panel with resolution presets (1280x720, 1440x810, 1600x900,
 1920x1080 — applied immediately via `Engine.set_resolution`), a pixel-scale
-slider (1-6, lower = sharper per-pixel lighting, slower — hidden while the
-GPU renderer is active, since it only affects the software per-pixel pass), a
-max-FPS slider (30-240), and a **Renderer: GPU / CPU** toggle. The renderer
-choice takes effect on the *next launch* (live switching mid-session is out
-of scope); everything else persists and applies immediately. CLI flags
-(`--width`/`--height`/`--pixel-scale`/`--gpu`/`--cpu`) still win over the
-saved values.
+slider (1-6, lower = sharper per-pixel lighting, slower — hidden unless the
+software renderer is the one actually active, since it only affects that
+renderer's per-pixel pass), a max-FPS slider (30-240), and a **Graphics API**
+row: `AUTO / CPU / GL / DX12 / VULKAN`. Next to it, an "Active: ..." label
+shows which backend is *actually* running this session (read from the live
+engine), which can differ from the saved preference if a GPU backend wasn't
+available and the engine fell back. The API choice takes effect on the *next
+launch* (live switching mid-session is out of scope); everything else
+persists and applies immediately. CLI flags
+(`--width`/`--height`/`--pixel-scale`/`--api`/`--gpu`/`--cpu`) still win over
+the saved values.
 
 The **+ Import FBX** button in the content browser (or **File > Import
 FBX...**) opens a file picker and converts a binary FBX model into a
@@ -248,35 +254,52 @@ lighting at 1/4 internal resolution; the bright demo scene ~68 FPS at
 
 ### GPU rendering
 
-`moderngl` is an **optional** dependency (`py -m pip install moderngl`).
-When present, `Engine(gpu="auto")` (the default for both apps) opens an
-OpenGL 3.3 core window instead of a plain software surface and renders every
-frame through `engine/gl_renderer.py` — a GLSL port of the same lighting
-model as `renderer.py` (ambient/ambient-cube, directional light, up to 16
-point/spot lights with distance falloff, spotlight cones, and IES profiles),
-running per-fragment with a real depth buffer instead of the software
-renderer's painter's-sort + face-ID buffer. Measured on this machine: the
-demo scene goes from ~56 FPS (software, default per-pixel path) to ~115 FPS
-GPU (both capped at `max_fps=120`, so GPU is closer to the cap than the raw
-ratio suggests); scenes bottlenecked on the software renderer's per-pixel
-pass see a much larger win. `--gpu`/`--cpu` force a renderer from the
-command line;
-`--headless` always forces software, since the SDL dummy driver used for
-headless/CI runs has no GL surface to attach to.
+Three renderer backends exist, chosen by `Engine(api=...)` — `"auto"` (the
+default for both apps), `"cpu"`, `"gl"`, `"dx12"`, or `"vulkan"`. `--api` on
+either app forces one from the command line (`--gpu`/`--cpu` remain as
+aliases for `--api gl` / `--api cpu`); the editor's Settings dialog offers
+the same five choices as a **Graphics API** row (see
+[Settings](#settings-window--settings)), applied on the next launch.
+`--headless` always forces `"cpu"`, since the SDL dummy driver used for
+headless/CI runs has no GL surface or wgpu-presentable window to attach to.
 
-**What stays on the CPU even in GPU mode:**
+**Fallback chain:** `"auto"` tries `"gl"` first (OpenGL/moderngl remains the
+default GPU path when available). Any failure along a GPU path — missing
+dependency, no suitable driver/adapter, context/device creation failure —
+prints one warning line and falls back one step at a time: requested api ->
+`"gl"` -> `"cpu"`. E.g. requesting `"dx12"` on a machine without `wgpu`
+installed prints one warning and tries `"gl"`; if that also fails (no
+`moderngl`, or no GL 3.3 driver), a second warning and the engine ends up on
+`"cpu"`. The rest of the engine behaves exactly as if that were the
+requested api all along.
+
+#### OpenGL (`gl`)
+
+`moderngl` is an **optional** dependency (`py -m pip install moderngl`).
+When present, opens an OpenGL 3.3 core window instead of a plain software
+surface and renders every frame through `engine/gl_renderer.py` — a GLSL
+port of the same lighting model as `renderer.py` (ambient/ambient-cube,
+directional light, up to 16 point/spot lights with distance falloff,
+spotlight cones, and IES profiles), running per-fragment with a real depth
+buffer instead of the software renderer's painter's-sort + face-ID buffer.
+Measured on this machine: the demo scene goes from ~56 FPS (software,
+default per-pixel path) to ~115 FPS GPU (both capped at `max_fps=120`, so
+GPU is closer to the cap than the raw ratio suggests); scenes bottlenecked
+on the software renderer's per-pixel pass see a much larger win.
+
+**What stays on the CPU even in GL mode:**
 
 - **Shadows** — `raytrace.ShadowTracer` still ray-casts per face against the
   triangle soup every frame (same caching/amortization as the software
   path); the GPU renderer uploads the resulting per-face factors as a small
   texture and samples it by a global face id in the fragment shader. Shadow
-  quality/cost is therefore identical between the two renderers — the GPU
+  quality/cost is therefore identical across all three renderers — GPU mode
   gets you faster *shading*, not faster *shadow tracing*.
 - **Mouse picking** (`raytrace.pick_entity`) and **collision**
   (`behaviors.FlyController`'s sphere-vs-OBB test) — both are ray/geometry
   math against the same triangle soup, independent of how pixels get shaded.
 
-**UI in GPU mode:** the editor/HUD keep drawing with pygame exactly as in
+**UI in GL mode:** the editor/HUD keep drawing with pygame exactly as in
 software mode — `Engine.screen` becomes a transparent overlay surface that
 gets composited over the 3D frame each tick as an alpha-blended fullscreen
 quad, so none of the editor/HUD code needed to change.
@@ -285,23 +308,54 @@ quad, so none of the editor/HUD code needed to change.
 
 - Max **16 dynamic point/spot lights** per frame (extras are silently
   dropped, sorted by scene order); the software renderer has no such cap.
+  Same cap applies to the dx12/vulkan backend below.
 - Fog distance is the true Euclidean camera-to-fragment distance (matching
   the software renderer's *per-pixel* path); the software renderer's *flat*
   path instead fogs by view-space linear depth. The two software paths
-  already disagree with each other here, so the GPU renderer matching the
+  already disagree with each other here, so the GPU renderers matching the
   more precise of the two seemed the right call.
-- Resizing the GPU window (Settings dialog) recreates GL-side size-dependent
+- Resizing the GL window (Settings dialog) recreates GL-side size-dependent
   objects (viewport, UI overlay texture) but keeps the existing GL context;
   this path is exercised by `set_resolution` but wasn't soak-tested under
   heavy interactive resizing.
-- The GPU path was verified against an NVIDIA RTX 5070 Ti; other vendors'
+- The GL path was verified against an NVIDIA RTX 5070 Ti; other vendors'
   GL 3.3 core drivers should work (nothing vendor-specific is used) but
   weren't tested.
 
-**Fallback:** any failure anywhere along the GPU path (missing `moderngl`,
-no GL 3.3 driver, context creation failure) is caught, prints one warning
-line, and the window is recreated without the `OPENGL` flag — the rest of
-the engine behaves exactly as if `gpu=False` had been passed.
+#### DirectX 12 / Vulkan (`dx12` / `vulkan`)
+
+`wgpu` (the [wgpu-py](https://github.com/pygfx/wgpu-py) WebGPU bindings) is
+an **optional** dependency (`py -m pip install wgpu`), independent of
+`moderngl` — one can be installed without the other and each GPU backend
+still works. `engine/wgpu_renderer.py` implements the same lighting model a
+third time in WGSL (ambient/ambient-cube, directional light, up to 16
+point/spot lights, IES profiles, fog), reusing the exact same triangle-soup
+and light-gathering code the other two renderers use (`engine/gpu_geometry.py`,
+`engine/renderer.py`) so all three stay in sync from one source of truth.
+DirectX 11 is **not** offered as a choice: wgpu-native removed its D3D11
+backend, so DX12 is the supported Direct3D path on Windows.
+
+**"Offscreen + readback"**, in plain terms: unlike the GL backend (which
+renders straight into the window and composites the UI on the GPU), the
+wgpu backend renders each frame into its own off-window color+depth texture,
+then copies that texture back to normal CPU memory and blits it into the
+actual window surface, after which the editor/HUD draw on top exactly as in
+software mode. This is simpler to implement correctly than the GL
+compositing path, but it pays for a full frame's worth of GPU->CPU transfer
+every tick — it will not out-run the GL backend's in-framebuffer compositing
+at high resolutions, though it's still dramatically faster than the software
+renderer for shading-bound scenes.
+
+**Known limitations specific to this backend:**
+
+- **No wireframe.** wgpu's line-fill polygon mode needs a device feature
+  that isn't guaranteed to exist on every adapter/vendor, so it isn't
+  requested (for portability); `F1` is a documented no-op on dx12/vulkan.
+- Same 16-light cap and CPU-side shadow/picking/collision notes as the GL
+  backend above apply here too.
+- Verified on this machine against an NVIDIA RTX 5070 Ti; other vendors'
+  DX12/Vulkan drivers should work (nothing vendor-specific is used) but
+  weren't tested.
 
 ## Extending it
 

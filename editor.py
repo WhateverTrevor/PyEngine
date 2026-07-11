@@ -2,8 +2,10 @@
 
     py editor.py                     open scenes/scene.json (or a starter scene)
     py editor.py --scene my.json     work on a specific scene file
-    py editor.py --gpu / --cpu       force the OpenGL or software renderer
-                                      (default: auto, or Settings > Renderer)
+    py editor.py --api dx12          force a rendering backend: cpu / gl /
+                                      dx12 / vulkan (default: auto, or
+                                      Settings > Graphics API); --gpu/--cpu
+                                      still work as aliases for gl/cpu
 
 Controls (Help > Controls in the editor shows the full list):
     RMB hold        mouse look + WASD/QE/Space/Ctrl fly (Unreal-style: these
@@ -51,7 +53,7 @@ PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
     "browser": (760, BROWSER_H),
 }
 RESOLUTIONS = ((1280, 720), (1440, 810), (1600, 900), (1920, 1080))
-SETTINGS_SIZE = (380, 226)
+SETTINGS_SIZE = (380, 246)
 
 
 def load_settings() -> dict:
@@ -180,9 +182,10 @@ class Editor:
         self.mat_ui = None          # open MaterialEditorUI, or None
         self.status = ("", 0.0)     # transient message near the content browser
         self.save_flash = 0.0
-        # renderer preference for *next launch* (live switching is out of
-        # scope); defaults to whatever this session actually ended up using
-        self.renderer_pref = "gpu" if eng.gl_renderer is not None else "cpu"
+        # graphics-api preference for *next launch* (live switching is out
+        # of scope); defaults to whatever this session actually ended up
+        # using (see `_active_api`)
+        self.api_pref = self._active_api()
 
         # ---- dockable panel state ----
         self.dock_order = {"left": [], "right": ["outliner", "details"],
@@ -709,6 +712,23 @@ class Editor:
     def _show_about(self) -> None:
         self.status = ("PyEngine 0.1 — pure-Python real-time 3D engine", 4.0)
 
+    def _active_api(self) -> str:
+        """Which backend this session actually ended up running, read from
+        the live engine (not from any saved preference) -- "gl", "dx12",
+        "vulkan", or "cpu"."""
+        eng = self.eng
+        if eng.gl_renderer is not None:
+            return "gl"
+        if eng.wgpu_renderer is not None:
+            return eng.wgpu_renderer.stats.get("mode", "dx12")
+        return "cpu"
+
+    def _software_active(self) -> bool:
+        """True while the software (CPU) renderer is the one actually
+        running -- gates the pixel-scale slider, which only affects that
+        renderer's per-pixel pass."""
+        return self.eng.gl_renderer is None and self.eng.wgpu_renderer is None
+
     def _settings_rect(self, w, h):
         import pygame
         sw, sh = SETTINGS_SIZE
@@ -732,12 +752,15 @@ class Editor:
     def _settings_slider_track(self, row):
         return (row.x + 100, row.right - 50)
 
-    def _settings_renderer_buttons(self, rect):
+    def _settings_api_buttons(self, rect):
         import pygame
-        x, y = rect.x + 100, rect.y + 160
-        bw, bh, gap = 60, 22, 8
-        return [("gpu", pygame.Rect(x, y, bw, bh)),
-                ("cpu", pygame.Rect(x + bw + gap, y, bw, bh))]
+        x, y = rect.x + 12, rect.y + 180
+        bw, bh, gap = 62, 22, 6
+        out = []
+        for key in ("auto", "cpu", "gl", "dx12", "vulkan"):
+            out.append((key, pygame.Rect(x, y, bw, bh)))
+            x += bw + gap
+        return out
 
     def _apply_settings_slider(self, which, row, mx) -> None:
         x0, x1 = self._settings_slider_track(row)
@@ -764,14 +787,14 @@ class Editor:
                     self.eng.set_resolution(rw, rh)
                     self._save_settings()
                     return
-            for key, btn in self._settings_renderer_buttons(rect):
+            for key, btn in self._settings_api_buttons(rect):
                 if btn.collidepoint(mp):
-                    self.renderer_pref = key
+                    self.api_pref = key
                     self._save_settings()
-                    self.status = ("Renderer preference saved — restart to apply", 3.0)
+                    self.status = ("Graphics API preference saved — restart to apply", 3.0)
                     return
             for which in ("pixel", "max_fps"):
-                if which == "pixel" and self.eng.gl_renderer is not None:
+                if which == "pixel" and not self._software_active():
                     continue  # pixel scale only affects the software per-pixel pass
                 row = self._settings_slider_row(rect, which)
                 if row.collidepoint(mp):
@@ -793,7 +816,7 @@ class Editor:
             "width": w, "height": h,
             "pixel_scale": int(self.eng.renderer.render_scale),
             "max_fps": int(self.eng.max_fps),
-            "renderer": self.renderer_pref,
+            "api": self.api_pref,
             "panel_visible": dict(self.panel_visible),
             "dock_order": {side: list(ids) for side, ids in self.dock_order.items()},
             "floating": list(self.floating),
@@ -1359,21 +1382,24 @@ class Editor:
             lab = self.font_small.render(f"{rw}x{rh}", True, TEXT)
             surf.blit(lab, (btn.x + (btn.width - lab.get_width()) // 2, btn.y + 5))
 
-        if self.eng.gl_renderer is None:
+        if self._software_active():
             self._draw_settings_slider(surf, rect, "pixel", "pixel scale",
                                        self.eng.renderer.render_scale, 1, 6)
         self._draw_settings_slider(surf, rect, "max_fps", "max fps",
                                    self.eng.max_fps, 30, 240)
 
-        surf.blit(self.font_small.render("Renderer (restart)", True, TEXT_DIM),
-                  (rect.x + 12, rect.y + 165 - 22))
-        for key, btn in self._settings_renderer_buttons(rect):
-            active = self.renderer_pref == key
+        surf.blit(self.font_small.render("Graphics API (restart)", True, TEXT_DIM),
+                  (rect.x + 12, rect.y + 160))
+        for key, btn in self._settings_api_buttons(rect):
+            active = self.api_pref == key
             pygame.draw.rect(surf, SELECT_BG if active else (33, 36, 44), btn,
                              border_radius=4)
             pygame.draw.rect(surf, PANEL_EDGE, btn, 1, border_radius=4)
             lab = self.font_small.render(key.upper(), True, TEXT)
             surf.blit(lab, (btn.x + (btn.width - lab.get_width()) // 2, btn.y + 4))
+
+        active_lab = self.font_small.render(f"Active: {self._active_api()}", True, TEXT_DIM)
+        surf.blit(active_lab, (rect.x + 12, rect.y + 210))
 
     def _draw_settings_slider(self, surf, rect, which, label, value, lo, hi) -> None:
         import pygame
@@ -1869,10 +1895,13 @@ def main() -> None:
                         help="per-pixel lighting internal resolution divisor "
                              "(lower = sharper, slower; default 4, or from "
                              "settings.json if present)")
+    parser.add_argument("--api", choices=["auto", "cpu", "gl", "dx12", "vulkan"], default=None,
+                        help="force a rendering backend (default: auto, or "
+                             "Settings > Graphics API)")
     parser.add_argument("--gpu", action="store_true",
-                        help="force the GPU (moderngl) renderer")
+                        help="alias for --api gl (force the OpenGL/moderngl renderer)")
     parser.add_argument("--cpu", action="store_true",
-                        help="force the software renderer")
+                        help="alias for --api cpu (force the software renderer)")
     args = parser.parse_args()
 
     if args.headless:
@@ -1888,20 +1917,20 @@ def main() -> None:
                    else settings.get("pixel_scale", 4))
     max_fps = settings.get("max_fps", 120)
 
-    gpu_mode = "auto"
-    renderer_pref = settings.get("renderer")
-    if renderer_pref == "gpu":
-        gpu_mode = True
-    elif renderer_pref == "cpu":
-        gpu_mode = False
-    if args.gpu:
-        gpu_mode = True
+    api_mode = "auto"
+    settings_api = settings.get("api")
+    if settings_api in ("auto", "cpu", "gl", "dx12", "vulkan"):
+        api_mode = settings_api
+    if args.api:
+        api_mode = args.api
+    elif args.gpu:
+        api_mode = "gl"
     elif args.cpu:
-        gpu_mode = False
+        api_mode = "cpu"
     if args.headless:
-        gpu_mode = False  # the SDL dummy driver has no GL surface to attach to
+        api_mode = "cpu"  # the SDL dummy driver has no GL surface / wgpu window to attach to
 
-    eng = engine.Engine(width, height, title="PyEngine Editor", max_fps=max_fps, gpu=gpu_mode)
+    eng = engine.Engine(width, height, title="PyEngine Editor", max_fps=max_fps, api=api_mode)
     eng.renderer.render_scale = max(1, pixel_scale)
     eng.loading_step("loading asset library", 0.12)
     lib = engine.AssetLibrary(os.path.join(BASE_DIR, "assets"))
@@ -1916,8 +1945,9 @@ def main() -> None:
 
     editor = Editor(engine, eng, scene, camera, lib, args.scene)
     editor._apply_layout_settings(settings)
-    if renderer_pref in ("gpu", "cpu"):  # show the saved preference even if it
-        editor.renderer_pref = renderer_pref  # didn't match what actually ran
+    if settings_api in ("auto", "cpu", "gl", "dx12", "vulkan"):
+        # show the saved preference even if it didn't match what actually ran
+        editor.api_pref = settings_api
 
     flashlight = engine.Entity("flashlight", light=engine.SpotLight(
         color=(255, 244, 214), intensity=2.0, range=24.0, radius=0.25,
