@@ -22,3 +22,4 @@ death never loses more than one milestone.
 | 2026-07-10 | DX12/Vulkan finisher (fresh from checkpoint) | 77,335 | completed under budget; judged + merged to main |
 | 2026-07-11 | Environment assets (sun/sky material/GI/fog volumes) | 461,730 cumulative (5 resumes incl. 2 limit deaths) | completed; 1 review finding (GI receiver gating) fixed on send-back; judged + squash-merged e7b7735. Over budget: should have been 2-3 runs |
 | 2026-07-11 | Window management (minimize/close/registry/reset) | 143,784 | completed under budget; judged + squash-merged |
+| 2026-07-12 | wgpu visual parity (sun disc/GI/fog volumes) | 170,917 (+ ~91k wasted: agent re-delegated on first call despite the rule — caught, sent back; its stray nested agent burned 46k more) | completed; judged + squash-merged 52f0601. Slightly over budget. Lesson: restate the anti-delegation rule IN the task prompt, not just the agent definition |

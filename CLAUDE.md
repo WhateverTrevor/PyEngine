@@ -52,8 +52,10 @@ survival horror game. Repo: https://github.com/WhateverTrevor/PyEngine.
 
 ## Known gaps / natural backlog
 
-- **Top queued task: wgpu (DX12/Vulkan) visual parity** — the backend runs
-  but does not render the sun disc, GI, or fog volumes (CPU + GL only).
+- **Top queued task: wgpu directional (sun) shadow attenuation on mesh
+  faces** — the only remaining wgpu visual gap after the parity merge
+  (52f0601); mirror GL's `_upload_dl_shadow_tex` + `dlShadowTex`
+  texelFetch pattern.
 - Software flat mode (F2) is painter-only (approximate depth); GPU paths cap
   at 16 lights; wgpu path = offscreen+readback, no wireframe.
 - Fog Volume boxes are world-axis-aligned (rotation ignored, v1). GI is
