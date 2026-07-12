@@ -47,6 +47,12 @@ ROW_H = 20
 DETAIL_ROW_H = 24
 DETAILS_ROWS_TOP = 34     # y-offset (within a panel's content rect) of row 0
 TILE_W, TILE_H, ICON = 84, 100, 64
+BROWSER_TOPBAR_H = 26     # content-browser top bar (New Folder / Import)
+TREE_ROW_H = 18           # content-browser folder-tree row height
+TREE_W = 130              # factory folder-tree column width
+_NO_RENAME = object()     # sentinel for "not renaming" -- distinct from every
+                          # real folder id AND from the root folder id (None),
+                          # so the root row can't be mistaken for a rename target
 PANEL_BG = (22, 24, 29)
 PANEL_EDGE = (58, 62, 72)
 TEXT = (210, 212, 218)
@@ -202,6 +208,13 @@ class Editor:
         self.outliner_scroll = 0
         self.browser_scroll = 0
         self.drag_asset = None
+        # ---- content-browser folder tree ----
+        self.selected_folder = None   # folder id, or None == root
+        self.tree_scroll = 0
+        self.renaming_folder = _NO_RENAME  # folder id being renamed, or _NO_RENAME;
+                                            # NOT None -- None is the root folder id,
+                                            # so that can't double as "not renaming"
+        self.rename_buffer = ""       # editable text while renaming_folder is set
         self.active_slider = None   # index into _details_rows while dragging
         self.gizmo_drag = None      # active gizmo drag state dict
         self.gizmo_mode = "translate"  # W/E/R select translate / rotate / scale
@@ -1252,13 +1265,149 @@ class Editor:
         self.scene_path = path
         self._save_scene()
 
-    def _import_btn_rect(self, brect):
+    # ---- content browser: top bar / folder tree / grid layout ----
+    def _browser_layout(self, content):
+        """topbar / tree / grid sub-rects of the browser panel's content
+        rect -- the single source both `_draw_browser` and the browser
+        click router use, so drawing and hit-testing never disagree."""
         import pygame
-        return pygame.Rect(brect.right - 130, brect.y + 4, 120, 20)
+        topbar = pygame.Rect(content.x, content.y, content.width, BROWSER_TOPBAR_H)
+        below = pygame.Rect(content.x, topbar.bottom, content.width,
+                            max(0, content.height - BROWSER_TOPBAR_H))
+        tree_w = min(TREE_W, max(60, below.width // 3))
+        tree = pygame.Rect(below.x, below.y, tree_w, below.height)
+        grid = pygame.Rect(below.x + tree_w, below.y,
+                           max(0, below.width - tree_w), below.height)
+        return {"topbar": topbar, "tree": tree, "grid": grid}
 
-    def _import_hdri_btn_rect(self, brect):
+    def _new_folder_btn_rect(self, topbar):
         import pygame
-        return pygame.Rect(brect.right - 262, brect.y + 4, 126, 20)
+        return pygame.Rect(topbar.x + 4, topbar.y + 3, 90, 20)
+
+    def _import_btn_rect(self, topbar):
+        import pygame
+        return pygame.Rect(topbar.right - 74, topbar.y + 3, 70, 20)
+
+    # ---- content browser: folder tree ----
+    def _folder_tree_rows(self):
+        """Flattened [(folder_id_or_None, depth, name)], root first, then a
+        depth-first walk of `lib.folders` sorted by name at each level."""
+        rows = [(None, 0, "Assets")]
+
+        def rec(parent, depth):
+            for fid in self.lib.folder_children(parent):
+                rows.append((fid, depth, self.lib.folders[fid]["name"]))
+                rec(fid, depth + 1)
+
+        rec(None, 1)
+        return rows
+
+    def _tree_row_rect(self, tree_rect, i):
+        import pygame
+        y = tree_rect.y + 4 + i * TREE_ROW_H - self.tree_scroll
+        return pygame.Rect(tree_rect.x + 2, y, tree_rect.width - 4, TREE_ROW_H - 1)
+
+    @staticmethod
+    def _tree_rows_clip(tree_rect):
+        """Rows area excluding the bottom "F2 rename" hint strip -- shared by
+        drawing and hit-testing so a row half-hidden behind the hint can't be
+        clicked, and the hint never draws over a fully visible row."""
+        import pygame
+        return pygame.Rect(tree_rect.x, tree_rect.y, tree_rect.width,
+                           max(0, tree_rect.height - 16))
+
+    def _tree_row_at(self, mp, tree_rect):
+        """(index, folder_id) of the tree row under mp, or (None, None)."""
+        clip = self._tree_rows_clip(tree_rect)
+        if not clip.collidepoint(mp):
+            return None, None
+        for i, (fid, _depth, _name) in enumerate(self._folder_tree_rows()):
+            r = self._tree_row_rect(tree_rect, i)
+            if r.bottom <= clip.bottom and r.collidepoint(mp):
+                return i, fid
+        return None, None
+
+    def _new_folder(self) -> None:
+        parent = self.selected_folder
+        existing = {self.lib.folders[c]["name"] for c in self.lib.folder_children(parent)}
+        base, name, n = "New Folder", "New Folder", 2
+        while name in existing:
+            name = f"{base} {n}"
+            n += 1
+        fid = self.lib.create_folder(name, parent)
+        self.lib.save_folders()
+        self.selected_folder = fid
+        self._begin_rename(fid)
+
+    def _begin_rename(self, folder_id) -> None:
+        """No-ops for the root folder (id None) and unknown ids -- root has
+        no name to edit, and there's no "F2 renamed root" state to enter."""
+        if folder_id is None or folder_id not in self.lib.folders:
+            return
+        self.renaming_folder = folder_id
+        self.rename_buffer = self.lib.folders[folder_id]["name"]
+
+    def _commit_rename(self) -> None:
+        fid, name = self.renaming_folder, self.rename_buffer.strip()
+        self.renaming_folder = _NO_RENAME
+        if fid is not _NO_RENAME and fid is not None and name:
+            self.lib.rename_folder(fid, name)
+            self.lib.save_folders()
+
+    def _cancel_rename(self) -> None:
+        self.renaming_folder = _NO_RENAME
+
+    def _update_rename(self, inp) -> None:
+        import pygame
+        self.rename_buffer += inp.text_typed
+        if inp.pressed(pygame.K_BACKSPACE):
+            self.rename_buffer = self.rename_buffer[:-1]
+        if inp.pressed(pygame.K_RETURN) or inp.pressed(pygame.K_KP_ENTER):
+            self._commit_rename()
+
+    # ---- content browser: import routed into the selected folder ----
+    def _import_dialog_to_folder(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                title="Import asset",
+                filetypes=[("Supported", "*.fbx *.hdr"), ("FBX models", "*.fbx"),
+                          ("Radiance HDR", "*.hdr"), ("All files", "*.*")])
+            root.destroy()
+        except Exception as ex:
+            self.status = (f"file dialog unavailable: {ex}", 5.0)
+            return
+        if not path:
+            return
+        self._import_path_to_folder(path)
+
+    def _import_path_to_folder(self, path: str) -> None:
+        """Import an .fbx/.hdr file and assign it to `self.selected_folder`.
+
+        Split out from `_import_dialog_to_folder` so tests (and any future
+        drag-and-drop from Explorer) can drive the import with a real path,
+        no tkinter dialog involved.
+        """
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".fbx":
+                name = self.engine_mod.import_fbx(path, self.lib.directory)
+            elif ext == ".hdr":
+                name = self.engine_mod.import_hdri(path, self.lib.directory)
+            else:
+                self.status = (f"unsupported file type: {ext}", 5.0)
+                return
+            self.lib.reload()
+            self.lib.set_asset_folder(name, self.selected_folder)
+            self.lib.save_folders()
+            self.icons[name] = make_icon(self.engine_mod, self.lib.by_name[name])
+            self.status = (f"imported '{name}' — drag it from the browser", 5.0)
+        except Exception as ex:
+            self.status = (f"import failed: {ex}", 6.0)
 
     def _import_fbx_dialog(self) -> None:
         try:
@@ -1327,6 +1476,9 @@ class Editor:
         if self.settings_open:      # settings dialog captures all editor input
             self._update_settings(engine, w, h)
             return
+        if self.renaming_folder is not _NO_RENAME:  # inline folder rename captures input
+            self._update_rename(inp)
+            return
 
         layout = self._layout(w, h)
         looking = self.fly is not None and self.fly.looking
@@ -1339,7 +1491,16 @@ class Editor:
             if target == "outliner":
                 self.outliner_scroll = max(0, self.outliner_scroll - int(inp.wheel) * 3)
             elif target == "browser":
-                self.browser_scroll = max(0, self.browser_scroll - int(inp.wheel) * 70)
+                content = self._panel_content_rect("browser", layout)
+                blay = self._browser_layout(content) if content is not None else None
+                if blay is not None and blay["tree"].collidepoint(mp):
+                    n_rows = len(self._folder_tree_rows())
+                    visible = max(0, blay["tree"].height - 4) // TREE_ROW_H
+                    self.tree_scroll = max(0, min(
+                        self.tree_scroll - int(inp.wheel) * 2,
+                        max(0, (n_rows - visible) * TREE_ROW_H)))
+                else:
+                    self.browser_scroll = max(0, self.browser_scroll - int(inp.wheel) * 70)
 
         if inp.mouse_button_pressed(1):
             hit_splitter = None
@@ -1420,6 +1581,9 @@ class Editor:
                 self._place_asset(self.drag_asset, mp, w, h)
             self.drag_asset = None
 
+        if inp.pressed(pygame.K_F2) and self.selected_folder is not None:
+            self._begin_rename(self.selected_folder)
+
         ctrl = inp.held(pygame.K_LCTRL) or inp.held(pygame.K_RCTRL)
         if inp.pressed(pygame.K_DELETE):
             self._delete_selected()
@@ -1459,8 +1623,11 @@ class Editor:
                 self.dirty = True
 
     def handle_escape(self) -> bool:
-        """Engine Esc hook: dropdown/settings, then material editor, then
-        deselect, and only then let the engine quit."""
+        """Engine Esc hook: folder rename, then dropdown/settings, then
+        material editor, then deselect, and only then let the engine quit."""
+        if self.renaming_folder is not _NO_RENAME:
+            self._cancel_rename()
+            return True
         if self.open_menu is not None:
             self.open_menu = None
             return True
@@ -1482,12 +1649,21 @@ class Editor:
         elif pid == "details":
             self._click_details(mp, content)
         elif pid == "browser":
-            if self._import_btn_rect(content).collidepoint(mp):
-                self._import_fbx_dialog()
-            elif self._import_hdri_btn_rect(content).collidepoint(mp):
-                self._import_hdri_dialog()
-            else:
-                asset = self._tile_at(mp, content)
+            blay = self._browser_layout(content)
+            if self._new_folder_btn_rect(blay["topbar"]).collidepoint(mp):
+                self._new_folder()
+            elif self._import_btn_rect(blay["topbar"]).collidepoint(mp):
+                self._import_dialog_to_folder()
+            elif blay["tree"].collidepoint(mp):
+                _i, fid = self._tree_row_at(mp, blay["tree"])
+                if _i is not None:
+                    if self.renaming_folder is not _NO_RENAME and self.renaming_folder != fid:
+                        self._commit_rename()
+                    self.selected_folder = fid
+            elif blay["grid"].collidepoint(mp):
+                if self.renaming_folder is not _NO_RENAME:
+                    self._commit_rename()
+                asset = self._tile_at(mp, blay["grid"])
                 if asset is not None:
                     self.drag_asset = asset
 
@@ -1517,10 +1693,10 @@ class Editor:
         if 0 <= mp[1] - rect.y - 6 and 0 <= i < len(rows):
             self.selected = rows[i]
 
-    def _tile_at(self, mp, brect):
-        x0 = brect.x + 10 - self.browser_scroll
-        for asset in self.lib.assets:
-            if x0 <= mp[0] < x0 + TILE_W and brect.y + 26 <= mp[1] < brect.y + 26 + TILE_H - 8:
+    def _tile_at(self, mp, grid_rect):
+        x0 = grid_rect.x + 10 - self.browser_scroll
+        for asset in self.lib.assets_in(self.selected_folder):
+            if x0 <= mp[0] < x0 + TILE_W and grid_rect.y + 6 <= mp[1] < grid_rect.y + 6 + TILE_H - 8:
                 return asset
             x0 += TILE_W + 8
         return None
@@ -2015,39 +2191,79 @@ class Editor:
                 value = self.font_small.render(row["text"], True, ACCENT)
                 surf.blit(value, (rr.x + 96, rr.y + 5))
 
-    def _draw_browser(self, surf, rect) -> None:
+    def _draw_browser_topbar(self, surf, topbar, mp) -> None:
         import pygame
-        mp = pygame.mouse.get_pos()
-        btn = self._import_btn_rect(rect)
+        pygame.draw.line(surf, PANEL_EDGE, (topbar.x, topbar.bottom),
+                         (topbar.right, topbar.bottom))
+        nfb = self._new_folder_btn_rect(topbar)
+        pygame.draw.rect(surf, HOVER_BG if nfb.collidepoint(mp) else (33, 36, 44),
+                         nfb, border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, nfb, 1, border_radius=4)
+        nflabel = self.font_small.render("+ Folder", True, ACCENT)
+        surf.blit(nflabel, (nfb.x + (nfb.width - nflabel.get_width()) // 2, nfb.y + 4))
+        btn = self._import_btn_rect(topbar)
         pygame.draw.rect(surf, HOVER_BG if btn.collidepoint(mp) else (33, 36, 44),
                          btn, border_radius=4)
         pygame.draw.rect(surf, PANEL_EDGE, btn, 1, border_radius=4)
-        label = self.font_small.render("+ Import FBX", True, ACCENT)
+        label = self.font_small.render("Import", True, ACCENT)
         surf.blit(label, (btn.x + (btn.width - label.get_width()) // 2, btn.y + 4))
-        hbtn = self._import_hdri_btn_rect(rect)
-        pygame.draw.rect(surf, HOVER_BG if hbtn.collidepoint(mp) else (33, 36, 44),
-                         hbtn, border_radius=4)
-        pygame.draw.rect(surf, PANEL_EDGE, hbtn, 1, border_radius=4)
-        hlabel = self.font_small.render("+ Import HDRI", True, ACCENT)
-        surf.blit(hlabel, (hbtn.x + (hbtn.width - hlabel.get_width()) // 2, hbtn.y + 4))
         if self.status[1] > 0:
+            avail = btn.x - (nfb.right + 8)
             msg = self.font_small.render(self.status[0][:60], True, (235, 210, 140))
-            surf.blit(msg, (rect.x + 10, rect.y + 6))
-        x = rect.x + 10 - self.browser_scroll
-        for asset in self.lib.assets:
-            tile = pygame.Rect(x, rect.y + 26, TILE_W, TILE_H - 12)
-            if tile.right > rect.x and tile.left < rect.right:
+            if avail > 20:
+                surf.blit(msg, (nfb.right + 8, topbar.y + 6))
+
+    def _draw_browser_tree(self, surf, tree_rect, mp) -> None:
+        import pygame
+        pygame.draw.line(surf, PANEL_EDGE, (tree_rect.right, tree_rect.y),
+                         (tree_rect.right, tree_rect.bottom))
+        clip = self._tree_rows_clip(tree_rect)
+        rows = self._folder_tree_rows()
+        for i, (fid, depth, name) in enumerate(rows):
+            rr = self._tree_row_rect(tree_rect, i)
+            if rr.bottom < tree_rect.y or rr.bottom > clip.bottom:
+                continue
+            selected = fid == self.selected_folder
+            if selected:
+                pygame.draw.rect(surf, SELECT_BG, rr, border_radius=2)
+            elif rr.collidepoint(mp):
+                pygame.draw.rect(surf, HOVER_BG, rr, border_radius=2)
+            if self.renaming_folder is not _NO_RENAME and self.renaming_folder == fid:
+                pygame.draw.rect(surf, (16, 17, 21), rr.inflate(-2, -2), border_radius=2)
+                pygame.draw.rect(surf, ACCENT, rr.inflate(-2, -2), 1, border_radius=2)
+                text = self.rename_buffer
+            else:
+                text = name
+            lab = self.font_small.render(text[:20], True, TEXT if selected else TEXT_DIM)
+            surf.blit(lab, (rr.x + 4 + depth * 12, rr.y + 3))
+        hint = self.font_small.render("F2 rename", True, TEXT_DIM)
+        surf.blit(hint, (tree_rect.x + 4, tree_rect.bottom - 16))
+
+    def _draw_browser_grid(self, surf, grid_rect, mp) -> None:
+        import pygame
+        x = grid_rect.x + 10 - self.browser_scroll
+        for asset in self.lib.assets_in(self.selected_folder):
+            tile = pygame.Rect(x, grid_rect.y + 6, TILE_W, TILE_H - 12)
+            if tile.right > grid_rect.x and tile.left < grid_rect.right:
                 hovered = tile.collidepoint(mp)
                 pygame.draw.rect(surf, HOVER_BG if hovered else (30, 32, 39), tile,
                                  border_radius=4)
                 icon = self.icons.get(asset.name)
                 if icon is not None:
-                    surf.blit(icon, (x + (TILE_W - ICON) // 2, rect.y + 30))
+                    surf.blit(icon, (x + (TILE_W - ICON) // 2, grid_rect.y + 10))
                 label = self.font_small.render(asset.name[:12], True,
                                                TEXT if hovered else TEXT_DIM)
                 surf.blit(label, (x + (TILE_W - label.get_width()) // 2,
-                                  rect.y + 30 + ICON + 3))
+                                  grid_rect.y + 10 + ICON + 3))
             x += TILE_W + 8
+
+    def _draw_browser(self, surf, rect) -> None:
+        import pygame
+        mp = pygame.mouse.get_pos()
+        blay = self._browser_layout(rect)
+        self._draw_browser_topbar(surf, blay["topbar"], mp)
+        self._draw_browser_tree(surf, blay["tree"], mp)
+        self._draw_browser_grid(surf, blay["grid"], mp)
 
 
 NODE_W = 150

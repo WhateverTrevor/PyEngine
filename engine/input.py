@@ -18,11 +18,15 @@ class InputManager:
         self.mouse_dx = 0.0
         self.mouse_dy = 0.0
         self.captured = False
+        self.text_typed = ""  # printable chars typed since the last consume_edges,
+                               # in order -- for inline text-entry UI (e.g. rename)
 
     def process(self, events) -> None:
         for e in events:
             if e.type == pygame.KEYDOWN:
                 self._pressed.add(e.key)
+                if e.unicode and e.unicode.isprintable():
+                    self.text_typed += e.unicode
             elif e.type == pygame.MOUSEBUTTONDOWN:
                 self._mouse_pressed.add(e.button)
             elif e.type == pygame.MOUSEBUTTONUP:
@@ -42,6 +46,7 @@ class InputManager:
         self.wheel = 0.0
         self.mouse_dx = 0.0
         self.mouse_dy = 0.0
+        self.text_typed = ""
 
     def held(self, key: int) -> bool:
         return bool(pygame.key.get_pressed()[key])

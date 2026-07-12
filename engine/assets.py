@@ -117,28 +117,99 @@ class AssetDef:
 
 
 class AssetLibrary:
+    """Owns the on-disk assets/*.json plus the content-browser folder tree.
+
+    The folder tree is a separate manifest (folders.json) rather than a field
+    on each asset JSON: assets stay self-contained/portable, and folders are
+    purely an editor organization concern layered on top. `folders` maps
+    folder id (str) -> {"name", "parent"} (parent is a folder id or None for
+    root); `folder_of` maps asset name -> folder id, absent/None == root.
+    """
+
     def __init__(self, directory: str):
         self.directory = directory
         self.assets: list[AssetDef] = []
         self.by_name: dict[str, AssetDef] = {}
+        self.folders: dict[str, dict] = {}
+        self.folder_of: dict[str, str] = {}
+        self._next_folder_id = 1
         self.reload()
 
     def reload(self) -> None:
         self.assets.clear()
         self.by_name.clear()
-        if not os.path.isdir(self.directory):
-            return
-        for fn in sorted(os.listdir(self.directory)):
-            if not fn.lower().endswith(".json"):
-                continue
-            with open(os.path.join(self.directory, fn), encoding="utf-8") as f:
-                asset = AssetDef(json.load(f), os.path.join(self.directory, fn))
-            self.assets.append(asset)
-            self.by_name[asset.name] = asset
+        if os.path.isdir(self.directory):
+            for fn in sorted(os.listdir(self.directory)):
+                if not fn.lower().endswith(".json") or fn == "folders.json":
+                    continue
+                with open(os.path.join(self.directory, fn), encoding="utf-8") as f:
+                    asset = AssetDef(json.load(f), os.path.join(self.directory, fn))
+                self.assets.append(asset)
+                self.by_name[asset.name] = asset
         self.assets.sort(key=lambda a: (a.category, a.name))
+        self._load_folders()
 
     def instantiate(self, name: str, entity_name: str | None = None) -> Entity:
         return self.by_name[name].instantiate(entity_name)
+
+    # ---- folder tree ----
+    def _folders_path(self) -> str:
+        return os.path.join(self.directory, "folders.json")
+
+    def _load_folders(self) -> None:
+        self.folders = {}
+        self.folder_of = {}
+        self._next_folder_id = 1
+        path = self._folders_path()
+        assignments = {}
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                for fid, spec in data.get("folders", {}).items():
+                    self.folders[fid] = {"name": spec.get("name", "Folder"),
+                                         "parent": spec.get("parent")}
+                self._next_folder_id = int(data.get("next_id", 1))
+                assignments = data.get("assignments", {})
+            except (OSError, ValueError):
+                self.folders = {}
+        # keep only assignments that point at real folders and real assets --
+        # deleting a folder manually (or an asset going away) shouldn't crash
+        # the browser, it should just fall the asset back to root.
+        self.folder_of = {name: fid for name, fid in assignments.items()
+                          if fid in self.folders and name in self.by_name}
+
+    def save_folders(self) -> None:
+        data = {"folders": self.folders, "assignments": self.folder_of,
+                "next_id": self._next_folder_id}
+        try:
+            with open(self._folders_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass
+
+    def create_folder(self, name: str, parent: str | None = None) -> str:
+        fid = str(self._next_folder_id)
+        self._next_folder_id += 1
+        self.folders[fid] = {"name": name, "parent": parent}
+        return fid
+
+    def rename_folder(self, folder_id: str, name: str) -> None:
+        if folder_id in self.folders and name:
+            self.folders[folder_id]["name"] = name
+
+    def folder_children(self, parent: str | None) -> list[str]:
+        return sorted((fid for fid, f in self.folders.items() if f["parent"] == parent),
+                     key=lambda fid: self.folders[fid]["name"].lower())
+
+    def set_asset_folder(self, asset_name: str, folder_id: str | None) -> None:
+        if folder_id is None or folder_id not in self.folders:
+            self.folder_of.pop(asset_name, None)
+        else:
+            self.folder_of[asset_name] = folder_id
+
+    def assets_in(self, folder_id: str | None) -> list[AssetDef]:
+        return [a for a in self.assets if self.folder_of.get(a.name) == folder_id]
 
 
 def _vec(v: Vec3) -> list[float]:
