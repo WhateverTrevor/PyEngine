@@ -93,9 +93,13 @@ import numpy as np
 from .gpu_geometry import _build_color, _build_geometry, _entity_world_faces, _scene_environment
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
-from .renderer import _face_light_strength, _gather_lights
+from .raytrace import GITracer
+from .renderer import (_face_light_strength, _fog_volumes, _gather_lights,
+                       _gi_direct_lighting, _gi_receiver_geometry, _sun_sky_info)
 
 _MAX_LIGHTS = 16
+_MAX_FOG_VOL = 4
+_FOG_SKY_FAR = 260.0  # path-length clip for fog volumes behind the sky, matches GLRenderer
 _BACKEND_ENV = {"dx12": "D3D12", "vulkan": "Vulkan"}
 _BACKEND_MODE = {"D3D12": "dx12", "Vulkan": "vulkan"}
 
@@ -107,6 +111,7 @@ _BACKEND_MODE = {"D3D12": "dx12", "Vulkan": "vulkan"}
 # specifically to avoid WGSL's vec3-aligns-to-16-bytes trap.
 _MESH_WGSL = f"""
 const MAX_LIGHTS: i32 = {_MAX_LIGHTS};
+const MAX_FOG_VOL: i32 = {_MAX_FOG_VOL};
 
 struct FrameUniforms {{
     camera_pos: vec4<f32>,        // xyz = camera world position
@@ -114,8 +119,11 @@ struct FrameUniforms {{
     dl_color_ambient: vec4<f32>,  // xyz = dlColor * intensity, w = ambient
     flags: vec4<f32>,             // x=useEnv y=envStrength z=fogEnabled w=nLights
     fog_color_start: vec4<f32>,   // xyz = fog color (0..1), w = fog start
-    fog_end: vec4<f32>,           // x = fog end
+    fog_end: vec4<f32>,           // x = fog end, y = fog volume count
     ambient_cube: array<vec4<f32>, 6>,  // xyz per cube axis (+X -X +Y -Y +Z -Z)
+    fog_vol_lo: array<vec4<f32>, MAX_FOG_VOL>,     // xyz = box lo, w = density
+    fog_vol_hi: array<vec4<f32>, MAX_FOG_VOL>,     // xyz = box hi, w = height falloff
+    fog_vol_color: array<vec4<f32>, MAX_FOG_VOL>,  // xyz = color (0..1)
 }};
 
 struct LightData {{
@@ -141,6 +149,7 @@ struct EntityUniforms {{
 @group(0) @binding(1) var<uniform> light_buf: LightArray;
 @group(0) @binding(2) var shadow_tex: texture_2d<f32>;
 @group(0) @binding(3) var ies_tex: texture_2d<f32>;
+@group(0) @binding(4) var gi_tex: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> entity: EntityUniforms;
 
 struct VOut {{
@@ -180,6 +189,40 @@ fn eval_ambient_cube(n: vec3<f32>) -> vec3<f32> {{
     return (c / wsum) * frame.flags.y;
 }}
 
+// Ray-AABB slab intersection clipped to [tNear, tFar] -- same math as
+// GLRenderer's fogVolSegment(); returns (t0, t1), t1 < t0 means no overlap.
+fn fog_vol_segment(origin: vec3<f32>, dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>,
+                   t_near: f32, t_far: f32) -> vec2<f32> {{
+    let inv_dir = vec3<f32>(1.0) / dir;
+    let t1v = (lo - origin) * inv_dir;
+    let t2v = (hi - origin) * inv_dir;
+    let tmin = min(t1v, t2v);
+    let tmax = max(t1v, t2v);
+    let t0 = max(max(max(tmin.x, tmin.y), tmin.z), t_near);
+    let t1 = min(min(min(tmax.x, tmax.y), tmax.z), t_far);
+    return vec2<f32>(t0, t1);
+}}
+
+fn apply_fog_volumes(color_in: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>,
+                     t_near: f32, t_far: f32) -> vec3<f32> {{
+    var color = color_in;
+    let count = i32(frame.fog_end.y + 0.5);
+    for (var i: i32 = 0; i < count; i = i + 1) {{
+        let lo = frame.fog_vol_lo[i];
+        let hi = frame.fog_vol_hi[i];
+        let seg = fog_vol_segment(origin, dir, lo.xyz, hi.xyz, t_near, t_far);
+        let seg_len = max(seg.y - seg.x, 0.0);
+        var density = lo.w;
+        if (hi.w > 0.0) {{
+            let mid_h = origin.y + dir.y * (0.5 * (seg.x + seg.y));
+            density = density * exp(-max(mid_h, 0.0) * hi.w);
+        }}
+        let t_ext = exp(-density * seg_len);
+        color = color * t_ext + frame.fog_vol_color[i].xyz * (1.0 - t_ext);
+    }}
+    return color;
+}}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
@@ -192,6 +235,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         let amb = frame.dl_color_ambient.w;
         lum = vec3<f32>(amb) + frame.dl_color_ambient.xyz * ((1.0 - amb) * lambert);
     }}
+    lum = lum + textureLoad(gi_tex, vec2<i32>(0, i32(entity.face_offset.x + 0.5) + in.face_id), 0).rgb;
 
     let n_lights = i32(frame.flags.w + 0.5);
     let face_offset = i32(entity.face_offset.x + 0.5);
@@ -227,9 +271,16 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     }}
 
     var out_color = in.color * lum;
+
+    let view_dir = in.world_pos - frame.camera_pos.xyz;
+    let frag_dist = length(view_dir);
+    let ray_dir = view_dir / max(frag_dist, 1e-6);
+    if (i32(frame.fog_end.y + 0.5) > 0) {{
+        out_color = apply_fog_volumes(out_color, frame.camera_pos.xyz, ray_dir, 0.0, frag_dist);
+    }}
+
     if (frame.flags.z > 0.5) {{
-        let dist = length(in.world_pos - frame.camera_pos.xyz);
-        let f = clamp((dist - frame.fog_color_start.w) / (frame.fog_end.x - frame.fog_color_start.w),
+        let f = clamp((frag_dist - frame.fog_color_start.w) / (frame.fog_end.x - frame.fog_color_start.w),
                       0.0, 1.0);
         out_color = mix(out_color, frame.fog_color_start.xyz, f);
     }}
@@ -238,57 +289,111 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 """
 
 # SkyUniforms field order+size must match `_pack_sky_uniforms` below.
-_SKY_WGSL = """
+_SKY_WGSL = f"""
 const PI: f32 = 3.14159265359;
+const MAX_FOG_VOL: i32 = {_MAX_FOG_VOL};
 
-struct SkyUniforms {
+struct SkyUniforms {{
     cam_right: vec4<f32>,   // xyz
     cam_up: vec4<f32>,      // xyz
     cam_fwd: vec4<f32>,     // xyz
     view_size: vec4<f32>,   // x=w y=h z=focalK
-    flags: vec4<f32>,       // x=useEnv y=useGradient
+    flags: vec4<f32>,       // x=useEnv y=useGradient z=sunEnabled w=fogVolCount
     sky_top: vec4<f32>,     // xyz (0..1)
     sky_horizon: vec4<f32>, // xyz (0..1)
     bg_color: vec4<f32>,    // xyz (0..1)
-};
+    camera_pos: vec4<f32>,  // xyz -- fog-volume ray origin
+    sun_dir: vec4<f32>,     // xyz, w = disc size (deg)
+    sun_color: vec4<f32>,   // xyz (already * intensity), w = disc softness
+    sun_extra: vec4<f32>,   // x = glow, y = fog-volume far clip
+    fog_vol_lo: array<vec4<f32>, MAX_FOG_VOL>,     // xyz = box lo, w = density
+    fog_vol_hi: array<vec4<f32>, MAX_FOG_VOL>,     // xyz = box hi, w = height falloff
+    fog_vol_color: array<vec4<f32>, MAX_FOG_VOL>,  // xyz = color (0..1)
+}};
 
 @group(0) @binding(0) var<uniform> sky: SkyUniforms;
 @group(0) @binding(1) var env_tex: texture_2d<f32>;
 @group(0) @binding(2) var env_samp: sampler;
 
 @vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {{
     // big-triangle fullscreen trick -- no vertex buffer needed
     var positions = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
     return vec4<f32>(positions[vi], 0.0, 1.0);
-}
+}}
+
+fn sky_fog_vol_segment(origin: vec3<f32>, dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>,
+                       t_near: f32, t_far: f32) -> vec2<f32> {{
+    let inv_dir = vec3<f32>(1.0) / dir;
+    let t1v = (lo - origin) * inv_dir;
+    let t2v = (hi - origin) * inv_dir;
+    let tmin = min(t1v, t2v);
+    let tmax = max(t1v, t2v);
+    let t0 = max(max(max(tmin.x, tmin.y), tmin.z), t_near);
+    let t1 = min(min(min(tmax.x, tmax.y), tmax.z), t_far);
+    return vec2<f32>(t0, t1);
+}}
 
 @fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    if (sky.flags.x > 0.5) {
-        // wgpu's @builtin(position) origin is TOP-left with y increasing
-        // DOWNWARD (unlike GL's gl_FragCoord, which is bottom-left/y-up) --
-        // flip the y term here so +dcy still means "up" in camera space.
-        let dcx = (frag.x - sky.view_size.x * 0.5) / sky.view_size.z;
-        let dcy = (sky.view_size.y * 0.5 - frag.y) / sky.view_size.z;
-        let dir = normalize(dcx * sky.cam_right.xyz + dcy * sky.cam_up.xyz + sky.cam_fwd.xyz);
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {{
+    // wgpu's @builtin(position) origin is TOP-left with y increasing
+    // DOWNWARD (unlike GL's gl_FragCoord, which is bottom-left/y-up) --
+    // flip the y term here so +dcy still means "up" in camera space.
+    let dcx = (frag.x - sky.view_size.x * 0.5) / sky.view_size.z;
+    let dcy = (sky.view_size.y * 0.5 - frag.y) / sky.view_size.z;
+    let dir = normalize(dcx * sky.cam_right.xyz + dcy * sky.cam_up.xyz + sky.cam_fwd.xyz);
+
+    var base: vec3<f32>;
+    if (sky.flags.x > 0.5) {{
         let theta = acos(clamp(dir.y, -1.0, 1.0));
         var phi = atan2(dir.z, dir.x);
-        if (phi < 0.0) { phi = phi + 2.0 * PI; }
+        if (phi < 0.0) {{ phi = phi + 2.0 * PI; }}
         let uv = vec2<f32>(phi / (2.0 * PI), theta / PI);
-        let radiance = textureSample(env_tex, env_samp, uv).rgb;
-        return vec4<f32>(clamp(radiance, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
-    } else if (sky.flags.y > 0.5) {
+        base = textureSample(env_tex, env_samp, uv).rgb;
+    }} else if (sky.flags.y > 0.5) {{
         // top of screen (frag.y=0) -> sky_top, bottom (frag.y=view_size.y) -> sky_horizon;
         // no inversion needed here since wgpu's y-down frag coord already
         // runs top-to-bottom in the same order we want top-to-horizon.
         let f = clamp(frag.y / sky.view_size.y, 0.0, 1.0);
-        return vec4<f32>(mix(sky.sky_top.xyz, sky.sky_horizon.xyz, f), 1.0);
-    } else {
-        return vec4<f32>(sky.bg_color.xyz, 1.0);
-    }
-}
+        base = mix(sky.sky_top.xyz, sky.sky_horizon.xyz, f);
+    }} else {{
+        base = sky.bg_color.xyz;
+    }}
+
+    if (sky.flags.z > 0.5) {{
+        let cos_ang = clamp(dot(dir, sky.sun_dir.xyz), -1.0, 1.0);
+        let ang = degrees(acos(cos_ang));
+        let disc_size = sky.sun_dir.w;
+        let soft = max(disc_size * sky.sun_color.w, 0.001);
+        let e0 = disc_size - soft;
+        let e1 = disc_size + soft;
+        let t = clamp((e1 - ang) / max(e1 - e0, 0.0001), 0.0, 1.0);
+        let disc = t * t * (3.0 - 2.0 * t);
+        let halo_deg = disc_size * 12.0 + 3.0;
+        let g = clamp(1.0 - ang / halo_deg, 0.0, 1.0);
+        let glow_amt = sky.sun_extra.x * g * g * g;
+        base = base + sky.sun_color.xyz * disc + sky.sun_color.xyz * glow_amt * 0.5;
+    }}
+
+    let fog_vol_count = i32(sky.flags.w + 0.5);
+    let fog_far = sky.sun_extra.y;
+    for (var i: i32 = 0; i < fog_vol_count; i = i + 1) {{
+        let lo = sky.fog_vol_lo[i];
+        let hi = sky.fog_vol_hi[i];
+        let seg = sky_fog_vol_segment(sky.camera_pos.xyz, dir, lo.xyz, hi.xyz, 0.0, fog_far);
+        let seg_len = max(seg.y - seg.x, 0.0);
+        var density = lo.w;
+        if (hi.w > 0.0) {{
+            let mid_h = sky.camera_pos.y + dir.y * (0.5 * (seg.x + seg.y));
+            density = density * exp(-max(mid_h, 0.0) * hi.w);
+        }}
+        let t_ext = exp(-density * seg_len);
+        base = base * t_ext + sky.fog_vol_color[i].xyz * (1.0 - t_ext);
+    }}
+
+    return vec4<f32>(clamp(base, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}}
 """
 
 
@@ -319,10 +424,12 @@ class WgpuRenderer:
     MAX_LIGHTS = _MAX_LIGHTS
     _COLOR_FORMAT = "rgba8unorm"
     _DEPTH_FORMAT = "depth24plus"
-    _FRAME_UBO_SIZE = 192   # FrameUniforms: 6 header vec4 + 6 ambient_cube vec4
+    # FrameUniforms: 6 header vec4 + 6 ambient_cube vec4 + 3x MAX_FOG_VOL fog-vol vec4
+    _FRAME_UBO_SIZE = 192 + 48 * _MAX_FOG_VOL
     _LIGHT_UBO_SIZE = 64 * _MAX_LIGHTS  # LightData = 4 vec4 = 64B, x16 lights
     _ENTITY_UBO_SIZE = 192  # 2x mat4x4 (64B) + 3x vec4 (48B) + 1x vec4 (16B)
-    _SKY_UBO_SIZE = 128     # SkyUniforms: 8 vec4
+    # SkyUniforms: 12 header vec4 (incl. camera_pos/sun_*) + 3x MAX_FOG_VOL fog-vol vec4
+    _SKY_UBO_SIZE = 192 + 48 * _MAX_FOG_VOL
 
     def __init__(self, backend: str):
         if backend not in _BACKEND_ENV:
@@ -346,6 +453,7 @@ class WgpuRenderer:
         self._entity_uniform_cache: dict[int, dict] = {}
         self._env_tex_cache: dict[int, dict] = {}
         self._last_sky_env_view = None
+        self._gi = GITracer()
 
         self._build_pipelines()
         self._build_static_resources()
@@ -455,6 +563,15 @@ class WgpuRenderer:
             usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
         self._shadow_view = self._shadow_tex.create_view()
 
+        # per-face one-bounce GI (see GITracer): rgba32float, alpha unused --
+        # same (1, total_faces) layout as GLRenderer's giTex, sampled by
+        # textureLoad(gi_tex, (0, faceOffset + faceId)) in the mesh shader.
+        self._gi_tex_size = (1, 1)
+        self._gi_tex = device.create_texture(
+            size=(1, 1, 1), format="rgba32float",
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        self._gi_view = self._gi_tex.create_view()
+
         self._frame_bind_group = self._make_frame_bind_group()
         self._sky_bind_group = self._make_sky_bind_group(self._dummy_env_view)
         self._last_sky_env_view = self._dummy_env_view
@@ -467,6 +584,7 @@ class WgpuRenderer:
                                         "size": self._LIGHT_UBO_SIZE}},
             {"binding": 2, "resource": self._shadow_view},
             {"binding": 3, "resource": self._ies_view},
+            {"binding": 4, "resource": self._gi_view},
         ])
 
     def _make_sky_bind_group(self, env_view):
@@ -516,6 +634,27 @@ class WgpuRenderer:
         self.device.queue.write_texture(
             {"texture": self._shadow_tex}, data.tobytes(),
             {"bytes_per_row": w_s * 4, "rows_per_image": h_s}, (w_s, h_s, 1))
+
+    def _upload_gi_tex(self, gi_data: np.ndarray, total_faces: int) -> None:
+        """Per-face RGB indirect-light texture, same (1, total_faces)
+        face-id-indexed layout as GLRenderer's giTex."""
+        wgpu = self._wgpu
+        size = (1, max(total_faces, 1))
+        if self._gi_tex_size != size:
+            self._gi_tex.destroy()
+            self._gi_tex = self.device.create_texture(
+                size=(size[0], size[1], 1), format="rgba32float",
+                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+            self._gi_view = self._gi_tex.create_view()
+            self._gi_tex_size = size
+            self._frame_bind_group = self._make_frame_bind_group()  # view changed
+        w_s, h_s = size
+        rgba = np.zeros((h_s, w_s, 4), dtype=np.float32)
+        rgba[:, 0, :3] = gi_data
+        data = np.ascontiguousarray(rgba, dtype=np.float32)
+        self.device.queue.write_texture(
+            {"texture": self._gi_tex}, data.tobytes(),
+            {"bytes_per_row": w_s * 16, "rows_per_image": h_s}, (w_s, h_s, 1))
 
     def _get_env_view(self, env):
         wgpu = self._wgpu
@@ -616,11 +755,12 @@ class WgpuRenderer:
         buf[44] = float(face_offset)
         return buf.tobytes()
 
-    def _pack_frame_uniforms(self, scene, camera, env, lights) -> bytes:
-        """FrameUniforms: 6 header vec4 (96B) + 6 ambient_cube vec4 (96B) = 192B."""
+    def _pack_frame_uniforms(self, scene, camera, env, lights, vols) -> bytes:
+        """FrameUniforms: 6 header vec4 (96B) + 6 ambient_cube vec4 (96B)
+        + 3x MAX_FOG_VOL fog-vol vec4 arrays (48B * MAX_FOG_VOL) = 384B."""
         dl = scene.light
         fog = scene.fog
-        buf = np.zeros(48, dtype=np.float32)
+        buf = np.zeros(self._FRAME_UBO_SIZE // 4, dtype=np.float32)
         buf[0:3] = camera.position.to_array().astype(np.float32)
         buf[4:7] = dl.direction.to_array().astype(np.float32)
         dl_color = (np.asarray(dl.color, dtype=np.float32) / 255.0) * dl.intensity
@@ -634,10 +774,23 @@ class WgpuRenderer:
             buf[16:19] = np.asarray(fog.color, dtype=np.float32) / 255.0
             buf[19] = float(fog.start)
             buf[20] = float(fog.end)
+        buf[21] = float(len(vols))
         if env is not None:
             cube = np.zeros((6, 4), dtype=np.float32)
             cube[:, :3] = env.ambient_cube
             buf[24:48] = cube.ravel()
+        lo = np.zeros((_MAX_FOG_VOL, 4), dtype=np.float32)
+        hi = np.zeros((_MAX_FOG_VOL, 4), dtype=np.float32)
+        color = np.zeros((_MAX_FOG_VOL, 4), dtype=np.float32)
+        for i, (vlo, vhi, fv) in enumerate(vols):
+            lo[i, :3] = vlo
+            lo[i, 3] = fv.density
+            hi[i, :3] = vhi
+            hi[i, 3] = fv.height_falloff
+            color[i, :3] = np.asarray(fv.color, dtype=np.float32) / 255.0
+        buf[48:48 + 16] = lo.ravel()
+        buf[64:64 + 16] = hi.ravel()
+        buf[80:80 + 16] = color.ravel()
         return buf.tobytes()
 
     def _pack_lights(self, lights) -> bytes:
@@ -655,14 +808,15 @@ class WgpuRenderer:
             buf[i, 13] = info.cos_out if info.cos_out is not None else 0.0
         return buf.tobytes()
 
-    def _pack_sky_uniforms(self, scene, camera, env, w: int, h: int) -> bytes:
-        """SkyUniforms: 8 vec4 = 128B."""
+    def _pack_sky_uniforms(self, scene, camera, env, w: int, h: int, vols) -> bytes:
+        """SkyUniforms: 12 header vec4 (192B) + 3x MAX_FOG_VOL fog-vol vec4
+        arrays (48B * MAX_FOG_VOL) = 384B."""
         k = 0.5 * h / math.tan(math.radians(camera.fov) * 0.5)
         rot = (rotation_y(camera.yaw) @ rotation_x(camera.pitch))[:3, :3]
         right = rot @ np.array([1.0, 0.0, 0.0])
         up = rot @ np.array([0.0, 1.0, 0.0])
         fwd = rot @ np.array([0.0, 0.0, -1.0])
-        buf = np.zeros(32, dtype=np.float32)
+        buf = np.zeros(self._SKY_UBO_SIZE // 4, dtype=np.float32)
         buf[0:3] = right
         buf[4:7] = up
         buf[8:11] = fwd
@@ -675,6 +829,30 @@ class WgpuRenderer:
                 buf[24:27] = np.asarray(scene.sky[1], dtype=np.float32) / 255.0
             else:
                 buf[28:31] = np.asarray(scene.background, dtype=np.float32) / 255.0
+        buf[32:35] = camera.position.to_array().astype(np.float32)  # camera_pos
+        sun = _sun_sky_info(scene)
+        if sun is not None:
+            buf[18] = 1.0  # flags.z = sunEnabled
+            buf[36:39] = sun.dir
+            buf[39] = float(sun.disc_size)
+            buf[40:43] = sun.color
+            buf[43] = float(sun.disc_softness)
+            buf[44] = float(sun.glow)
+        buf[45] = _FOG_SKY_FAR
+        buf[19] = float(len(vols))  # flags.w = fogVolCount
+        lo = np.zeros((_MAX_FOG_VOL, 4), dtype=np.float32)
+        hi = np.zeros((_MAX_FOG_VOL, 4), dtype=np.float32)
+        color = np.zeros((_MAX_FOG_VOL, 4), dtype=np.float32)
+        for i, (vlo, vhi, fv) in enumerate(vols):
+            lo[i, :3] = vlo
+            lo[i, 3] = fv.density
+            hi[i, :3] = vhi
+            hi[i, 3] = fv.height_falloff
+            color[i, :3] = np.asarray(fv.color, dtype=np.float32) / 255.0
+        base = 48
+        buf[base:base + 16] = lo.ravel()
+        buf[base + 16:base + 32] = hi.ravel()
+        buf[base + 32:base + 48] = color.ravel()
         return buf.tobytes()
 
     # ------------------------------------------------------------------
@@ -709,15 +887,32 @@ class WgpuRenderer:
                     shadow_data[off:off + m, li_idx] = factors
         self._upload_shadow_tex(shadow_data, total_faces)
 
+        # one-bounce GI -- baked/cached by GITracer, zero per-frame cost once
+        # static (mirrors GLRenderer.render()'s GI block exactly).
+        gi_data = np.zeros((max(total_faces, 1), 3), dtype=np.float32)
+        gi_cfg = getattr(scene, "gi", None)
+        if tracer is not None and gi_cfg and gi_cfg.get("enabled") and total_faces > 0:
+            gi_map = self._gi.compute(scene, tracer,
+                                      lambda casters: _gi_direct_lighting(scene, casters, tracer),
+                                      _gi_receiver_geometry,
+                                      gi_cfg.get("samples", 16), gi_cfg.get("intensity", 1.0))
+            for entity, off, m in zip(live, offsets, face_counts):
+                gi = gi_map.get(id(entity))
+                if gi is not None:
+                    gi_data[off:off + m] = gi
+        self._upload_gi_tex(gi_data, total_faces)
+
+        vols = _fog_volumes(scene)
+
         # Frame-global uniforms: one write per buffer this frame, so all
         # draws in the render pass recorded below see consistent data once
         # the command buffer actually executes after submit() (see module
         # docstring's write-then-submit-ordering note).
         self.device.queue.write_buffer(self._frame_ubo, 0,
-                                       self._pack_frame_uniforms(scene, camera, env, lights))
+                                       self._pack_frame_uniforms(scene, camera, env, lights, vols))
         self.device.queue.write_buffer(self._light_ubo, 0, self._pack_lights(lights))
         self.device.queue.write_buffer(self._sky_ubo, 0,
-                                       self._pack_sky_uniforms(scene, camera, env, w, h))
+                                       self._pack_sky_uniforms(scene, camera, env, w, h, vols))
 
         env_view = self._get_env_view(env) if env is not None else self._dummy_env_view
         if env_view is not self._last_sky_env_view:
@@ -795,5 +990,6 @@ class WgpuRenderer:
             self._color_tex.destroy()
             self._depth_tex.destroy()
         self._shadow_tex.destroy()
+        self._gi_tex.destroy()
         self._ies_tex.destroy()
         self._dummy_env_tex.destroy()
