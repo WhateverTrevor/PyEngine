@@ -21,3 +21,4 @@ death never loses more than one milestone.
 | 2026-07-10 | DX12/Vulkan resume (transcript resume) | unknown | DIED AT LIMIT AGAIN mid-settings-fix; salvaged at 57bf45f. Lesson: resuming a huge transcript re-reads it all at cold rates — after a death, start a FRESH agent from the wip branch + HANDOFF instead. Remaining: settings row-spacing fix + full verification battery. |
 | 2026-07-10 | DX12/Vulkan finisher (fresh from checkpoint) | 77,335 | completed under budget; judged + merged to main |
 | 2026-07-11 | Environment assets (sun/sky material/GI/fog volumes) | 461,730 cumulative (5 resumes incl. 2 limit deaths) | completed; 1 review finding (GI receiver gating) fixed on send-back; judged + squash-merged e7b7735. Over budget: should have been 2-3 runs |
+| 2026-07-11 | Window management (minimize/close/registry/reset) | 143,784 | completed under budget; judged + squash-merged |
