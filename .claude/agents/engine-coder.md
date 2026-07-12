@@ -61,19 +61,32 @@ agent that judges it before anything is committed.
   ray-plane intersection, lights evaluate per pixel only on visible pixels
   within each light's range. Flat: classic per-face shading. Painter's-sort
   depth ordering in both.
-- `engine/raytrace.py` — soft shadows: sampled shadow rays per face against
-  the triangle soup, cached per (receiver, light). CACHE INVALIDATION RULE:
-  any moving shadow caster invalidates the whole world version — animated
-  entities should set `casts_shadow = False` (see the Ghost asset).
+- `engine/raytrace.py` — soft shadows (point/spot spherical-area sampling,
+  directional disk-jittered sampling for the Sun) + `GITracer` (one-bounce
+  cosine-hemisphere GI), all cached per world version. CACHE INVALIDATION
+  RULE: any moving shadow caster invalidates the whole world version —
+  animated entities should set `casts_shadow = False` (see the Ghost asset).
+  `casts_shadow` governs OCCLUDING/bounce-sourcing only; every visible mesh
+  receives shadows and GI regardless (a review once rejected gating
+  receivers on it).
+- GPU backends: `engine/gl_renderer.py` (OpenGL 3.3/moderngl, feature-
+  complete vs CPU) and `engine/wgpu_renderer.py` (DX12/Vulkan via wgpu,
+  offscreen+readback; MISSING sun disc/GI/fog volumes — parity is the top
+  backlog item); `engine/gpu_geometry.py` holds the shared vertex-soup
+  helpers. Engine picks via `api=` with a dx12/vulkan -> gl -> cpu fallback.
 - `engine/scene.py` — Entity/Transform/Behavior. `Transform.matrix()` is
   memoized; never mutate the returned array.
-- `engine/lighting.py` (Point/Spot/IES), `engine/environment.py` (HDRI RGBE
-  I/O, ambient cube), `engine/materials.py` (node graphs baked to per-face
-  colors), `engine/fbx.py` (binary FBX importer), `engine/assets.py`
+- `engine/lighting.py` (Point/Spot/IES, `SunDisc`, `FogVolume`),
+  `engine/environment.py` (HDRI RGBE I/O, ambient cube, `import_hdri`),
+  `engine/materials.py` (node graphs baked to per-face colors + a sky
+  evaluation context that bakes graphs to HDR equirect environments),
+  `engine/fbx.py` (binary FBX importer), `engine/assets.py`
   (self-contained JSON assets, scene save/load — new persistent entity state
   must be added to BOTH save and load), `engine/behaviors.py` (incl.
-  FlyController with sphere-vs-OBB collision), `engine/core.py` (fixed
-  60 Hz timestep; input edge events are consumed once per frame).
+  FlyController with sphere-vs-OBB collision, `SunController` driving
+  scene.light from the Sun entity's rotation), `engine/core.py` (fixed
+  60 Hz timestep; input edge events are consumed once per frame; GPU
+  context lifecycle + fallback chain).
 - `editor.py` — outliner, content browser, details panel, gizmo (G cycles
   translate/rotate/scale), node material editor (M), FBX import button.
   UI state lives on the `Editor` class; panel rects come from the

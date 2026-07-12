@@ -39,16 +39,36 @@ survival horror game. Repo: https://github.com/WhateverTrevor/PyEngine.
 
 ## Verification (run these as judge; all must pass before merging)
 
-- `py tests\smoke_test.py`   — full engine/editor battery (CPU paths)
-- `py tests\gl_checks.py`    — OpenGL backend: CPU parity, IES, cone, shadows, depth
-- `py tests\wgpu_checks.py`  — DX12 backend: 3-way parity, shadows, HDRI sky
-- FPS reference (regressions): editor cpu ~33 / gl ~58-80 / dx12 ~45;
-  demo cpu ~54 / gl ~117 / dx12 ~88 / vulkan ~85.
+- `py tests\smoke_test.py`     — full engine/editor battery (CPU paths)
+- `py tests\gl_checks.py`      — OpenGL backend: CPU parity, IES, cone, shadows, depth
+- `py tests\wgpu_checks.py`    — DX12 backend: 3-way parity, shadows, HDRI sky
+- `py tests\env_checks.py`     — sun disc tracking, directional shadows, GI
+  green-bleed, fog volumes, sky-material bake, HDRI import
+- `py tests\window_checks.py`  — panel minimize/close/reset layout math,
+  settings round-trip, material-editor bake
+- FPS reference (post environment features, 2026-07-11): editor cpu ~23 /
+  dx12 ~53; demo cpu ~44-52 / gl ~116 / dx12 ~81 / vulkan ~85. If a number
+  regresses >20%, investigate before merging.
 
 ## Known gaps / natural backlog
 
+- **Top queued task: wgpu (DX12/Vulkan) visual parity** — the backend runs
+  but does not render the sun disc, GI, or fog volumes (CPU + GL only).
 - Software flat mode (F2) is painter-only (approximate depth); GPU paths cap
   at 16 lights; wgpu path = offscreen+readback, no wireframe.
+- Fog Volume boxes are world-axis-aligned (rotation ignored, v1). GI is
+  one-bounce, per-face, static-scene cached (~300ms starter-scene bake).
 - No undo system. FBX import is geometry+diffuse colors only (no textures/UVs).
 - Next obvious features: walking player (gravity), interactions
   (doors/pickups), enemy AI, texture/UV pipeline.
+
+## State at last supervisor retirement (2026-07-11)
+
+Everything requested by the user is merged and pushed through `8ef3dc2`:
+GPU backends (gl/dx12/vulkan + settings API selector), Sun (time-of-day
+rotation, disc, directional ray-traced shadows), HDRI import + editable sky
+materials (node editor, Unreal-vocabulary nodes), one-bounce GI, atmospheric
+fog + Fog Volume assets, and full window management (minimize/close on every
+panel, Window-menu registry, factory Reset Layout). No task in flight; no
+wip branches; `.claude/wip/HANDOFF.md` is the no-task stub. Token ledger is
+current through the window-management run.
