@@ -33,6 +33,7 @@ PANEL_TITLE_H = 18
 EDGE_SNAP = 48
 
 OUTLINER_W = 260          # docked left/right panel width
+MIN_DOCK_W = 150          # side-dock width when every panel on it is minimized
 BROWSER_H = 118           # docked bottom panel height
 DETAILS_H = 322           # default floating height for the details panel
 ROW_H = 20
@@ -209,6 +210,7 @@ class Editor:
                            "bottom": ["browser"]}
         self.floating = []          # panel ids currently floating, z-order (front=last)
         self.panel_visible = {"outliner": True, "details": True, "browser": True}
+        self.panel_minimized = {"outliner": False, "details": False, "browser": False}
         self.float_rect = {}        # panel id -> pygame.Rect, used only while floating
         self.panel_drag = None      # {"id","dx","dy","w","h"} while dragging a title bar
 
@@ -240,15 +242,24 @@ class Editor:
         r.y = min(max(r.y, MENU_H), max(MENU_H, h - r.height))
         return r
 
+    def _all_minimized(self, ids) -> bool:
+        return len(ids) > 0 and all(self.panel_minimized.get(p, False) for p in ids)
+
     def _layout(self, w, h):
         import pygame
         menu = pygame.Rect(0, 0, w, MENU_H)
         left_ids = [p for p in self.dock_order["left"] if self.panel_visible.get(p, True)]
         right_ids = [p for p in self.dock_order["right"] if self.panel_visible.get(p, True)]
         bottom_ids = [p for p in self.dock_order["bottom"] if self.panel_visible.get(p, True)]
-        left_w = OUTLINER_W if left_ids else 0
-        right_w = OUTLINER_W if right_ids else 0
-        bottom_h = BROWSER_H if bottom_ids else 0
+        left_w = 0
+        if left_ids:
+            left_w = MIN_DOCK_W if self._all_minimized(left_ids) else OUTLINER_W
+        right_w = 0
+        if right_ids:
+            right_w = MIN_DOCK_W if self._all_minimized(right_ids) else OUTLINER_W
+        bottom_h = 0
+        if bottom_ids:
+            bottom_h = PANEL_TITLE_H if self._all_minimized(bottom_ids) else BROWSER_H
         top = MENU_H
         stack_bottom = h - bottom_h
         panels = {}
@@ -258,10 +269,18 @@ class Editor:
             if n == 0:
                 return
             avail = max(0, stack_bottom - top)
-            share = avail // n
+            minimized = [p for p in ids if self.panel_minimized.get(p, False)]
+            normal = [p for p in ids if not self.panel_minimized.get(p, False)]
+            remain = max(0, avail - len(minimized) * PANEL_TITLE_H)
+            n_normal = len(normal)
+            share = remain // n_normal if n_normal else 0
             y = top
-            for i, pid in enumerate(ids):
-                hh = share if i < n - 1 else avail - share * (n - 1)
+            for pid in ids:
+                if pid in minimized:
+                    hh = PANEL_TITLE_H
+                else:
+                    idx = normal.index(pid)
+                    hh = share if idx < n_normal - 1 else remain - share * (n_normal - 1)
                 panels[pid] = pygame.Rect(x, y, width, max(0, hh))
                 y += hh
 
@@ -274,13 +293,17 @@ class Editor:
             x = left_w
             for i, pid in enumerate(bottom_ids):
                 ww = share if i < n - 1 else bw_total - share * (n - 1)
-                panels[pid] = pygame.Rect(x, stack_bottom, max(0, ww), bottom_h)
+                hh = PANEL_TITLE_H if self.panel_minimized.get(pid, False) else bottom_h
+                panels[pid] = pygame.Rect(x, stack_bottom, max(0, ww), hh)
                 x += ww
 
         for pid in ("outliner", "details", "browser"):
             if not self.panel_visible.get(pid, True) or pid in panels:
                 continue
-            panels[pid] = self._float_rect_for(pid, w, h)
+            r = self._float_rect_for(pid, w, h)
+            if self.panel_minimized.get(pid, False):
+                r = pygame.Rect(r.x, r.y, r.width, PANEL_TITLE_H)
+            panels[pid] = r
 
         viewport = pygame.Rect(left_w, top, max(0, w - left_w - right_w),
                                max(0, stack_bottom - top))
@@ -294,6 +317,14 @@ class Editor:
             return None
         return pygame.Rect(r.x, r.y + PANEL_TITLE_H, r.width,
                            max(0, r.height - PANEL_TITLE_H))
+
+    def _panel_title_buttons(self, rect):
+        """[minimize][close] rects at the right end of a panel's title bar,
+        used identically for drawing and hit-testing."""
+        import pygame
+        close = pygame.Rect(rect.right - 18, rect.y + 3, 13, 13)
+        minimize = pygame.Rect(rect.right - 34, rect.y + 3, 13, 13)
+        return {"minimize": minimize, "close": close}
 
     def _hit_panel(self, pos, layout):
         panels = layout["panels"]
@@ -709,6 +740,7 @@ class Editor:
                 ("Outliner", lambda: self._toggle_panel("outliner"), True),
                 ("Details", lambda: self._toggle_panel("details"), True),
                 ("Content Browser", lambda: self._toggle_panel("browser"), True),
+                ("Material Editor", self._toggle_material_editor, True),
                 ("Settings...", self._open_settings, True),
                 ("Reset Layout", self._reset_layout, True),
             ],
@@ -717,6 +749,15 @@ class Editor:
                 ("About", self._show_about, True),
             ],
         }
+
+    def _menu_checked(self, label):
+        """True/False for a checkmarked Window-menu item, None otherwise."""
+        pid = self._WINDOW_PANEL_LABELS.get(label)
+        if pid is not None:
+            return self.panel_visible.get(pid, True)
+        if label == "Material Editor":
+            return self.mat_ui is not None
+        return None
 
     def _dropdown_geom(self, name, w):
         import pygame
@@ -767,9 +808,20 @@ class Editor:
             self.dock_order[side].append(pid)
         self._save_settings()
 
+    def _full_panel_size(self, pid, rect):
+        """The panel's un-minimized (w, h) — used so a drag on a minimized
+        title bar doesn't bake the collapsed height into float_rect."""
+        stored = self.float_rect.get(pid)
+        if stored is not None:
+            return stored.width, stored.height
+        if self.panel_minimized.get(pid, False):
+            return PANEL_DEFAULT_FLOAT[pid]
+        return rect.width, rect.height
+
     def _begin_panel_drag(self, pid, mp, rect) -> None:
+        fw, fh = self._full_panel_size(pid, rect)
         self.panel_drag = {"id": pid, "dx": mp[0] - rect.x, "dy": mp[1] - rect.y,
-                           "w": rect.width, "h": rect.height}
+                           "w": fw, "h": fh}
 
     def _finish_panel_drag(self, mp, w, h) -> None:
         import pygame
@@ -792,11 +844,26 @@ class Editor:
         self.panel_visible[pid] = not self.panel_visible.get(pid, True)
         self._save_settings()
 
+    def _toggle_minimize(self, pid) -> None:
+        self.panel_minimized[pid] = not self.panel_minimized.get(pid, False)
+        self._save_settings()
+
+    def _toggle_material_editor(self) -> None:
+        if self.mat_ui is not None:
+            self.mat_ui.close()
+            return
+        e = self.selected
+        if e is None or e.mesh is None:
+            self.status = ("select a mesh entity first", 3.0)
+            return
+        self.mat_ui = MaterialEditorUI(self, e)
+
     def _reset_layout(self) -> None:
         self.dock_order = {"left": [], "right": ["outliner", "details"],
                            "bottom": ["browser"]}
         self.floating = []
         self.panel_visible = {"outliner": True, "details": True, "browser": True}
+        self.panel_minimized = {"outliner": False, "details": False, "browser": False}
         self.float_rect = {}
         self._save_settings()
 
@@ -917,6 +984,7 @@ class Editor:
             "max_fps": int(self.eng.max_fps),
             "api": self.api_pref,
             "panel_visible": dict(self.panel_visible),
+            "panel_minimized": dict(self.panel_minimized),
             "dock_order": {side: list(ids) for side, ids in self.dock_order.items()},
             "floating": list(self.floating),
             "float_rect": {pid: [r.x, r.y, r.width, r.height]
@@ -943,6 +1011,10 @@ class Editor:
         for pid in valid:
             if pid in pv:
                 self.panel_visible[pid] = bool(pv[pid])
+        pm = data.get("panel_minimized", {})
+        for pid in valid:
+            if pid in pm:
+                self.panel_minimized[pid] = bool(pm[pid])
         for pid, v in data.get("float_rect", {}).items():
             if pid in valid and isinstance(v, list) and len(v) == 4:
                 self.float_rect[pid] = pygame.Rect(*v)
@@ -1136,6 +1208,8 @@ class Editor:
 
         if inp.wheel and not looking:
             target = self._hit_panel(mp, layout)
+            if target is not None and self.panel_minimized.get(target, False):
+                target = None
             if target == "outliner":
                 self.outliner_scroll = max(0, self.outliner_scroll - int(inp.wheel) * 3)
             elif target == "browser":
@@ -1151,8 +1225,15 @@ class Editor:
                     rect = layout["panels"][target]
                     title_rect = pygame.Rect(rect.x, rect.y, rect.width, PANEL_TITLE_H)
                     if title_rect.collidepoint(mp):
-                        self._begin_panel_drag(target, mp, rect)
-                    else:
+                        btns = self._panel_title_buttons(rect)
+                        if btns["close"].collidepoint(mp):
+                            self.panel_visible[target] = False
+                            self._save_settings()
+                        elif btns["minimize"].collidepoint(mp):
+                            self._toggle_minimize(target)
+                        else:
+                            self._begin_panel_drag(target, mp, rect)
+                    elif not self.panel_minimized.get(target, False):
                         content = self._panel_content_rect(target, layout)
                         self._route_panel_click(target, mp, content)
                 elif layout["viewport"].collidepoint(mp):
@@ -1377,8 +1458,9 @@ class Editor:
         if drag_pid is not None and drag_pid in panels:
             mp = eng.input.mouse_pos
             g = self.panel_drag
+            dh = PANEL_TITLE_H if self.panel_minimized.get(drag_pid, False) else g["h"]
             panels[drag_pid] = pygame.Rect(mp[0] - g["dx"], mp[1] - g["dy"],
-                                           g["w"], g["h"])
+                                           g["w"], dh)
 
         for pid in ("outliner", "details", "browser"):
             if pid in panels and pid not in self.floating and pid != drag_pid:
@@ -1415,6 +1497,17 @@ class Editor:
             return "Details"
         return "Content Browser"
 
+    def _draw_title_buttons(self, surf, rect) -> None:
+        import pygame
+        mp = pygame.mouse.get_pos()
+        for key, r in self._panel_title_buttons(rect).items():
+            hov = r.collidepoint(mp)
+            pygame.draw.rect(surf, HOVER_BG if hov else (44, 47, 56), r, border_radius=2)
+            glyph = "-" if key == "minimize" else "x"
+            lab = self.font_small.render(glyph, True, TEXT)
+            surf.blit(lab, (r.x + (r.width - lab.get_width()) // 2,
+                            r.y + (r.height - lab.get_height()) // 2))
+
     def _draw_panel(self, surf, pid, rect) -> None:
         import pygame
         pygame.draw.rect(surf, PANEL_BG, rect)
@@ -1423,8 +1516,11 @@ class Editor:
         pygame.draw.rect(surf, (30, 33, 40), title_rect)
         pygame.draw.line(surf, PANEL_EDGE, (rect.x, rect.y + PANEL_TITLE_H),
                          (rect.right, rect.y + PANEL_TITLE_H))
-        lab = self.font_small.render(self._panel_title(pid)[:44], True, TEXT)
+        lab = self.font_small.render(self._panel_title(pid)[:40], True, TEXT)
         surf.blit(lab, (rect.x + 8, rect.y + 3))
+        self._draw_title_buttons(surf, rect)
+        if self.panel_minimized.get(pid, False):
+            return
         content = pygame.Rect(rect.x, rect.y + PANEL_TITLE_H, rect.width,
                               max(0, rect.height - PANEL_TITLE_H))
         if pid == "outliner":
@@ -1451,7 +1547,6 @@ class Editor:
 
         if self.open_menu is None:
             return
-        checks = self._WINDOW_PANEL_LABELS if self.open_menu == "Window" else {}
         hints = self._MENU_HOTKEYS.get(self.open_menu, {})
         drop, rows = self._dropdown_geom(self.open_menu, w)
         pygame.draw.rect(surf, (24, 26, 32), drop)
@@ -1460,11 +1555,11 @@ class Editor:
             if r.collidepoint(mp):
                 pygame.draw.rect(surf, HOVER_BG, r)
             color = TEXT if enabled else TEXT_DIM
-            if label in checks:
-                pid = checks[label]
+            checked = self._menu_checked(label)
+            if checked is not None:
                 box = pygame.Rect(r.x + 4, r.y + 5, 12, 12)
                 pygame.draw.rect(surf, (48, 51, 60), box, border_radius=2)
-                if self.panel_visible.get(pid, True):
+                if checked:
                     pygame.draw.rect(surf, ACCENT, box.inflate(-4, -4), border_radius=2)
                 surf.blit(self.font_small.render(label, True, color), (r.x + 22, r.y + 4))
             else:
@@ -1817,6 +1912,7 @@ class MaterialEditorUI:
         self.drag_link = None    # source node id while dragging a new wire
         self.drag_param = None   # (node_id, param_name)
         self.drag_title = None   # (grab_dx, grab_dy) while dragging the title bar
+        self.minimized = False
         self._spawn_i = 0
 
     def close(self) -> None:
@@ -1831,6 +1927,14 @@ class MaterialEditorUI:
         y = min(max(self.pos[1], MENU_H), max(MENU_H, h - sh))
         self.pos = [x, y]
         return pygame.Rect(x, y, sw, sh)
+
+    def outer_rect(self, w, h):
+        """The on-screen box — collapsed to the title bar while minimized."""
+        import pygame
+        r = self.rect(w, h)
+        if self.minimized:
+            return pygame.Rect(r.x, r.y, r.width, PANEL_TITLE_H)
+        return r
 
     def content_rect(self, w, h):
         import pygame
@@ -1885,10 +1989,10 @@ class MaterialEditorUI:
         inp = engine.input
         mp = inp.mouse_pos
         w, h = engine.screen.get_size()
-        outer = self.rect(w, h)
-        panel = self.content_rect(w, h)
+        outer = self.outer_rect(w, h)
         title_bar = pygame.Rect(outer.x, outer.y, outer.width, PANEL_TITLE_H)
         close = pygame.Rect(outer.right - 24, outer.y + 2, 16, 16)
+        minimize = pygame.Rect(outer.right - 44, outer.y + 2, 16, 16)
 
         if inp.pressed(pygame.K_m):
             self.close()
@@ -1897,33 +2001,38 @@ class MaterialEditorUI:
             if close.collidepoint(mp):
                 self.close()
                 return
+            if minimize.collidepoint(mp):
+                self.minimized = not self.minimized
+                return
             if title_bar.collidepoint(mp):
                 self.drag_title = (mp[0] - outer.x, mp[1] - outer.y)
-            else:
-                self._press(mp, panel)
+            elif not self.minimized:
+                self._press(mp, self.content_rect(w, h))
         if inp.mouse_held(1):
             if self.drag_title is not None:
                 dx, dy = self.drag_title
                 self.pos = [mp[0] - dx, mp[1] - dy]
-            if self.drag_node is not None:
-                nid, dx, dy = self.drag_node
-                if nid in self.graph.nodes:
-                    self.graph.nodes[nid]["pos"] = [mp[0] - panel.x - dx,
-                                                    mp[1] - panel.y - dy]
-            if self.drag_param is not None:
-                nid, pname = self.drag_param
-                if nid in self.graph.nodes:
-                    node = self.graph.nodes[nid]
-                    inputs, _ = self.editor.engine_mod.NODE_DEFS[node["type"]]
-                    j = list(node["params"]).index(pname)
-                    rr = self._param_row(nid, j, panel)
-                    lo, hi = self.editor.engine_mod.PARAM_RANGES.get(pname, (0, 1))
-                    f = min(max((mp[0] - (rr.x + 46)) / max(rr.width - 52, 1), 0.0), 1.0)
-                    node["params"][pname] = lo + f * (hi - lo)
-                    self.apply(draft=True)
+            if not self.minimized:
+                panel = self.content_rect(w, h)
+                if self.drag_node is not None:
+                    nid, dx, dy = self.drag_node
+                    if nid in self.graph.nodes:
+                        self.graph.nodes[nid]["pos"] = [mp[0] - panel.x - dx,
+                                                        mp[1] - panel.y - dy]
+                if self.drag_param is not None:
+                    nid, pname = self.drag_param
+                    if nid in self.graph.nodes:
+                        node = self.graph.nodes[nid]
+                        inputs, _ = self.editor.engine_mod.NODE_DEFS[node["type"]]
+                        j = list(node["params"]).index(pname)
+                        rr = self._param_row(nid, j, panel)
+                        lo, hi = self.editor.engine_mod.PARAM_RANGES.get(pname, (0, 1))
+                        f = min(max((mp[0] - (rr.x + 46)) / max(rr.width - 52, 1), 0.0), 1.0)
+                        node["params"][pname] = lo + f * (hi - lo)
+                        self.apply(draft=True)
         else:
-            if self.drag_link is not None:
-                self._finish_link(mp, panel)
+            if self.drag_link is not None and not self.minimized:
+                self._finish_link(mp, self.content_rect(w, h))
             if self.drag_param is not None:
                 self.apply(draft=False)  # full-res bake once the drag releases
             self.drag_node = self.drag_param = self.drag_link = self.drag_title = None
@@ -1988,8 +2097,7 @@ class MaterialEditorUI:
     def draw(self, surf) -> None:
         import pygame
         w, h = surf.get_size()
-        outer = self.rect(w, h)
-        panel = self.content_rect(w, h)
+        outer = self.outer_rect(w, h)
         pygame.draw.rect(surf, (18, 20, 25), outer)
         pygame.draw.rect(surf, PANEL_EDGE, outer, 1)
         title_bar = pygame.Rect(outer.x, outer.y, outer.width, PANEL_TITLE_H)
@@ -2004,7 +2112,14 @@ class MaterialEditorUI:
         pygame.draw.rect(surf, (60, 34, 34), close, border_radius=3)
         x_lab = self.editor.font_small.render("X", True, (230, 160, 160))
         surf.blit(x_lab, (close.x + 4, close.y + 1))
+        minimize = pygame.Rect(outer.right - 44, outer.y + 2, 16, 16)
+        pygame.draw.rect(surf, (40, 44, 54), minimize, border_radius=3)
+        m_lab = self.editor.font_small.render("-", True, TEXT)
+        surf.blit(m_lab, (minimize.x + 5, minimize.y - 1))
+        if self.minimized:
+            return
 
+        panel = self.content_rect(w, h)
         for t, r in self._palette_rects(panel):
             hov = r.collidepoint(pygame.mouse.get_pos())
             pygame.draw.rect(surf, HOVER_BG if hov else (30, 33, 40), r,

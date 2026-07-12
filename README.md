@@ -53,22 +53,42 @@ rings), scale (drag axis handles, or the center square for uniform scale).
 
 **File**: New Scene, Open Scene..., Save, Save As..., Import FBX..., Exit.
 **Edit**: Duplicate, Delete, Focus Selection — the same code path the
-hotkeys use. **Window**: show/hide the Outliner, Details, and Content
-Browser panels (checkmarked when visible), open **Settings...**, or
-**Reset Layout** to restore the default arrangement.
+hotkeys use. **Window**: the full panel registry — show/hide the Outliner,
+Details, and Content Browser (checkmarked when visible; reopening one here
+round-trips with closing it via its title-bar [x]), toggle the **Material
+Editor** for the current selection (checkmarked while open; status message
+"select a mesh entity first" if the selection isn't a mesh), open
+**Settings...**, or **Reset Layout** to restore the default arrangement.
 
 #### Dockable panels
 
 The Outliner, Details, and Content Browser are panels with a draggable
-18px title bar. Drop one within 48px of the left or right edge to dock it
-there (260px wide, panels docked to the same side split the vertical space
-between them evenly); the Content Browser docks to the bottom edge instead
-(118px tall, full width between any side docks). Drop anywhere else and the
-panel floats at that position, keeping its current size. Floating panels
-draw on top of the viewport and the clicked one comes to front. The
-material editor is floating-only, with the same draggable title bar.
-Layout, visibility, and floating positions persist to `settings.json`
-(per-user, gitignored) and reload on the next launch.
+18px title bar carrying two small buttons at its right end: **[–] minimize**
+and **[x] close** (hover-highlighted, hit-tested through the same rect
+helper used to draw them). **[x]** hides the panel (`Window` menu
+checkmark clears; reopen it from there). **[–]** collapses the panel to
+just its title bar — a docked minimized panel occupies only that strip in
+its dock stack and the freed height redistributes evenly to the other
+panels still docked on that side; if *every* panel on a side dock is
+minimized, the whole dock shrinks to a narrow title-bar-only column and the
+viewport widens to fill the freed space. A floating minimized panel draws
+only its title bar over the viewport. Minimized panel content never draws
+or hits testing while collapsed. Clicking [–] again restores it. Dragging a
+minimized panel's title bar still moves and docks/floats it normally.
+
+Drop a panel within 48px of the left or right edge to dock it there (260px
+wide, panels docked to the same side split the vertical space between them
+evenly); the Content Browser docks to the bottom edge instead (118px tall,
+full width between any side docks). Drop anywhere else and the panel floats
+at that position, keeping its current size. Floating panels draw on top of
+the viewport and the clicked one comes to front. The material editor is
+floating-only, with the same draggable title bar and the same [–]/[x]
+buttons (minimizing collapses it to its title bar; closing it clears its
+`Window > Material Editor` checkmark). **Reset Layout** restores the
+default docking, makes every panel visible, clears every minimized state,
+and clears floating positions in one click — no leftovers. Layout,
+visibility, minimized state, and floating positions all persist to
+`settings.json` (per-user, gitignored) and reload on the next launch.
 
 #### Settings (Window > Settings)
 
