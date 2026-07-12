@@ -47,7 +47,8 @@ void main() { fragColor = texture(tex, v_uv); }
 class Engine:
     def __init__(self, width: int = 1280, height: int = 720, title: str = "PyEngine",
                  max_fps: int = 120, fixed_dt: float = 1.0 / 60.0, splash: bool = True,
-                 api: str = "auto", gpu: "str | bool | None" = None):
+                 api: str = "auto", gpu: "str | bool | None" = None,
+                 fullscreen: bool = False):
         """`api`: "auto" (try "gl", falling back toward "cpu"; headless/dummy
         driver always forces "cpu"), "cpu" (software only), "gl" (OpenGL 3.3
         via moderngl), "dx12" / "vulkan" (WebGPU via wgpu-py, see
@@ -68,6 +69,9 @@ class Engine:
         os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
         pygame.init()
         self._size = (width, height)
+        self._windowed_size = (width, height)  # remembered across a fullscreen toggle
+        self.fullscreen = False
+        self._fullscreen_pref = fullscreen  # applied once the real window opens
         pygame.display.set_caption(title)
         self.input = InputManager()
         self.renderer = Renderer()
@@ -164,19 +168,28 @@ class Engine:
         if want == "gl":
             try:
                 self._create_gpu_window()
+                self._apply_fullscreen_pref()
                 return
             except Exception as ex:
                 print(f"GPU renderer unavailable ({ex!r}); "
                       f"falling back to the software renderer.")
                 self.gl_renderer = None
 
-        self.screen = pygame.display.set_mode(self._size)
+        self.screen = pygame.display.set_mode(self._size, pygame.RESIZABLE)
+        self._apply_fullscreen_pref()
+
+    def _apply_fullscreen_pref(self) -> None:
+        """Applied once after the real window opens (fullscreen= at __init__,
+        or a saved settings.json preference the app chooses to honor)."""
+        if self._fullscreen_pref and not self.fullscreen:
+            self.set_fullscreen(True)
 
     def _create_wgpu_window(self, backend: str) -> None:
         from .wgpu_renderer import WgpuRenderer
 
         self.wgpu_renderer = WgpuRenderer(backend)  # raises -> caller falls back to gl/cpu
-        self.screen = pygame.display.set_mode(self._size)  # plain window, no OPENGL flag
+        self.screen = pygame.display.set_mode(self._size, pygame.RESIZABLE)  # plain window
+        self._apply_fullscreen_pref()
 
     def _create_gpu_window(self) -> None:
         import moderngl
@@ -184,7 +197,7 @@ class Engine:
         from .gl_renderer import GLRenderer
 
         self._gl_window_attribs()
-        pygame.display.set_mode(self._size, pygame.OPENGL | pygame.DOUBLEBUF)
+        pygame.display.set_mode(self._size, pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
         ctx = moderngl.create_context()
         ctx.viewport = (0, 0, self._size[0], self._size[1])
         self._gl_ctx = ctx
@@ -231,12 +244,14 @@ class Engine:
         self._ui_vao.render(moderngl.TRIANGLES)
         ctx.disable(moderngl.BLEND)
 
-    def set_resolution(self, width: int, height: int) -> None:
-        """Resize the window (e.g. from an editor Settings panel).
+    def _rebuild_window(self, size: tuple[int, int], fullscreen: bool) -> None:
+        """Re-open the window at `size`, in or out of fullscreen.
 
-        The renderer's deferred-pass cache and HUD text cache key off the
-        current screen size already, so they self-invalidate next frame —
-        no further bookkeeping needed here. In GL mode the window is
+        Shared by `set_resolution`, `set_fullscreen`, and the VIDEORESIZE
+        handler in `run()` so all three window-size paths behave the same
+        way. The renderer's deferred-pass cache and HUD text cache key off
+        the current screen size already, so they self-invalidate next frame
+        -- no further bookkeeping needed here. In GL mode the window is
         re-created with the GL attributes/flags and the UI overlay surface
         + texture are rebuilt at the new size; the GL viewport is set
         explicitly afterward since SDL does not update it on a resize (nor,
@@ -245,15 +260,39 @@ class Engine:
         re-creating it is enough -- `WgpuRenderer._ensure_size` rebuilds its
         size-dependent offscreen textures lazily on the next `render()` call.
         """
-        self._size = (width, height)
+        self._size = size
+        extra = pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE
         if self.gl_renderer is not None:
             self._gl_window_attribs()
-            pygame.display.set_mode(self._size, pygame.OPENGL | pygame.DOUBLEBUF)
-            self._gl_ctx.viewport = (0, 0, width, height)
+            pygame.display.set_mode(self._size, pygame.OPENGL | pygame.DOUBLEBUF | extra)
+            self._gl_ctx.viewport = (0, 0, size[0], size[1])
             self.screen = pygame.Surface(self._size, pygame.SRCALPHA)
             self._resize_ui_texture()
         else:
-            self.screen = pygame.display.set_mode(self._size)
+            self.screen = pygame.display.set_mode(self._size, extra)
+
+    def set_resolution(self, width: int, height: int) -> None:
+        """Resize the window (e.g. from an editor Settings panel)."""
+        if not self.fullscreen:
+            self._windowed_size = (width, height)
+        self._rebuild_window((width, height), self.fullscreen)
+
+    def set_fullscreen(self, enabled: bool) -> None:
+        """Toggle OS fullscreen; the layout adapts to whatever resolution
+        that ends up being (see editor.py's proportional dock sizing) --
+        this call only owns window/context lifecycle, not panel layout."""
+        if enabled == self.fullscreen:
+            return
+        if enabled:
+            self._windowed_size = self._size
+            # NOT pygame.display.Info() -- that reports the *current window's*
+            # size once a mode is set, not the monitor's native resolution;
+            # get_desktop_sizes() is independent of window state.
+            size = pygame.display.get_desktop_sizes()[0]
+        else:
+            size = self._windowed_size
+        self.fullscreen = enabled
+        self._rebuild_window(size, enabled)
 
     def run(self, scene, camera, max_frames: int | None = None,
             screenshot_path: str | None = None, overlay=None) -> None:
@@ -281,6 +320,14 @@ class Engine:
                 elif e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
                     if not (self.esc_handler is not None and self.esc_handler()):
                         running = False
+                elif e.type == pygame.VIDEORESIZE and not self.fullscreen:
+                    # dragging the OS window edge -- SDL already resized the
+                    # surface but GL/wgpu targets need to follow explicitly
+                    # (see _rebuild_window); ignored in fullscreen since SDL
+                    # can send a spurious VIDEORESIZE during that transition
+                    if (e.w, e.h) != self._size:
+                        self._windowed_size = (e.w, e.h)
+                        self._rebuild_window((e.w, e.h), False)
             self.input.process(events)
 
             now = time.perf_counter()

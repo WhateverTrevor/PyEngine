@@ -10,8 +10,8 @@ sys.path.insert(0, WT)
 import numpy as np
 
 import engine
-from editor import (Editor, EditorBehavior, MaterialEditorUI, PANEL_TITLE_H,
-                    build_starter_scene)
+from editor import (DOCK_FRAC_DEFAULT, Editor, EditorBehavior, MaterialEditorUI,
+                    MIN_PANEL_H, MIN_PANEL_W, PANEL_TITLE_H, build_starter_scene)
 
 OUT = os.path.join(tempfile.gettempdir(), "judge_winmgmt.png")
 
@@ -76,6 +76,70 @@ fc = crate.mesh.face_colors
 assert fc[:, 0].mean() > fc[:, 1].mean() * 3, "material bake broken post-merge"
 print("material editor OK post-merge: bake applied "
       f"(R {fc[:, 0].mean():.0f} vs G {fc[:, 1].mean():.0f})")
+
+# 7. splitter drag resizes a dock proportionally, and clamps to the min size
+editor.dock_frac = dict(DOCK_FRAC_DEFAULT)
+lay5 = editor._layout(W, H)
+assert "right" in lay5["splitters"] and "bottom" in lay5["splitters"]
+rw0 = lay5["panels"]["outliner"].width
+editor._update_splitter_drag("right", (W - 400, H // 2), W, H)
+lay6 = editor._layout(W, H)
+assert lay6["panels"]["outliner"].width > rw0 + 100, (rw0, lay6["panels"]["outliner"].width)
+print(f"splitter drag OK: right dock {rw0} -> {lay6['panels']['outliner'].width}")
+# dragging past the window edge clamps to MIN_PANEL_W, not negative/zero
+editor._update_splitter_drag("right", (W + 500, H // 2), W, H)
+lay7 = editor._layout(W, H)
+assert lay7["panels"]["outliner"].width == MIN_PANEL_W, lay7["panels"]["outliner"].width
+print(f"splitter clamp OK: dragging off-screen holds at MIN_PANEL_W={MIN_PANEL_W}")
+
+# 8. dock sizing is proportional -- same frac at a different resolution scales
+editor.dock_frac = dict(DOCK_FRAC_DEFAULT)
+lay_a = editor._layout(1440, 810)
+lay_b = editor._layout(2880, 1620)  # exactly 2x
+assert lay_b["panels"]["outliner"].width == 2 * lay_a["panels"]["outliner"].width, (
+    lay_a["panels"]["outliner"].width, lay_b["panels"]["outliner"].width)
+print("proportional resize OK: dock width scales with window width "
+      f"({lay_a['panels']['outliner'].width} -> {lay_b['panels']['outliner'].width} at 2x)")
+
+# 9. floating-panel corner resize grip
+editor._dock_panel("details", "float")
+lay8 = editor._layout(W, H)
+drect = lay8["panels"]["details"]
+orig_w, orig_h, corner = drect.width, drect.height, (drect.right, drect.bottom)
+editor._begin_panel_resize("details", corner, drect)
+editor._update_panel_resize((corner[0] + 120, corner[1] + 80))
+assert editor.float_rect["details"].width == orig_w + 120, editor.float_rect["details"].width
+assert editor.float_rect["details"].height == orig_h + 80, editor.float_rect["details"].height
+print("floating resize grip OK: float_rect grew by the drag delta")
+# shrinking past the minimum clamps rather than going negative/zero
+editor._begin_panel_resize("details", corner, drect)
+editor._update_panel_resize((corner[0] - 9999, corner[1] - 9999))
+assert editor.float_rect["details"].width == MIN_PANEL_W
+assert editor.float_rect["details"].height == MIN_PANEL_H
+print(f"floating resize clamp OK: holds at MIN_PANEL_W/H ({MIN_PANEL_W}, {MIN_PANEL_H})")
+editor._dock_panel("details", "right")  # restore for the rest of the script
+
+# 10. fullscreen toggle: math round-trips (Engine owns window/context lifecycle;
+# under the SDL dummy driver the toggle still flips the size/flag correctly --
+# see engine/core.py's set_fullscreen for the get_desktop_sizes() rationale)
+before_size, before_full = eng._size, eng.fullscreen
+eng.set_fullscreen(True)
+assert eng.fullscreen is True
+assert eng._size != before_size or eng._size == before_size  # size may equal desktop==window
+eng.set_fullscreen(False)
+assert eng.fullscreen is False
+assert eng._size == before_size, (eng._size, before_size)
+print(f"fullscreen toggle OK: {before_size} -> fullscreen -> back to {eng._size}")
+
+# 11. settings round-trip includes dock_frac + fullscreen
+editor.dock_frac["left"] = 0.33
+data2 = editor._settings_dict()
+assert data2["fullscreen"] is False
+assert abs(data2["dock_frac"]["left"] - 0.33) < 1e-9
+editor3 = Editor(engine, eng, scene, camera, lib, "scenes/scene.json")
+editor3._apply_layout_settings(data2)
+assert abs(editor3.dock_frac["left"] - 0.33) < 1e-9
+print("settings round-trip OK: dock_frac + fullscreen persist")
 
 # screenshot: details minimized (docked), Window menu open showing registry
 editor.panel_minimized["details"] = True

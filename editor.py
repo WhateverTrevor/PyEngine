@@ -32,9 +32,16 @@ MENU_H = 26
 PANEL_TITLE_H = 18
 EDGE_SNAP = 48
 
-OUTLINER_W = 260          # docked left/right panel width
+OUTLINER_W = 260          # docked left/right panel width (factory default)
 MIN_DOCK_W = 150          # side-dock width when every panel on it is minimized
-BROWSER_H = 118           # docked bottom panel height
+BROWSER_H = 118           # docked bottom panel height (factory default)
+MIN_PANEL_W = 150         # smallest a dragged side-dock or floating panel can go
+MIN_PANEL_H = 90          # smallest a dragged floating panel or bottom dock can go
+SPLITTER_PX = 6           # hit-test/hover band around a dock splitter, in pixels
+_LAYOUT_REF_W, _LAYOUT_REF_H = 1440, 810  # resolution the factory fractions assume
+DOCK_FRAC_DEFAULT = {"left": OUTLINER_W / _LAYOUT_REF_W,
+                     "right": OUTLINER_W / _LAYOUT_REF_W,
+                     "bottom": BROWSER_H / _LAYOUT_REF_H}
 DETAILS_H = 322           # default floating height for the details panel
 ROW_H = 20
 DETAIL_ROW_H = 24
@@ -177,6 +184,7 @@ class Editor:
     _MENU_HOTKEYS = {
         "File": {"Save": "Ctrl+S"},
         "Edit": {"Duplicate": "Ctrl+D", "Delete": "Del", "Focus Selection": "F"},
+        "Window": {"Fullscreen": "F11"},
     }
 
     def __init__(self, engine_mod, eng, scene, camera, lib, scene_path):
@@ -213,6 +221,11 @@ class Editor:
         self.panel_minimized = {"outliner": False, "details": False, "browser": False}
         self.float_rect = {}        # panel id -> pygame.Rect, used only while floating
         self.panel_drag = None      # {"id","dx","dy","w","h"} while dragging a title bar
+        self.dock_frac = dict(DOCK_FRAC_DEFAULT)  # side -> fraction of window w/h;
+                                     # proportional so a window resize/fullscreen
+                                     # toggle rescales docks instead of freezing pixels
+        self.splitter_drag = None   # "left" / "right" / "bottom" while dragging a splitter
+        self.panel_resize = None    # {"id","w","h","mx","my"} while resizing a float corner
 
         # ---- menu bar / dialogs ----
         self.open_menu = None       # name of the open dropdown, or None
@@ -245,6 +258,17 @@ class Editor:
     def _all_minimized(self, ids) -> bool:
         return len(ids) > 0 and all(self.panel_minimized.get(p, False) for p in ids)
 
+    def _dock_side_w(self, side, w):
+        """Docked left/right width from the stored fraction -- proportional
+        to the window, clamped to a sane range so it can't be dragged (or
+        resized into) unusably small/huge."""
+        px = self.dock_frac.get(side, DOCK_FRAC_DEFAULT[side]) * w
+        return int(max(MIN_PANEL_W, min(px, w * 0.6)))
+
+    def _dock_bottom_h(self, h):
+        px = self.dock_frac.get("bottom", DOCK_FRAC_DEFAULT["bottom"]) * h
+        return int(max(MIN_PANEL_H, min(px, h * 0.6)))
+
     def _layout(self, w, h):
         import pygame
         menu = pygame.Rect(0, 0, w, MENU_H)
@@ -253,13 +277,16 @@ class Editor:
         bottom_ids = [p for p in self.dock_order["bottom"] if self.panel_visible.get(p, True)]
         left_w = 0
         if left_ids:
-            left_w = MIN_DOCK_W if self._all_minimized(left_ids) else OUTLINER_W
+            left_w = MIN_DOCK_W if self._all_minimized(left_ids) else self._dock_side_w("left", w)
         right_w = 0
         if right_ids:
-            right_w = MIN_DOCK_W if self._all_minimized(right_ids) else OUTLINER_W
+            right_w = MIN_DOCK_W if self._all_minimized(right_ids) else self._dock_side_w("right", w)
+        if left_w + right_w > max(0, w - MIN_PANEL_W):  # keep a usable viewport strip
+            scale = max(0, w - MIN_PANEL_W) / max(1, left_w + right_w)
+            left_w, right_w = int(left_w * scale), int(right_w * scale)
         bottom_h = 0
         if bottom_ids:
-            bottom_h = PANEL_TITLE_H if self._all_minimized(bottom_ids) else BROWSER_H
+            bottom_h = PANEL_TITLE_H if self._all_minimized(bottom_ids) else self._dock_bottom_h(h)
         top = MENU_H
         stack_bottom = h - bottom_h
         panels = {}
@@ -307,8 +334,22 @@ class Editor:
 
         viewport = pygame.Rect(left_w, top, max(0, w - left_w - right_w),
                                max(0, stack_bottom - top))
+
+        splitters = {}
+        half = SPLITTER_PX // 2
+        if left_ids and not self._all_minimized(left_ids):
+            splitters["left"] = pygame.Rect(left_w - half, top, SPLITTER_PX,
+                                            max(0, stack_bottom - top))
+        if right_ids and not self._all_minimized(right_ids):
+            splitters["right"] = pygame.Rect(w - right_w - half, top, SPLITTER_PX,
+                                             max(0, stack_bottom - top))
+        if bottom_ids and not self._all_minimized(bottom_ids):
+            splitters["bottom"] = pygame.Rect(left_w, stack_bottom - half,
+                                              max(0, w - left_w - right_w), SPLITTER_PX)
+
         return {"menu": menu, "viewport": viewport, "panels": panels,
-                "left_w": left_w, "right_w": right_w, "bottom_h": bottom_h}
+                "left_w": left_w, "right_w": right_w, "bottom_h": bottom_h,
+                "splitters": splitters}
 
     def _panel_content_rect(self, pid, layout):
         import pygame
@@ -325,6 +366,13 @@ class Editor:
         close = pygame.Rect(rect.right - 18, rect.y + 3, 13, 13)
         minimize = pygame.Rect(rect.right - 34, rect.y + 3, 13, 13)
         return {"minimize": minimize, "close": close}
+
+    @staticmethod
+    def _panel_resize_handle(rect):
+        """Bottom-right resize grip rect for a floating panel — same rect
+        used for drawing the grip glyph and hit-testing the resize drag."""
+        import pygame
+        return pygame.Rect(rect.right - 10, rect.bottom - 10, 10, 10)
 
     def _hit_panel(self, pos, layout):
         panels = layout["panels"]
@@ -741,6 +789,7 @@ class Editor:
                 ("Details", lambda: self._toggle_panel("details"), True),
                 ("Content Browser", lambda: self._toggle_panel("browser"), True),
                 ("Material Editor", self._toggle_material_editor, True),
+                ("Fullscreen", self._toggle_fullscreen, True),
                 ("Settings...", self._open_settings, True),
                 ("Reset Layout", self._reset_layout, True),
             ],
@@ -757,6 +806,8 @@ class Editor:
             return self.panel_visible.get(pid, True)
         if label == "Material Editor":
             return self.mat_ui is not None
+        if label == "Fullscreen":
+            return self.eng.fullscreen
         return None
 
     def _dropdown_geom(self, name, w):
@@ -840,6 +891,66 @@ class Editor:
             self._float_rect_for(pid, w, h)  # clamp on-screen
         self.panel_drag = None
 
+    # ---- splitter drag (docked panel resize) ----
+    def _update_splitter_drag(self, side, mp, w, h) -> None:
+        """Drag updates `dock_frac[side]` directly (as a fraction of the
+        *current* window size) so the dock stays proportional across a
+        later resize/fullscreen toggle instead of freezing at this pixel
+        width. Clamped the same way `_dock_side_w`/`_dock_bottom_h` clamp on
+        read, so the splitter can't be dragged past the min/max it enforces."""
+        if side == "left":
+            px = max(MIN_PANEL_W, min(mp[0], int(w * 0.6)))
+            self.dock_frac["left"] = px / w
+        elif side == "right":
+            px = max(MIN_PANEL_W, min(w - mp[0], int(w * 0.6)))
+            self.dock_frac["right"] = px / w
+        elif side == "bottom":
+            px = max(MIN_PANEL_H, min(h - mp[1], int(h * 0.6)))
+            self.dock_frac["bottom"] = px / h
+
+    # ---- floating-panel corner resize ----
+    def _begin_panel_resize(self, pid, mp, rect) -> None:
+        self.panel_resize = {"id": pid, "w": rect.width, "h": rect.height,
+                             "mx": mp[0], "my": mp[1]}
+
+    def _update_panel_resize(self, mp) -> None:
+        import pygame
+        g = self.panel_resize
+        pid = g["id"]
+        nw = max(MIN_PANEL_W, g["w"] + (mp[0] - g["mx"]))
+        nh = max(MIN_PANEL_H, g["h"] + (mp[1] - g["my"]))
+        r = self.float_rect.get(pid)
+        if r is None:
+            r = pygame.Rect(0, 0, nw, nh)
+            self.float_rect[pid] = r
+        r.width, r.height = nw, nh
+
+    # ---- hover affordance / fullscreen ----
+    def _update_cursor(self, mp, layout) -> None:
+        import pygame
+        side = self.splitter_drag
+        if side is None:
+            for s, r in layout["splitters"].items():
+                if r.collidepoint(mp):
+                    side = s
+                    break
+        if side in ("left", "right"):
+            cursor = pygame.SYSTEM_CURSOR_SIZEWE
+        elif side == "bottom":
+            cursor = pygame.SYSTEM_CURSOR_SIZENS
+        elif self.panel_resize is not None:
+            cursor = pygame.SYSTEM_CURSOR_SIZENWSE
+        else:
+            cursor = pygame.SYSTEM_CURSOR_ARROW
+        try:  # the SDL dummy video driver (headless benchmarking/tests) has
+            pygame.mouse.set_cursor(cursor)  # no real cursor to set
+        except pygame.error:
+            pass
+
+    def _toggle_fullscreen(self) -> None:
+        self.eng.set_fullscreen(not self.eng.fullscreen)
+        self._save_settings()
+
     def _toggle_panel(self, pid) -> None:
         self.panel_visible[pid] = not self.panel_visible.get(pid, True)
         self._save_settings()
@@ -865,6 +976,7 @@ class Editor:
         self.panel_visible = {"outliner": True, "details": True, "browser": True}
         self.panel_minimized = {"outliner": False, "details": False, "browser": False}
         self.float_rect = {}
+        self.dock_frac = dict(DOCK_FRAC_DEFAULT)
         self._save_settings()
 
     # ---- settings dialog ----
@@ -977,18 +1089,23 @@ class Editor:
 
     # ---- settings.json persistence ----
     def _settings_dict(self) -> dict:
-        w, h = self.eng.screen.get_size()
+        # the *windowed* size, not the live one -- while fullscreen, the live
+        # size is just the desktop resolution, and saving that would make
+        # "un-fullscreen" on next launch pointless (see Engine.set_fullscreen)
+        w, h = getattr(self.eng, "_windowed_size", self.eng.screen.get_size())
         return {
             "width": w, "height": h,
             "pixel_scale": int(self.eng.renderer.render_scale),
             "max_fps": int(self.eng.max_fps),
             "api": self.api_pref,
+            "fullscreen": bool(self.eng.fullscreen),
             "panel_visible": dict(self.panel_visible),
             "panel_minimized": dict(self.panel_minimized),
             "dock_order": {side: list(ids) for side, ids in self.dock_order.items()},
             "floating": list(self.floating),
             "float_rect": {pid: [r.x, r.y, r.width, r.height]
                           for pid, r in self.float_rect.items()},
+            "dock_frac": dict(self.dock_frac),
         }
 
     def _save_settings(self) -> None:
@@ -1018,6 +1135,11 @@ class Editor:
         for pid, v in data.get("float_rect", {}).items():
             if pid in valid and isinstance(v, list) and len(v) == 4:
                 self.float_rect[pid] = pygame.Rect(*v)
+        df = data.get("dock_frac", {})
+        for side in ("left", "right", "bottom"):
+            v = df.get(side)
+            if isinstance(v, (int, float)) and 0.02 <= v <= 0.8:
+                self.dock_frac[side] = float(v)
 
     # ---- File / Edit menu actions (shared with hotkeys) ----
     def _duplicate_selected(self) -> None:
@@ -1196,6 +1318,9 @@ class Editor:
         if self.status[1] > 0:
             self.status = (self.status[0], self.status[1] - dt)
 
+        if inp.pressed(pygame.K_F11):
+            self._toggle_fullscreen()
+
         if self.mat_ui is not None:  # node editor captures all editor input
             self.mat_ui.update(engine, dt)
             return
@@ -1205,6 +1330,7 @@ class Editor:
 
         layout = self._layout(w, h)
         looking = self.fly is not None and self.fly.looking
+        self._update_cursor(mp, layout)
 
         if inp.wheel and not looking:
             target = self._hit_panel(mp, layout)
@@ -1216,7 +1342,14 @@ class Editor:
                 self.browser_scroll = max(0, self.browser_scroll - int(inp.wheel) * 70)
 
         if inp.mouse_button_pressed(1):
-            if not self._handle_menu_click(mp, w):
+            hit_splitter = None
+            for side, r in layout["splitters"].items():
+                if r.collidepoint(mp):
+                    hit_splitter = side
+                    break
+            if hit_splitter is not None:
+                self.splitter_drag = hit_splitter
+            elif not self._handle_menu_click(mp, w):
                 target = self._hit_panel(mp, layout)
                 if target is not None:
                     if target in self.floating:
@@ -1234,8 +1367,12 @@ class Editor:
                         else:
                             self._begin_panel_drag(target, mp, rect)
                     elif not self.panel_minimized.get(target, False):
-                        content = self._panel_content_rect(target, layout)
-                        self._route_panel_click(target, mp, content)
+                        if target in self.floating \
+                                and self._panel_resize_handle(rect).collidepoint(mp):
+                            self._begin_panel_resize(target, mp, rect)
+                        else:
+                            content = self._panel_content_rect(target, layout)
+                            self._route_panel_click(target, mp, content)
                 elif layout["viewport"].collidepoint(mp):
                     self.active_slider = None
                     if not self._try_grab_gizmo(mp, w, h):
@@ -1243,6 +1380,20 @@ class Editor:
 
         if self.panel_drag is not None and not inp.mouse_held(1):
             self._finish_panel_drag(mp, w, h)
+
+        if self.splitter_drag is not None:
+            if inp.mouse_held(1):
+                self._update_splitter_drag(self.splitter_drag, mp, w, h)
+            else:
+                self.splitter_drag = None
+                self._save_settings()
+
+        if self.panel_resize is not None:
+            if inp.mouse_held(1):
+                self._update_panel_resize(mp)
+            else:
+                self.panel_resize = None
+                self._save_settings()
 
         # gizmo drag
         if self.gizmo_drag is not None:
@@ -1453,6 +1604,12 @@ class Editor:
                 layout["left_w"], h - layout["bottom_h"],
                 w - layout["left_w"] - layout["right_w"], layout["bottom_h"]))
 
+        mp = eng.input.mouse_pos
+        for side, r in layout["splitters"].items():
+            hov = self.splitter_drag == side or r.collidepoint(mp)
+            if hov:
+                pygame.draw.rect(surf, ACCENT, r)
+
         panels = dict(layout["panels"])
         drag_pid = self.panel_drag["id"] if self.panel_drag else None
         if drag_pid is not None and drag_pid in panels:
@@ -1529,6 +1686,14 @@ class Editor:
             self._draw_details(surf, content)
         elif pid == "browser":
             self._draw_browser(surf, content)
+        if pid in self.floating:
+            grip = self._panel_resize_handle(rect)
+            corner = (ACCENT if self.panel_resize is not None
+                                and self.panel_resize["id"] == pid else PANEL_EDGE)
+            for i in range(3):
+                off = 3 + i * 3
+                pygame.draw.line(surf, corner, (grip.right - off, grip.bottom),
+                                 (grip.right, grip.bottom - off))
 
     def _draw_menu_bar(self, surf, w) -> None:
         import pygame
@@ -2230,6 +2395,7 @@ def main() -> None:
     pixel_scale = (args.pixel_scale if args.pixel_scale is not None
                    else settings.get("pixel_scale", 4))
     max_fps = settings.get("max_fps", 120)
+    fullscreen = bool(settings.get("fullscreen", False)) and not args.headless
 
     api_mode = "auto"
     settings_api = settings.get("api")
@@ -2244,7 +2410,8 @@ def main() -> None:
     if args.headless:
         api_mode = "cpu"  # the SDL dummy driver has no GL surface / wgpu window to attach to
 
-    eng = engine.Engine(width, height, title="PyEngine Editor", max_fps=max_fps, api=api_mode)
+    eng = engine.Engine(width, height, title="PyEngine Editor", max_fps=max_fps,
+                        api=api_mode, fullscreen=fullscreen)
     eng.renderer.render_scale = max(1, pixel_scale)
     eng.loading_step("loading asset library", 0.12)
     lib = engine.AssetLibrary(os.path.join(BASE_DIR, "assets"))
