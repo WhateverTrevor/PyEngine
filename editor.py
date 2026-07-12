@@ -45,9 +45,14 @@ DOCK_FRAC_DEFAULT = {"left": OUTLINER_W / _LAYOUT_REF_W,
 DETAILS_H = 322           # default floating height for the details panel
 ROW_H = 20
 DETAIL_ROW_H = 24
-DETAILS_ROWS_TOP = 34     # y-offset (within a panel's content rect) of row 0
+TRANSFORM_ROWS_TOP = 26   # y-offset of the Position/Rotation/Scale grid
+TRANSFORM_ROW_H = 20
+TRANSFORM_BLOCK_H = TRANSFORM_ROWS_TOP + 3 * TRANSFORM_ROW_H + 6  # + gap before rows
+DETAILS_ROWS_TOP = TRANSFORM_BLOCK_H  # y-offset (within content rect) of row 0,
+                          # i.e. below the transform grid that's always shown
 TILE_W, TILE_H, ICON = 84, 100, 64
 BROWSER_TOPBAR_H = 26     # content-browser top bar (New Folder / Import)
+VIEWPORT_TOOLBAR_H = 26   # slim bar docked at the top of the viewport rect
 TREE_ROW_H = 18           # content-browser folder-tree row height
 TREE_W = 130              # factory folder-tree column width
 _NO_RENAME = object()     # sentinel for "not renaming" -- distinct from every
@@ -218,6 +223,10 @@ class Editor:
         self.active_slider = None   # index into _details_rows while dragging
         self.gizmo_drag = None      # active gizmo drag state dict
         self.gizmo_mode = "translate"  # W/E/R select translate / rotate / scale
+        self.gizmo_space = "world"  # translate axes: "world" or "local" (viewport toolbar)
+        self.editing_field = None   # (row_label, axis) of the transform field being
+                                     # typed into, e.g. ("Position", "x"), or None
+        self.edit_buffer = ""       # editable text while editing_field is set
         self.mat_ui = None          # open MaterialEditorUI, or None
         self.status = ("", 0.0)     # transient message near the content browser
         self.save_flash = 0.0
@@ -410,7 +419,11 @@ class Editor:
             drop, _rows = self._dropdown_geom(self.open_menu, w)
             if drop.collidepoint(pos):
                 return True
-        return self._hit_panel(pos, self._layout(w, h)) is not None
+        layout = self._layout(w, h)
+        if layout["viewport"].collidepoint(pos) \
+                and self._viewport_toolbar_rect(layout["viewport"]).collidepoint(pos):
+            return True
+        return self._hit_panel(pos, layout) is not None
 
     def _outliner_rows(self):
         return [e for e in self.scene.entities
@@ -457,10 +470,111 @@ class Editor:
             for key in self.engine_mod.assets._FOG_VOLUME_PROPS:
                 setattr(dst.fog_volume, key, getattr(src.fog_volume, key))
 
+    # ---- viewport toolbar: mode buttons + world/local toggle, declarative so
+    # future controls (snapping, more modes, ...) just append to the list ----
+    def _set_gizmo_mode(self, mode) -> None:
+        self.gizmo_mode, self.gizmo_drag = mode, None
+
+    def _toggle_gizmo_space(self) -> None:
+        self.gizmo_space = "local" if self.gizmo_space == "world" else "world"
+
+    def _toolbar_buttons(self):
+        return [
+            {"id": "translate", "label": "Translate",
+             "active": lambda: self.gizmo_mode == "translate",
+             "action": lambda: self._set_gizmo_mode("translate")},
+            {"id": "rotate", "label": "Rotate",
+             "active": lambda: self.gizmo_mode == "rotate",
+             "action": lambda: self._set_gizmo_mode("rotate")},
+            {"id": "scale", "label": "Scale",
+             "active": lambda: self.gizmo_mode == "scale",
+             "action": lambda: self._set_gizmo_mode("scale")},
+            {"id": "space", "label": lambda: "World" if self.gizmo_space == "world"
+                                     else "Local", "group_gap": True,
+             "active": lambda: self.gizmo_space == "local",
+             "action": self._toggle_gizmo_space},
+        ]
+
+    def _viewport_toolbar_rect(self, viewport_rect):
+        import pygame
+        return pygame.Rect(viewport_rect.x, viewport_rect.y,
+                           viewport_rect.width, VIEWPORT_TOOLBAR_H)
+
+    def _toolbar_button_rects(self, toolbar_rect):
+        """[(button_def, rect), ...] -- the single source both the toolbar
+        draw call and its click router use, so they can't disagree."""
+        import pygame
+        rects = []
+        x = toolbar_rect.x + 6
+        y = toolbar_rect.y + 3
+        h = toolbar_rect.height - 6
+        for btn in self._toolbar_buttons():
+            if btn.get("group_gap"):
+                x += 10
+            label = btn["label"]() if callable(btn["label"]) else btn["label"]
+            bw = self.font_small.size(label)[0] + 16
+            rects.append((btn, pygame.Rect(x, y, bw, h)))
+            x += bw + 4
+        return rects
+
+    def _click_viewport_toolbar(self, mp, toolbar_rect) -> bool:
+        for btn, r in self._toolbar_button_rects(toolbar_rect):
+            if r.collidepoint(mp):
+                btn["action"]()
+                return True
+        return False
+
+    def _draw_viewport_toolbar(self, surf, toolbar_rect, mp) -> None:
+        import pygame
+        pygame.draw.rect(surf, PANEL_BG, toolbar_rect)
+        pygame.draw.line(surf, PANEL_EDGE, (toolbar_rect.x, toolbar_rect.bottom),
+                         (toolbar_rect.right, toolbar_rect.bottom))
+        for btn, r in self._toolbar_button_rects(toolbar_rect):
+            active = btn["active"]()
+            if active:
+                bg = ACCENT
+            elif r.collidepoint(mp):
+                bg = HOVER_BG
+            else:
+                bg = (33, 36, 44)
+            pygame.draw.rect(surf, bg, r, border_radius=4)
+            pygame.draw.rect(surf, PANEL_EDGE, r, 1, border_radius=4)
+            label = btn["label"]() if callable(btn["label"]) else btn["label"]
+            color = (20, 20, 24) if active else ACCENT
+            text = self.font_small.render(label, True, color)
+            surf.blit(text, (r.x + (r.width - text.get_width()) // 2,
+                             r.y + (r.height - text.get_height()) // 2))
+
     # ---- transform gizmo: W/E/R select translate / rotate / scale ----
     _GIZMO_AXES = (((1.0, 0.0, 0.0), (225, 85, 85)),
                    ((0.0, 1.0, 0.0), (105, 215, 105)),
                    ((0.0, 0.0, 1.0), (95, 145, 250)))
+
+    def _local_axis_defs(self, e):
+        """_GIZMO_AXES rotated into the entity's local (object) space -- the
+        same composition order as Transform.matrix()'s rotation (Ry @ Rx @ Rz),
+        computed independently so nothing here touches the memoized matrix."""
+        import numpy as np
+        r = e.transform.rotation
+        cx, sx = math.cos(r.x), math.sin(r.x)
+        cy, sy = math.cos(r.y), math.sin(r.y)
+        cz, sz = math.cos(r.z), math.sin(r.z)
+        ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+        rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+        rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+        rot = ry @ rx @ rz
+        return [((float(rot[0, i]), float(rot[1, i]), float(rot[2, i])),
+                 self._GIZMO_AXES[i][1]) for i in range(3)]
+
+    def _axis_defs(self, e):
+        """Axis set to use for the current mode/space. Local space only makes
+        sense for translate: scale already operates on transform.scale, which
+        is inherently object-local regardless of this toggle, and rotate drags
+        Euler components directly (see _update_gizmo_drag) so a world/local
+        split there would need a quaternion rewrite -- out of scope here."""
+        if self.gizmo_mode == "translate" and self.gizmo_space == "local" and e is not None:
+            return self._local_axis_defs(e)
+        return self._GIZMO_AXES
 
     def _gizmo_center(self, w, h):
         e = self.selected
@@ -479,7 +593,7 @@ class Editor:
             return []
         Vec3 = self.engine_mod.Vec3
         handles = []
-        for i, (axis, color) in enumerate(self._GIZMO_AXES):
+        for i, (axis, color) in enumerate(self._axis_defs(self.selected)):
             tip = Vec3(p.x + axis[0] * length, p.y + axis[1] * length,
                        p.z + axis[2] * length)
             s1 = self.camera.project(tip, w, h)
@@ -677,6 +791,107 @@ class Editor:
             {"kind": "toggle", "label": "enabled", "get": lambda: fv.enabled,
              "set": lambda v: setattr(fv, "enabled", v)},
         ]
+
+    # ---- details panel: editable Position/Rotation/Scale XYZ fields ----
+    _TRANSFORM_AXES = ("x", "y", "z")
+
+    def _transform_rows(self, e):
+        """[{"label", "fields": [{"get","set"}, ...3]}, ...] for Position,
+        Rotation (stored in radians, edited in degrees), and Scale. Rebuilt
+        fresh on every call (like _details_rows) so gizmo-driven live edits
+        and Vec3 objects the gizmo replaced never go stale."""
+        t = e.transform
+
+        def block(label, obj, to_ui=lambda v: v, from_ui=lambda v: v):
+            fields = []
+            for ax in self._TRANSFORM_AXES:
+                def get(obj=obj, ax=ax, to_ui=to_ui):
+                    return to_ui(getattr(obj, ax))
+
+                def set_(v, obj=obj, ax=ax, from_ui=from_ui):
+                    setattr(obj, ax, from_ui(v))
+                fields.append({"get": get, "set": set_})
+            return {"label": label, "fields": fields}
+
+        return [block("Position", t.position),
+                block("Rotation", t.rotation, math.degrees, math.radians),
+                block("Scale", t.scale)]
+
+    @staticmethod
+    def _fmt_num(v: float) -> str:
+        s = f"{v:.3f}"
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s or "0"
+
+    def _transform_row_rect(self, rect, i):
+        import pygame
+        return pygame.Rect(rect.x + 6, rect.y + TRANSFORM_ROWS_TOP + i * TRANSFORM_ROW_H,
+                           rect.width - 12, TRANSFORM_ROW_H - 2)
+
+    @staticmethod
+    def _transform_field_rects(row_rect):
+        """3 XYZ field rects within a transform row -- shared by draw + hit-test."""
+        import pygame
+        label_w = 62
+        avail = max(0, row_rect.width - label_w)
+        fw = max(20, (avail - 8) // 3)
+        rects = []
+        x = row_rect.x + label_w
+        for _ in range(3):
+            rects.append(pygame.Rect(x, row_rect.y, fw, row_rect.height))
+            x += fw + 4
+        return rects
+
+    def _begin_edit_field(self, key, value) -> None:
+        self._commit_edit_field()
+        self.editing_field = key
+        self.edit_buffer = self._fmt_num(value)
+
+    def _commit_edit_field(self) -> None:
+        """Enter, Tab, or a click elsewhere calls this. Invalid text reverts
+        (the field simply never gets written) rather than raising."""
+        if self.editing_field is None:
+            return
+        label, axis = self.editing_field
+        buf = self.edit_buffer
+        self.editing_field = None
+        e = self.selected
+        if e is None:
+            return
+        try:
+            value = float(buf)
+        except ValueError:
+            return
+        for row in self._transform_rows(e):
+            if row["label"] == label:
+                row["fields"][self._TRANSFORM_AXES.index(axis)]["set"](value)
+                self.dirty = True
+                return
+
+    def _cancel_edit_field(self) -> None:
+        self.editing_field = None
+
+    def _update_edit_field(self, inp) -> None:
+        import pygame
+        for ch in inp.text_typed:
+            if ch.isdigit() or ch in "-.":
+                self.edit_buffer += ch
+        if inp.pressed(pygame.K_BACKSPACE):
+            self.edit_buffer = self.edit_buffer[:-1]
+        if inp.pressed(pygame.K_RETURN) or inp.pressed(pygame.K_KP_ENTER) \
+                or inp.pressed(pygame.K_TAB):
+            self._commit_edit_field()
+
+    def _click_transform_fields(self, mp, rect, e) -> bool:
+        for i, row in enumerate(self._transform_rows(e)):
+            rr = self._transform_row_rect(rect, i)
+            for j, fr in enumerate(self._transform_field_rects(rr)):
+                if fr.collidepoint(mp):
+                    self._begin_edit_field((row["label"], self._TRANSFORM_AXES[j]),
+                                           row["fields"][j]["get"]())
+                    return True
+        return False
 
     def _details_rows(self):
         e = self.selected
@@ -1479,6 +1694,8 @@ class Editor:
         if self.renaming_folder is not _NO_RENAME:  # inline folder rename captures input
             self._update_rename(inp)
             return
+        if self.editing_field is not None:  # transform field text entry (see _update_edit_field)
+            self._update_edit_field(inp)
 
         layout = self._layout(w, h)
         looking = self.fly is not None and self.fly.looking
@@ -1503,6 +1720,7 @@ class Editor:
                     self.browser_scroll = max(0, self.browser_scroll - int(inp.wheel) * 70)
 
         if inp.mouse_button_pressed(1):
+            self._commit_edit_field()
             hit_splitter = None
             for side, r in layout["splitters"].items():
                 if r.collidepoint(mp):
@@ -1535,9 +1753,12 @@ class Editor:
                             content = self._panel_content_rect(target, layout)
                             self._route_panel_click(target, mp, content)
                 elif layout["viewport"].collidepoint(mp):
-                    self.active_slider = None
-                    if not self._try_grab_gizmo(mp, w, h):
-                        self._click_viewport(mp, w, h)
+                    toolbar_rect = self._viewport_toolbar_rect(layout["viewport"])
+                    if not (toolbar_rect.collidepoint(mp)
+                            and self._click_viewport_toolbar(mp, toolbar_rect)):
+                        self.active_slider = None
+                        if not self._try_grab_gizmo(mp, w, h):
+                            self._click_viewport(mp, w, h)
 
         if self.panel_drag is not None and not inp.mouse_held(1):
             self._finish_panel_drag(mp, w, h)
@@ -1584,47 +1805,54 @@ class Editor:
         if inp.pressed(pygame.K_F2) and self.selected_folder is not None:
             self._begin_rename(self.selected_folder)
 
+        # a details-panel transform field being typed into owns the keyboard:
+        # letters like w/e/r/f/c must not also fire viewport hotkeys below
+        editing_text = self.editing_field is not None
         ctrl = inp.held(pygame.K_LCTRL) or inp.held(pygame.K_RCTRL)
-        if inp.pressed(pygame.K_DELETE):
-            self._delete_selected()
-        if ctrl and inp.pressed(pygame.K_d):
-            self._duplicate_selected()
-        if ctrl and inp.pressed(pygame.K_s):
-            self._save_scene()
-        if inp.pressed(pygame.K_f) and not looking:
-            self._focus_selection()
-        if inp.pressed(pygame.K_c) and self.fly is not None:
-            self.fly.collide = not self.fly.collide
-        if not looking:
-            if inp.pressed(pygame.K_w):
-                self.gizmo_mode, self.gizmo_drag = "translate", None
-            elif inp.pressed(pygame.K_e):
-                self.gizmo_mode, self.gizmo_drag = "rotate", None
-            elif inp.pressed(pygame.K_r):
-                self.gizmo_mode, self.gizmo_drag = "scale", None
-        if inp.pressed(pygame.K_m) and self.selected is not None \
-                and (self.selected.mesh is not None or self.selected.environment is not None):
-            self.mat_ui = MaterialEditorUI(self, self.selected)
+        if not editing_text:
+            if inp.pressed(pygame.K_DELETE):
+                self._delete_selected()
+            if ctrl and inp.pressed(pygame.K_d):
+                self._duplicate_selected()
+            if ctrl and inp.pressed(pygame.K_s):
+                self._save_scene()
+            if inp.pressed(pygame.K_f) and not looking:
+                self._focus_selection()
+            if inp.pressed(pygame.K_c) and self.fly is not None:
+                self.fly.collide = not self.fly.collide
+            if not looking:
+                if inp.pressed(pygame.K_w):
+                    self._set_gizmo_mode("translate")
+                elif inp.pressed(pygame.K_e):
+                    self._set_gizmo_mode("rotate")
+                elif inp.pressed(pygame.K_r):
+                    self._set_gizmo_mode("scale")
+            if inp.pressed(pygame.K_m) and self.selected is not None \
+                    and (self.selected.mesh is not None or self.selected.environment is not None):
+                self.mat_ui = MaterialEditorUI(self, self.selected)
 
-        # rotate / scale the selection
-        if self.selected is not None:
-            step = math.pi / 12.0
-            if inp.pressed(pygame.K_COMMA):
-                self.selected.transform.rotation.y += step
-                self.dirty = True
-            if inp.pressed(pygame.K_PERIOD):
-                self.selected.transform.rotation.y -= step
-                self.dirty = True
-            if inp.pressed(pygame.K_MINUS) or inp.pressed(pygame.K_EQUALS):
-                f = 1.1 if inp.pressed(pygame.K_EQUALS) else 1.0 / 1.1
-                sc = self.selected.transform.scale
-                self.selected.transform.scale = self.engine_mod.Vec3(
-                    sc.x * f, sc.y * f, sc.z * f)
-                self.dirty = True
+            # rotate / scale the selection
+            if self.selected is not None:
+                step = math.pi / 12.0
+                if inp.pressed(pygame.K_COMMA):
+                    self.selected.transform.rotation.y += step
+                    self.dirty = True
+                if inp.pressed(pygame.K_PERIOD):
+                    self.selected.transform.rotation.y -= step
+                    self.dirty = True
+                if inp.pressed(pygame.K_MINUS) or inp.pressed(pygame.K_EQUALS):
+                    f = 1.1 if inp.pressed(pygame.K_EQUALS) else 1.0 / 1.1
+                    sc = self.selected.transform.scale
+                    self.selected.transform.scale = self.engine_mod.Vec3(
+                        sc.x * f, sc.y * f, sc.z * f)
+                    self.dirty = True
 
     def handle_escape(self) -> bool:
         """Engine Esc hook: folder rename, then dropdown/settings, then
         material editor, then deselect, and only then let the engine quit."""
+        if self.editing_field is not None:
+            self._cancel_edit_field()
+            return True
         if self.renaming_folder is not _NO_RENAME:
             self._cancel_rename()
             return True
@@ -1668,6 +1896,9 @@ class Editor:
                     self.drag_asset = asset
 
     def _click_details(self, mp, rect) -> None:
+        e = self.selected
+        if e is not None and self._click_transform_fields(mp, rect, e):
+            return
         rows = self._details_rows()
         i = (mp[1] - (rect.y + DETAILS_ROWS_TOP)) // DETAIL_ROW_H
         if not (0 <= i < len(rows)):
@@ -1781,6 +2012,8 @@ class Editor:
                 w - layout["left_w"] - layout["right_w"], layout["bottom_h"]))
 
         mp = eng.input.mouse_pos
+        if layout["viewport"].width > 0 and layout["viewport"].height > 0:
+            self._draw_viewport_toolbar(surf, self._viewport_toolbar_rect(layout["viewport"]), mp)
         for side, r in layout["splitters"].items():
             hov = self.splitter_drag == side or r.collidepoint(mp)
             if hov:
@@ -2089,7 +2322,10 @@ class Editor:
                                                12, 12), 2)
         _p, s0, _l = self._gizmo_center(w, h)
         if s0 is not None:
-            mode_label = self.font_small.render(self.gizmo_mode, True, TEXT_DIM)
+            label_text = self.gizmo_mode
+            if self.gizmo_mode == "translate":
+                label_text += f" ({self.gizmo_space})"
+            mode_label = self.font_small.render(label_text, True, TEXT_DIM)
             surf.blit(mode_label, (int(s0[0]) + 12, int(s0[1]) + 10))
         pt = self.camera.project(e.transform.position, w, h)
         if pt is None:
@@ -2141,6 +2377,25 @@ class Editor:
                                       True, TEXT_DIM)
         surf.blit(hint, (rect.x + 10, rect.bottom - 18))
 
+    def _draw_transform_fields(self, surf, rect, e) -> None:
+        import pygame
+        axis_labels = ("X", "Y", "Z")
+        for i, row in enumerate(self._transform_rows(e)):
+            rr = self._transform_row_rect(rect, i)
+            label = self.font_small.render(row["label"], True, TEXT_DIM)
+            surf.blit(label, (rr.x, rr.y + 4))
+            field_rects = self._transform_field_rects(rr)
+            for j, fr in enumerate(field_rects):
+                editing = self.editing_field == (row["label"], self._TRANSFORM_AXES[j])
+                bg = (16, 17, 21) if editing else (30, 32, 39)
+                pygame.draw.rect(surf, bg, fr, border_radius=2)
+                pygame.draw.rect(surf, ACCENT if editing else PANEL_EDGE, fr, 1,
+                                 border_radius=2)
+                text = self.edit_buffer if editing else self._fmt_num(row["fields"][j]["get"]())
+                color = TEXT if editing else self._GIZMO_AXES[j][1]
+                glyph = self.font_small.render(f"{axis_labels[j]} {text}", True, color)
+                surf.blit(glyph, (fr.x + 3, fr.y + (fr.height - glyph.get_height()) // 2))
+
     def _draw_details(self, surf, rect) -> None:
         import pygame
         e = self.selected
@@ -2150,10 +2405,7 @@ class Editor:
             return
         head = f"{e.name}" + (f"  ({e.asset_name})" if e.asset_name else "")
         surf.blit(self.font_small.render(head[:34], True, TEXT), (rect.x + 10, rect.y + 6))
-        p = e.transform.position
-        pos_text = f"x {p.x:.1f}  y {p.y:.1f}  z {p.z:.1f}"
-        surf.blit(self.font_small.render(pos_text, True, TEXT_DIM),
-                  (rect.x + 10, rect.y + 20))
+        self._draw_transform_fields(surf, rect, e)
 
         rows = self._details_rows()
         if not rows:
