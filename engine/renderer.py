@@ -22,8 +22,10 @@ import pygame
 
 from .lighting import SpotLight, ies_curve
 from .math3d import rotation_x, rotation_y
+from .raytrace import GITracer
 
 _COORD_LIMIT = 20000.0  # keep projected coords in a range pygame handles safely
+_FOG_SKY_FAR = 260.0  # path-length clip for fog volumes behind the sky (no surface hit)
 
 
 def _clip_near(points: np.ndarray, near: float) -> list[np.ndarray]:
@@ -103,6 +105,126 @@ def _face_light_strength(info: _LightInfo, normals: np.ndarray,
     return strength
 
 
+def _scene_sun(scene):
+    """First enabled-or-not Sun entity's SunDisc, or None."""
+    for e in scene.entities:
+        if e.sun is not None and e.visible:
+            return e.sun
+    return None
+
+
+def _world_face_geometry(entity):
+    """World-space per-face centroids + normals -- no camera needed, used by
+    GI's direct-lighting pass which evaluates every occluder face, not just
+    what's on screen."""
+    mesh = entity.mesh
+    model = entity.transform.matrix()
+    verts_world = mesh.vertices @ model[:3, :3].T + model[:3, 3]
+    try:
+        normal_mat = np.linalg.inv(model[:3, :3]).T
+    except np.linalg.LinAlgError:
+        normal_mat = np.eye(3)
+    normals_world = mesh.normals @ normal_mat.T
+    normals_world /= np.maximum(np.linalg.norm(normals_world, axis=1, keepdims=True), 1e-12)
+    centroids_world = verts_world[mesh.faces].mean(axis=1)
+    return centroids_world, normals_world
+
+
+def _gi_direct_lighting(scene, casters, tracer):
+    """Per-face (centroids, normals, albedo, direct-radiance) for GI emitters.
+
+    `direct` = directional (lambert, sun-shadowed) + point/spot (strength,
+    shadowed) -- no ambient, since GI bounces measured light, not the
+    ambient/sky term (matching the spec's "direct light" definition).
+    """
+    lights = _gather_lights(scene)
+    dl = scene.light
+    dl_dir = dl.direction.to_array()
+    to_light = -dl_dir / max(np.linalg.norm(dl_dir), 1e-12)
+    dl_color = (np.asarray(dl.color, dtype=np.float64) / 255.0) * dl.intensity
+    sun = _scene_sun(scene)
+
+    c_list, n_list, a_list, d_list = [], [], [], []
+    for e in casters:
+        centroids, normals = _world_face_geometry(e)
+        lambert = np.clip(normals @ to_light, 0.0, 1.0)
+        if sun is not None and sun.shadow_depth > 1e-6:
+            active = lambert > 1e-3
+            raw = tracer.directional_shadow_factors(
+                e, dl_dir, sun.shadow_softness, sun.shadow_samples, centroids, normals, active)
+            dshadow = 1.0 - sun.shadow_depth * (1.0 - raw)
+        else:
+            dshadow = 1.0
+        direct = dl_color[None, :] * (lambert * dshadow)[:, None]
+        for info in lights:
+            strength = _face_light_strength(info, normals, centroids)
+            active = strength > 1e-3
+            if active.any() and info.light.cast_shadows:
+                strength = strength * tracer.shadow_factors(
+                    e, info.light, info.pos, centroids, normals, active)
+            direct = direct + info.colorf[None, :] * strength[:, None]
+        c_list.append(centroids)
+        n_list.append(normals)
+        a_list.append(e.mesh.face_colors)
+        d_list.append(direct)
+    return (np.concatenate(c_list), np.concatenate(n_list),
+           np.concatenate(a_list), np.concatenate(d_list))
+
+
+def _gi_receiver_geometry(receivers):
+    """Per-face (centroids, normals) for GI receivers -- every visible mesh
+    entity, regardless of `casts_shadow`. Cheaper than `_gi_direct_lighting`
+    since receivers don't need their own direct/albedo (the bounced color
+    already carries the source's albedo; the receiver's own albedo is
+    applied later, same as ambient/directional/point terms)."""
+    c_list, n_list = [], []
+    for e in receivers:
+        centroids, normals = _world_face_geometry(e)
+        c_list.append(centroids)
+        n_list.append(normals)
+    return np.concatenate(c_list), np.concatenate(n_list)
+
+
+class _SunSkyInfo:
+    __slots__ = ("dir", "color", "disc_size", "disc_softness", "glow")
+
+
+def _sun_sky_info(scene):
+    """Sky-disc render info from the scene's Sun entity, or None if there
+    isn't one / its disc is disabled / the light has zero direction."""
+    sun = _scene_sun(scene)
+    if sun is None or not sun.enabled:
+        return None
+    dl = scene.light
+    dl_dir = dl.direction.to_array()
+    n = np.linalg.norm(dl_dir)
+    if n < 1e-9:
+        return None
+    info = _SunSkyInfo()
+    info.dir = (-dl_dir / n).astype(np.float32)
+    info.color = (np.asarray(dl.color, dtype=np.float32) / 255.0) * dl.intensity
+    info.disc_size = max(sun.disc_size, 0.05)
+    info.disc_softness = float(np.clip(sun.disc_softness, 0.0, 1.0))
+    info.glow = float(np.clip(sun.glow, 0.0, 1.0))
+    return info
+
+
+def _fog_volumes(scene):
+    """Up to 4 active FogVolume entities: [(lo, hi, FogVolume), ...] world AABB."""
+    vols = []
+    for e in scene.entities:
+        fv = e.fog_volume
+        if fv is None or not fv.enabled or not e.visible:
+            continue
+        p, s = e.transform.position, e.transform.scale
+        lo = np.array([p.x - abs(s.x), p.y - abs(s.y), p.z - abs(s.z)], dtype=np.float32)
+        hi = np.array([p.x + abs(s.x), p.y + abs(s.y), p.z + abs(s.z)], dtype=np.float32)
+        vols.append((lo, hi, fv))
+        if len(vols) >= 4:
+            break
+    return vols
+
+
 class Renderer:
     def __init__(self):
         self.wireframe = False
@@ -111,6 +233,7 @@ class Renderer:
         self.stats = {"triangles": 0, "shadow_lights": 0, "mode": ""}
         self._sky_cache = None
         self._defer_cache = None
+        self._gi = GITracer()
 
     def render(self, surface: pygame.Surface, scene, camera, tracer=None) -> None:
         if self.per_pixel and not self.wireframe:
@@ -184,15 +307,105 @@ class Renderer:
                 return e.environment
         return None
 
-    def _directional_base(self, scene, normals, env=None):
+    def _directional_base(self, scene, entity, normals, centroids, env, tracer):
+        """Ambient + directional term for one entity's faces. Only the
+        directional (lambert) part is shadowed -- ambient/sky light isn't
+        blocked by the sun's ray-traced occlusion test."""
         dl = scene.light
         dl_dir = dl.direction.to_array()
         to_light = -dl_dir / max(np.linalg.norm(dl_dir), 1e-12)
         dl_color = np.asarray(dl.color, dtype=np.float64) / 255.0 * dl.intensity
         lambert = np.clip(normals @ to_light, 0.0, 1.0)
+        if tracer is not None:
+            sun = _scene_sun(scene)
+            if sun is not None and sun.shadow_depth > 1e-6:
+                active = lambert > 1e-3
+                raw = tracer.directional_shadow_factors(
+                    entity, dl_dir, sun.shadow_softness, sun.shadow_samples,
+                    centroids, normals, active)
+                lambert = lambert * (1.0 - sun.shadow_depth * (1.0 - raw))
         if env is not None:  # image-based ambient from the HDRI environment
             return env.ambient(normals) + dl_color[None, :] * lambert[:, None]
         return dl.ambient + dl_color[None, :] * ((1.0 - dl.ambient) * lambert)[:, None]
+
+    def _gi_contrib(self, scene, tracer) -> dict:
+        """{id(entity): (M, 3) indirect-light array} from the cached GI bake,
+        or {} if GI is off / no tracer."""
+        gi_cfg = getattr(scene, "gi", None)
+        if not gi_cfg or not gi_cfg.get("enabled") or tracer is None:
+            return {}
+        return self._gi.compute(scene, tracer,
+                                lambda casters: _gi_direct_lighting(scene, casters, tracer),
+                                _gi_receiver_geometry,
+                                gi_cfg.get("samples", 16), gi_cfg.get("intensity", 1.0))
+
+    @staticmethod
+    def _apply_sun_disc(frame, sky_idx, dirs_all, sun: "_SunSkyInfo") -> None:
+        """Additively blend a sun disc + glow halo into sky pixels, in place.
+        `frame` is (rw, rh, 3) uint8; `sky_idx` indexes its flattened view."""
+        d = dirs_all[sky_idx]
+        d = d / np.linalg.norm(d, axis=1, keepdims=True)
+        cos_ang = np.clip(d @ sun.dir, -1.0, 1.0)
+        ang = np.degrees(np.arccos(cos_ang))
+        size = sun.disc_size
+        soft = max(size * sun.disc_softness, 1e-3)
+        e0, e1 = size - soft, size + soft
+        t = np.clip((e1 - ang) / max(e1 - e0, 1e-4), 0.0, 1.0)
+        disc = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+        halo_deg = size * 12.0 + 3.0
+        g = np.clip(1.0 - ang / halo_deg, 0.0, 1.0).astype(np.float32)
+        glow_amt = sun.glow * g * g * g
+
+        flat = frame.reshape(-1, 3)
+        base = flat[sky_idx].astype(np.float32)
+        add = (disc[:, None] * sun.color[None, :] * 255.0
+               + glow_amt[:, None] * sun.color[None, :] * 0.5 * 255.0)
+        flat[sky_idx] = np.clip(base + add, 0.0, 255.0).astype(np.uint8)
+
+    @staticmethod
+    def _apply_fog_volumes(out, cam, dirs, t_near, t_far, vols) -> None:
+        """Blend up to 4 fog volumes into `out` (V, 3) float32, in place.
+        Sequential alpha compositing -- not physically correct for
+        overlapping volumes, but visually fine for a sparse handful."""
+        for lo, hi, fv in vols:
+            inv = 1.0 / np.where(np.abs(dirs) < 1e-12, np.float32(1e-12), dirs)
+            t1 = (lo[None, :] - cam[None, :]) * inv
+            t2 = (hi[None, :] - cam[None, :]) * inv
+            tmin = np.minimum(t1, t2)
+            tmax = np.maximum(t1, t2)
+            t0 = np.maximum(tmin.max(axis=1), t_near)
+            t1v = np.minimum(tmax.min(axis=1), t_far)
+            length = np.maximum(t1v - t0, 0.0).astype(np.float32)
+            if fv.height_falloff:
+                mid_h = cam[1] + dirs[:, 1] * (0.5 * (t0 + t1v))
+                density = (fv.density
+                          * np.exp(-np.maximum(mid_h, 0.0) * fv.height_falloff)).astype(np.float32)
+            else:
+                density = np.float32(fv.density)
+            T = np.exp(-density * length).astype(np.float32)
+            fcol = np.asarray(fv.color, dtype=np.float32)
+            out[:] = out * T[:, None] + fcol[None, :] * (1.0 - T)[:, None]
+
+    @staticmethod
+    def _apply_atmosphere(out, scene, dirs, t, pos, fog) -> None:
+        """Distance fog with optional height falloff + sun-scatter tint, in
+        place on `out` (V, 3) float32. Per-pixel paths only."""
+        f = np.clip((t - fog.start) / (fog.end - fog.start), 0.0, 1.0)
+        if fog.height_falloff > 1e-6:
+            hf = np.exp(-np.maximum(pos[:, 1], 0.0) * fog.height_falloff).astype(np.float32)
+            f = np.clip(f * hf, 0.0, 1.0)
+        fog_col = np.asarray(fog.color, dtype=np.float32)
+        if fog.sun_scatter > 1e-6:
+            dl_dir = scene.light.direction.to_array()
+            n = np.linalg.norm(dl_dir)
+            sun_dir = (-dl_dir / n).astype(np.float32) if n > 1e-9 else np.zeros(3, np.float32)
+            align = np.clip(dirs @ sun_dir, 0.0, 1.0)
+            scatter = (align ** 8 * fog.sun_scatter).astype(np.float32)
+            sun_col = np.asarray(scene.light.color, dtype=np.float32)
+            fog_col_px = fog_col[None, :] * (1.0 - scatter)[:, None] + sun_col[None, :] * scatter[:, None]
+            out[:] = out * (1.0 - f)[:, None] + fog_col_px * f[:, None]
+        else:
+            out[:] = out * (1.0 - f)[:, None] + fog_col[None, :] * f[:, None]
 
     # ------------------------------------------------------------------
     # flat path: one color per face
@@ -208,6 +421,7 @@ class Renderer:
         fog_color = np.asarray(fog.color, dtype=np.float64) if fog else None
 
         env = self._scene_environment(scene)
+        gi_map = self._gi_contrib(scene, tracer)
         polys = []
         for entity in scene.entities:
             if entity.mesh is None or not entity.visible:
@@ -218,7 +432,10 @@ class Renderer:
                 continue
             normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
 
-            lum = self._directional_base(scene, normals, env)
+            lum = self._directional_base(scene, entity, normals, centroids, env, tracer)
+            gi = gi_map.get(id(entity))
+            if gi is not None:
+                lum = lum + gi
             for info in lights:
                 strength = _face_light_strength(info, normals, centroids)
                 active = strength > 1e-3
@@ -293,6 +510,7 @@ class Renderer:
         self.stats["shadow_lights"] = sum(1 for l in lights if l.light.cast_shadows)
         fog = scene.fog
         env = self._scene_environment(scene)
+        gi_map = self._gi_contrib(scene, tracer)
 
         # --- collect geometry + per-face attributes across all entities ---
         f_normals, f_centroids, f_albedo, f_base = [], [], [], []
@@ -311,7 +529,11 @@ class Renderer:
             f_normals.append(normals)
             f_centroids.append(centroids)
             f_albedo.append(entity.mesh.face_colors)
-            f_base.append(self._directional_base(scene, normals, env))
+            base = self._directional_base(scene, entity, normals, centroids, env, tracer)
+            gi = gi_map.get(id(entity))
+            if gi is not None:
+                base = base + gi
+            f_base.append(base)
             for li, info in enumerate(lights):
                 if tracer is not None and info.light.cast_shadows:
                     strength = _face_light_strength(info, normals, centroids)
@@ -373,9 +595,11 @@ class Renderer:
                              @ rot.T.astype(np.float32))
             cache["dirs_key"] = dirs_key
 
+        cam = camera.position.to_array().astype(np.float32)
+        sky_idx = np.flatnonzero(ids == 0)
+
         if env is not None:  # sky pixels sample the HDRI along their rays
             frame = np.empty((rw * rh, 3), dtype=np.uint8)
-            sky_idx = np.flatnonzero(ids == 0)
             if len(sky_idx):
                 d = cache["dirs"][sky_idx]
                 d = d / np.linalg.norm(d, axis=1, keepdims=True)
@@ -385,12 +609,25 @@ class Renderer:
         else:
             frame = cache["sky"].copy()  # uint8 (rw, rh, 3)
 
+        sun_info = _sun_sky_info(scene)
+        if sun_info is not None and len(sky_idx):
+            self._apply_sun_disc(frame, sky_idx, cache["dirs"], sun_info)
+
+        vols = _fog_volumes(scene)
+        if vols and len(sky_idx):
+            flat = frame.reshape(-1, 3)
+            sky_col = flat[sky_idx].astype(np.float32)
+            sky_dirs = cache["dirs"][sky_idx]
+            near_arr = np.full(len(sky_idx), near, dtype=np.float32)
+            far_arr = np.full(len(sky_idx), _FOG_SKY_FAR, dtype=np.float32)
+            self._apply_fog_volumes(sky_col, cam, sky_dirs, near_arr, far_arr, vols)
+            flat[sky_idx] = np.clip(sky_col, 0.0, 255.0).astype(np.uint8)
+
         if len(vis) == 0:
             pygame.surfarray.blit_array(small, frame)
             pygame.transform.scale(small, (w, h), surface)
             return
         fid_a = ids[vis] - 1                   # centroid-nearest candidate
-        cam = camera.position.to_array().astype(np.float32)
         dirs = cache["dirs"][vis]
 
         def _ray_plane_t(face_idx, ray_dirs):
@@ -457,9 +694,11 @@ class Renderer:
             lum[sel] += info.colorf.astype(np.float32)[None, :] * strength[:, None]
 
         out = albedo[fid] * lum
+        if vols:
+            near_arr = np.full(len(vis), near, dtype=np.float32)
+            self._apply_fog_volumes(out, cam, dirs, near_arr, t, vols)
         if fog is not None:
-            f = np.clip((t - fog.start) / (fog.end - fog.start), 0.0, 1.0)[:, None]
-            out = out * (1.0 - f) + np.asarray(fog.color, dtype=np.float32) * f
+            self._apply_atmosphere(out, scene, dirs, t, pos, fog)
         np.clip(out, 0.0, 255.0, out=out)
         frame.reshape(-1, 3)[vis] = out.astype(np.uint8)
 

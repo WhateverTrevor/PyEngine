@@ -26,7 +26,7 @@ from . import behaviors as behaviors_mod
 from . import mesh as mesh_mod
 from .camera import Camera
 from .environment import Environment, load_hdr
-from .lighting import DirectionalLight, Fog, PointLight, SpotLight
+from .lighting import DirectionalLight, Fog, FogVolume, PointLight, SpotLight, SunDisc
 from .materials import MaterialGraph
 from .math3d import Vec3
 from .scene import Entity, Scene
@@ -44,6 +44,11 @@ _MESH_FACTORIES = {
 # light attributes the editor can change and scenes persist per entity
 _LIGHT_PROPS = ("intensity", "color", "range", "radius", "inner", "outer",
                 "ies", "enabled", "cast_shadows")
+
+# SunDisc / FogVolume attributes the editor can change and scenes persist
+_SUN_PROPS = ("disc_size", "disc_softness", "glow", "enabled",
+             "shadow_softness", "shadow_depth", "shadow_samples")
+_FOG_VOLUME_PROPS = ("density", "color", "height_falloff", "enabled")
 
 
 def _tupled(spec: dict) -> dict:
@@ -94,6 +99,12 @@ class AssetDef:
             entity.light = SpotLight(**spec) if kind == "spot" else PointLight(**spec)
             if offset:
                 entity.light_offset = Vec3(*offset)
+
+        if "sun" in d:
+            entity.sun = SunDisc(**dict(d["sun"]))
+
+        if "fog_volume" in d:
+            entity.fog_volume = FogVolume(**_tupled(dict(d["fog_volume"])))
 
         for b in d.get("behaviors", []):
             spec = dict(b)
@@ -149,6 +160,12 @@ def _entity_dict(e: Entity) -> dict:
         d["light"] = light
     if e.material is not None:
         d["material"] = e.material.to_dict()
+    if e.sun is not None:
+        d["sun"] = {k: getattr(e.sun, k) for k in _SUN_PROPS}
+    if e.fog_volume is not None:
+        fv = e.fog_volume
+        d["fog_volume"] = {"density": fv.density, "color": list(fv.color),
+                           "height_falloff": fv.height_falloff, "enabled": fv.enabled}
     return d
 
 
@@ -160,10 +177,12 @@ def save_scene(scene: Scene, camera: Camera, path: str) -> None:
         "directional_light": {"direction": _vec(dl.direction), "ambient": dl.ambient,
                               "color": list(dl.color), "intensity": dl.intensity},
         "fog": ({"color": list(scene.fog.color), "start": scene.fog.start,
-                 "end": scene.fog.end} if scene.fog else None),
+                 "end": scene.fog.end, "height_falloff": scene.fog.height_falloff,
+                 "sun_scatter": scene.fog.sun_scatter} if scene.fog else None),
         "sky": ([list(scene.sky[0]), list(scene.sky[1])] if scene.sky else None),
         "background": list(scene.background),
         "enable_shadows": scene.enable_shadows,
+        "gi": dict(scene.gi),
         "entities": [_entity_dict(e) for e in scene.entities
                      if e.asset_name is not None],
     }
@@ -177,17 +196,21 @@ def load_scene(path: str, library: AssetLibrary,
         data = json.load(f)
 
     dl = data.get("directional_light", {})
+    fog_data = data.get("fog")
     scene = Scene(
         light=DirectionalLight(Vec3(*dl.get("direction", [-0.5, -1.0, -0.3])),
                                ambient=dl.get("ambient", 0.3),
                                color=tuple(dl.get("color", [255, 255, 255])),
                                intensity=dl.get("intensity", 1.0)),
-        fog=(Fog(tuple(data["fog"]["color"]), data["fog"]["start"], data["fog"]["end"])
-             if data.get("fog") else None),
+        fog=(Fog(tuple(fog_data["color"]), fog_data["start"], fog_data["end"],
+                height_falloff=fog_data.get("height_falloff", 0.0),
+                sun_scatter=fog_data.get("sun_scatter", 0.0))
+             if fog_data else None),
         sky=(tuple(tuple(c) for c in data["sky"]) if data.get("sky") else None),
         background=tuple(data.get("background", [12, 14, 20])),
         enable_shadows=data.get("enable_shadows", True),
     )
+    scene.gi = dict(data.get("gi", scene.gi))
     for spec in data.get("entities", []):
         entity = library.instantiate(spec["asset"], spec.get("name"))
         t = entity.transform
@@ -199,9 +222,19 @@ def load_scene(path: str, library: AssetLibrary,
                 if key in _LIGHT_PROPS:
                     setattr(entity.light, key,
                             tuple(value) if key == "color" else value)
-        if "material" in spec and entity.mesh is not None:
+        if "sun" in spec and entity.sun is not None:
+            for key, value in spec["sun"].items():
+                if key in _SUN_PROPS:
+                    setattr(entity.sun, key, value)
+        if "fog_volume" in spec and entity.fog_volume is not None:
+            fv, fvd = entity.fog_volume, spec["fog_volume"]
+            fv.density = fvd.get("density", fv.density)
+            fv.color = tuple(fvd.get("color", fv.color))
+            fv.height_falloff = fvd.get("height_falloff", fv.height_falloff)
+            fv.enabled = fvd.get("enabled", fv.enabled)
+        if "material" in spec and (entity.mesh is not None or entity.environment is not None):
             entity.material = MaterialGraph.from_dict(spec["material"])
-            entity.material.apply(entity.mesh)
+            entity.material.apply(entity)
         scene.add(entity)
 
     if camera is not None and "camera" in data:

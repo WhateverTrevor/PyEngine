@@ -93,3 +93,44 @@ class Fog:
     color: tuple[int, int, int]
     start: float   # camera distance where fog begins
     end: float     # camera distance where fog is fully opaque
+    # atmospheric upgrades, per-pixel paths only (see renderer._apply_fog):
+    height_falloff: float = 0.0  # density *= exp(-max(height, 0) * this); 0 = off
+    sun_scatter: float = 0.0     # 0-1: tint fog toward the sun color when looking at it
+
+
+class SunDisc:
+    """Sky-disc + shadow tuning carried by a "Sun" entity (see behaviors.SunController).
+
+    The entity's rotation drives `scene.light.direction`; this object holds
+    the extra knobs that aren't already on DirectionalLight: how the sun
+    disc/glow render in the sky, and the ray-traced directional shadow terms.
+    `enabled` toggles only the disc/glow visual -- shadows are toggled via
+    `shadow_depth == 0`, independent of the disc.
+    """
+
+    def __init__(self, disc_size: float = 1.0, disc_softness: float = 0.35,
+                 glow: float = 0.4, enabled: bool = True,
+                 shadow_softness: float = 0.5, shadow_depth: float = 0.85,
+                 shadow_samples: int = 6):
+        self.disc_size = disc_size            # degrees, angular radius
+        self.disc_softness = disc_softness    # 0..1, smoothstep edge width
+        self.glow = glow                      # 0..1, additive halo strength
+        self.enabled = enabled                # show the disc/glow in the sky
+        self.shadow_softness = shadow_softness  # degrees, penumbra cone angle
+        self.shadow_depth = shadow_depth      # 0..1: 0 = no shadow, 1 = full dark
+        self.shadow_samples = shadow_samples
+
+
+class FogVolume:
+    """Local volumetric fog box carried by a "Fog Volume" entity.
+
+    The box is `entity.transform.position +/- entity.transform.scale`,
+    world-axis-aligned (v1: the entity's rotation is not applied to the box).
+    """
+
+    def __init__(self, density: float = 0.4, color=(180, 190, 210),
+                 height_falloff: float = 0.0, enabled: bool = True):
+        self.density = density
+        self.color = tuple(color)
+        self.height_falloff = height_falloff
+        self.enabled = enabled

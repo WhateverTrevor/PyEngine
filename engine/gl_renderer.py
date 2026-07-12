@@ -30,9 +30,13 @@ import numpy as np
 from .gpu_geometry import _build_color, _build_geometry, _entity_world_faces, _scene_environment
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
-from .renderer import _face_light_strength, _gather_lights
+from .raytrace import GITracer
+from .renderer import (_face_light_strength, _fog_volumes, _gather_lights,
+                       _gi_direct_lighting, _gi_receiver_geometry, _scene_sun)
 
 _MAX_LIGHTS = 16
+_MAX_FOG_VOL = 4
+_FOG_SKY_FAR = 260.0  # path-length clip for fog volumes behind the sky
 
 # ---------------------------------------------------------------------------
 # shaders
@@ -77,6 +81,7 @@ uniform int faceOffset;
 
 uniform vec3 dlDir;
 uniform vec3 dlColor;
+uniform vec3 dlColorRaw;
 uniform float dlAmbient;
 uniform int useEnv;
 uniform vec3 ambientCube[6];
@@ -93,14 +98,54 @@ uniform float lightCosOut[MAX_LIGHTS];
 uniform int lightIesRow[MAX_LIGHTS];
 
 uniform sampler2D shadowTex;
+uniform sampler2D dlShadowTex;
+uniform sampler2D giTex;
 uniform sampler2D iesTex;
 
 uniform int fogEnabled;
 uniform vec3 fogColor;
 uniform float fogStart;
 uniform float fogEnd;
+uniform float fogHeightFalloff;
+uniform float fogSunScatter;
+
+#define MAX_FOG_VOL {_MAX_FOG_VOL}
+uniform int fogVolCount;
+uniform vec3 fogVolLo[MAX_FOG_VOL];
+uniform vec3 fogVolHi[MAX_FOG_VOL];
+uniform float fogVolDensity[MAX_FOG_VOL];
+uniform vec3 fogVolColor[MAX_FOG_VOL];
+uniform float fogVolHeightFalloff[MAX_FOG_VOL];
 
 out vec4 fragColor;
+
+// Ray-AABB slab intersection clipped to [tNear, tFar]; returns the segment
+// (t0, t1) inside the box (t1 < t0 means no overlap).
+vec2 fogVolSegment(vec3 origin, vec3 dir, vec3 lo, vec3 hi, float tNear, float tFar) {{
+    vec3 invDir = 1.0 / dir;
+    vec3 t1v = (lo - origin) * invDir;
+    vec3 t2v = (hi - origin) * invDir;
+    vec3 tmin = min(t1v, t2v);
+    vec3 tmax = max(t1v, t2v);
+    float t0 = max(max(max(tmin.x, tmin.y), tmin.z), tNear);
+    float t1 = min(min(min(tmax.x, tmax.y), tmax.z), tFar);
+    return vec2(t0, t1);
+}}
+
+vec3 applyFogVolumes(vec3 color, vec3 origin, vec3 dir, float tNear, float tFar) {{
+    for (int i = 0; i < fogVolCount; i++) {{
+        vec2 seg = fogVolSegment(origin, dir, fogVolLo[i], fogVolHi[i], tNear, tFar);
+        float segLen = max(seg.y - seg.x, 0.0);
+        float density = fogVolDensity[i];
+        if (fogVolHeightFalloff[i] > 0.0) {{
+            float midH = origin.y + dir.y * (0.5 * (seg.x + seg.y));
+            density *= exp(-max(midH, 0.0) * fogVolHeightFalloff[i]);
+        }}
+        float T = exp(-density * segLen);
+        color = color * T + fogVolColor[i] * (1.0 - T);
+    }}
+    return color;
+}}
 
 // Same cosine-weighted cube lookup as Environment.ambient(): axes are
 // (+X, -X, +Y, -Y, +Z, -Z), weighted by the clamped normal component.
@@ -118,12 +163,15 @@ void main() {{
     vec3 n = normalize(vNormal);
     vec3 toLight = normalize(-dlDir);
     float lambert = clamp(dot(n, toLight), 0.0, 1.0);
+    float dlShadow = texelFetch(dlShadowTex, ivec2(0, faceOffset + vFaceId), 0).r;
+    lambert *= dlShadow;
     vec3 lum;
     if (useEnv != 0) {{
         lum = evalAmbientCube(n) + dlColor * lambert;
     }} else {{
         lum = vec3(dlAmbient) + dlColor * ((1.0 - dlAmbient) * lambert);
     }}
+    lum += texelFetch(giTex, ivec2(0, faceOffset + vFaceId), 0).rgb;
 
     for (int i = 0; i < nLights; i++) {{
         vec3 delta = lightPos[i] - vWorldPos;
@@ -157,10 +205,26 @@ void main() {{
     }}
 
     vec3 outColor = vColor * lum;
+
+    vec3 viewDir = vWorldPos - cameraPos;
+    float fragDist = length(viewDir);
+    vec3 rayDir = viewDir / max(fragDist, 1e-6);
+    if (fogVolCount > 0) {{
+        outColor = applyFogVolumes(outColor, cameraPos, rayDir, 0.0, fragDist);
+    }}
+
     if (fogEnabled != 0) {{
-        float dist = length(vWorldPos - cameraPos);
-        float f = clamp((dist - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
-        outColor = mix(outColor, fogColor, f);
+        float f = clamp((fragDist - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
+        if (fogHeightFalloff > 0.0) {{
+            f = clamp(f * exp(-max(vWorldPos.y, 0.0) * fogHeightFalloff), 0.0, 1.0);
+        }}
+        vec3 fogCol = fogColor;
+        if (fogSunScatter > 0.0) {{
+            float align = clamp(dot(rayDir, normalize(-dlDir)), 0.0, 1.0);
+            float scatter = pow(align, 8.0) * fogSunScatter;
+            fogCol = mix(fogColor, dlColorRaw, scatter);
+        }}
+        outColor = mix(outColor, fogCol, f);
     }}
     fragColor = vec4(clamp(outColor, 0.0, 1.0), 1.0);
 }}
@@ -172,36 +236,89 @@ in vec2 in_pos;
 void main() { gl_Position = vec4(in_pos, 0.0, 1.0); }
 """
 
-_SKY_FS = """
+_SKY_FS = f"""
 #version 330 core
 uniform vec3 camRight, camUp, camFwd;
+uniform vec3 cameraPos;
 uniform vec2 viewSize;
 uniform float focalK;
 uniform int useEnv;
 uniform sampler2D envTex;
 uniform int useGradient;
 uniform vec3 skyTop, skyHorizon, bgColor;
+
+uniform int sunEnabled;
+uniform vec3 sunDir;
+uniform vec3 sunColor;
+uniform float sunDiscSize;
+uniform float sunDiscSoftness;
+uniform float sunGlow;
+
+#define MAX_FOG_VOL {_MAX_FOG_VOL}
+uniform int fogVolCount;
+uniform vec3 fogVolLo[MAX_FOG_VOL];
+uniform vec3 fogVolHi[MAX_FOG_VOL];
+uniform float fogVolDensity[MAX_FOG_VOL];
+uniform vec3 fogVolColor[MAX_FOG_VOL];
+uniform float fogVolHeightFalloff[MAX_FOG_VOL];
+uniform float fogVolFar;
+
 out vec4 fragColor;
 const float PI = 3.14159265359;
 
-void main() {
-    if (useEnv != 0) {
-        float dcx = (gl_FragCoord.x - viewSize.x * 0.5) / focalK;
-        float dcy = (gl_FragCoord.y - viewSize.y * 0.5) / focalK;
-        vec3 dir = normalize(dcx * camRight + dcy * camUp + camFwd);
+void main() {{
+    float dcx = (gl_FragCoord.x - viewSize.x * 0.5) / focalK;
+    float dcy = (gl_FragCoord.y - viewSize.y * 0.5) / focalK;
+    vec3 dir = normalize(dcx * camRight + dcy * camUp + camFwd);
+
+    vec3 base;
+    if (useEnv != 0) {{
         float theta = acos(clamp(dir.y, -1.0, 1.0));
         float phi = atan(dir.z, dir.x);
         if (phi < 0.0) phi += 2.0 * PI;
         vec2 uv = vec2(phi / (2.0 * PI), theta / PI);
-        vec3 radiance = texture(envTex, uv).rgb;
-        fragColor = vec4(clamp(radiance, 0.0, 1.0), 1.0);
-    } else if (useGradient != 0) {
+        base = texture(envTex, uv).rgb;
+    }} else if (useGradient != 0) {{
         float f = clamp((viewSize.y - gl_FragCoord.y) / viewSize.y, 0.0, 1.0);
-        fragColor = vec4(mix(skyTop, skyHorizon, f), 1.0);
-    } else {
-        fragColor = vec4(bgColor, 1.0);
-    }
-}
+        base = mix(skyTop, skyHorizon, f);
+    }} else {{
+        base = bgColor;
+    }}
+
+    if (sunEnabled != 0) {{
+        float cosAng = clamp(dot(dir, sunDir), -1.0, 1.0);
+        float ang = degrees(acos(cosAng));
+        float soft = max(sunDiscSize * sunDiscSoftness, 0.001);
+        float e0 = sunDiscSize - soft;
+        float e1 = sunDiscSize + soft;
+        float t = clamp((e1 - ang) / max(e1 - e0, 0.0001), 0.0, 1.0);
+        float disc = t * t * (3.0 - 2.0 * t);
+        float haloDeg = sunDiscSize * 12.0 + 3.0;
+        float g = clamp(1.0 - ang / haloDeg, 0.0, 1.0);
+        float glowAmt = sunGlow * g * g * g;
+        base += sunColor * disc + sunColor * glowAmt * 0.5;
+    }}
+
+    for (int i = 0; i < fogVolCount; i++) {{
+        vec3 invDir = 1.0 / dir;
+        vec3 t1v = (fogVolLo[i] - cameraPos) * invDir;
+        vec3 t2v = (fogVolHi[i] - cameraPos) * invDir;
+        vec3 tmin = min(t1v, t2v);
+        vec3 tmax = max(t1v, t2v);
+        float t0 = max(max(max(tmin.x, tmin.y), tmin.z), 0.0);
+        float t1 = min(min(min(tmax.x, tmax.y), tmax.z), fogVolFar);
+        float segLen = max(t1 - t0, 0.0);
+        float density = fogVolDensity[i];
+        if (fogVolHeightFalloff[i] > 0.0) {{
+            float midH = cameraPos.y + dir.y * (0.5 * (t0 + t1));
+            density *= exp(-max(midH, 0.0) * fogVolHeightFalloff[i]);
+        }}
+        float T = exp(-density * segLen);
+        base = base * T + fogVolColor[i] * (1.0 - T);
+    }}
+
+    fragColor = vec4(clamp(base, 0.0, 1.0), 1.0);
+}}
 """
 
 
@@ -229,6 +346,8 @@ class GLRenderer:
     _ENV_UNIT = 0
     _SHADOW_UNIT = 1
     _IES_UNIT = 2
+    _DL_SHADOW_UNIT = 3
+    _GI_UNIT = 4
 
     def __init__(self, ctx: "moderngl.Context", target=None):
         self.ctx = ctx
@@ -240,6 +359,11 @@ class GLRenderer:
         self._env_tex_cache: dict[int, "moderngl.Texture"] = {}
         self._shadow_tex_obj = None
         self._shadow_tex_size = None
+        self._dl_shadow_tex_obj = None
+        self._dl_shadow_tex_size = None
+        self._gi_tex_obj = None
+        self._gi_tex_size = None
+        self._gi = GITracer()
 
         self._mesh_prog = ctx.program(vertex_shader=_MESH_VS, fragment_shader=_MESH_FS)
         self._sky_prog = ctx.program(vertex_shader=_SKY_VS, fragment_shader=_SKY_FS)
@@ -315,6 +439,37 @@ class GLRenderer:
                     shadow_data[off:off + m, li_idx] = factors
         self._upload_shadow_tex(shadow_data, total_faces)
 
+        # directional (sun) shadow -- reserved single-column texture, same
+        # face-id indexing as shadowTex above
+        sun = _scene_sun(scene)
+        dl_shadow_data = np.ones((max(total_faces, 1), 1), dtype=np.float32)
+        if tracer is not None and sun is not None and sun.shadow_depth > 1e-6 and total_faces > 0:
+            dl_dir = scene.light.direction.to_array()
+            to_light = -dl_dir / max(np.linalg.norm(dl_dir), 1e-12)
+            for entity, off, m in zip(live, offsets, face_counts):
+                centroids_w, normals_w = _entity_world_faces(entity)
+                lambert = np.clip(normals_w @ to_light, 0.0, 1.0)
+                active = lambert > 1e-3
+                raw = tracer.directional_shadow_factors(
+                    entity, dl_dir, sun.shadow_softness, sun.shadow_samples,
+                    centroids_w, normals_w, active)
+                dl_shadow_data[off:off + m, 0] = 1.0 - sun.shadow_depth * (1.0 - raw)
+        self._upload_dl_shadow_tex(dl_shadow_data, total_faces)
+
+        # one-bounce GI -- baked/cached by GITracer, zero per-frame cost once static
+        gi_data = np.zeros((max(total_faces, 1), 3), dtype=np.float32)
+        gi_cfg = getattr(scene, "gi", None)
+        if tracer is not None and gi_cfg and gi_cfg.get("enabled") and total_faces > 0:
+            gi_map = self._gi.compute(scene, tracer,
+                                      lambda casters: _gi_direct_lighting(scene, casters, tracer),
+                                      _gi_receiver_geometry,
+                                      gi_cfg.get("samples", 16), gi_cfg.get("intensity", 1.0))
+            for entity, off, m in zip(live, offsets, face_counts):
+                gi = gi_map.get(id(entity))
+                if gi is not None:
+                    gi_data[off:off + m] = gi
+        self._upload_gi_tex(gi_data, total_faces)
+
         view = camera.view_matrix()
         proj = _projection(camera, w, h)
 
@@ -327,9 +482,22 @@ class GLRenderer:
             prog["fogColor"].value = tuple(np.asarray(fog.color, dtype=np.float32) / 255.0)
             prog["fogStart"].value = float(fog.start)
             prog["fogEnd"].value = float(fog.end)
+            prog["fogHeightFalloff"].value = float(fog.height_falloff)
+            prog["fogSunScatter"].value = float(fog.sun_scatter)
+            prog["dlColorRaw"].value = tuple(
+                np.asarray(scene.light.color, dtype=np.float32) / 255.0)
+        else:
+            prog["fogHeightFalloff"].value = 0.0
+            prog["fogSunScatter"].value = 0.0
+            prog["dlColorRaw"].value = (0.0, 0.0, 0.0)
+        self._set_fog_volume_uniforms(prog, _fog_volumes(scene))
 
         self._shadow_tex_obj.use(location=self._SHADOW_UNIT)
         prog["shadowTex"].value = self._SHADOW_UNIT
+        self._dl_shadow_tex_obj.use(location=self._DL_SHADOW_UNIT)
+        prog["dlShadowTex"].value = self._DL_SHADOW_UNIT
+        self._gi_tex_obj.use(location=self._GI_UNIT)
+        prog["giTex"].value = self._GI_UNIT
         self._ies_tex.use(location=self._IES_UNIT)
         prog["iesTex"].value = self._IES_UNIT
 
@@ -370,6 +538,7 @@ class GLRenderer:
         prog["camRight"].value = tuple(right.astype(np.float32))
         prog["camUp"].value = tuple(up.astype(np.float32))
         prog["camFwd"].value = tuple(fwd.astype(np.float32))
+        prog["cameraPos"].value = tuple(camera.position.to_array().astype(np.float32))
         prog["viewSize"].value = (float(w), float(h))
         prog["focalK"].value = float(k)
 
@@ -391,6 +560,25 @@ class GLRenderer:
                 prog["useGradient"].value = 0
                 prog["bgColor"].value = tuple(
                     np.asarray(scene.background, dtype=np.float32) / 255.0)
+
+        sun = _scene_sun(scene)
+        if sun is not None and sun.enabled:
+            dl_dir = scene.light.direction.to_array()
+            n = np.linalg.norm(dl_dir)
+            prog["sunEnabled"].value = 1 if n > 1e-9 else 0
+            if n > 1e-9:
+                prog["sunDir"].value = tuple((-dl_dir / n).astype(np.float32))
+                dl_col = (np.asarray(scene.light.color, dtype=np.float32) / 255.0
+                         * scene.light.intensity)
+                prog["sunColor"].value = tuple(dl_col)
+                prog["sunDiscSize"].value = float(max(sun.disc_size, 0.05))
+                prog["sunDiscSoftness"].value = float(np.clip(sun.disc_softness, 0.0, 1.0))
+                prog["sunGlow"].value = float(np.clip(sun.glow, 0.0, 1.0))
+        else:
+            prog["sunEnabled"].value = 0
+
+        prog["fogVolFar"].value = float(_FOG_SKY_FAR)
+        self._set_fog_volume_uniforms(prog, _fog_volumes(scene))
 
         self._sky_vao.render(moderngl.TRIANGLES)
 
@@ -435,6 +623,27 @@ class GLRenderer:
         prog["lightCosIn"].write(cos_in.tobytes())
         prog["lightCosOut"].write(cos_out.tobytes())
         prog["lightIesRow"].write(ies_row.tobytes())
+
+    def _set_fog_volume_uniforms(self, prog, vols) -> None:
+        """Upload up to `_MAX_FOG_VOL` fog volumes; shared by the mesh and
+        sky programs (both declare the same uniform names)."""
+        prog["fogVolCount"].value = len(vols)
+        lo = np.zeros((_MAX_FOG_VOL, 3), dtype=np.float32)
+        hi = np.zeros((_MAX_FOG_VOL, 3), dtype=np.float32)
+        density = np.zeros(_MAX_FOG_VOL, dtype=np.float32)
+        color = np.zeros((_MAX_FOG_VOL, 3), dtype=np.float32)
+        height_falloff = np.zeros(_MAX_FOG_VOL, dtype=np.float32)
+        for i, (vlo, vhi, fv) in enumerate(vols):
+            lo[i] = vlo
+            hi[i] = vhi
+            density[i] = fv.density
+            color[i] = np.asarray(fv.color, dtype=np.float32) / 255.0
+            height_falloff[i] = fv.height_falloff
+        prog["fogVolLo"].write(lo.tobytes())
+        prog["fogVolHi"].write(hi.tobytes())
+        prog["fogVolDensity"].write(density.tobytes())
+        prog["fogVolColor"].write(color.tobytes())
+        prog["fogVolHeightFalloff"].write(height_falloff.tobytes())
 
     # ------------------------------------------------------------------
     def _get_geo_cache(self, mesh) -> dict:
@@ -494,6 +703,29 @@ class GLRenderer:
             self._shadow_tex_size = size
         self._shadow_tex_obj.write(np.ascontiguousarray(shadow_data, dtype=np.float32).tobytes())
 
+    def _upload_dl_shadow_tex(self, data: np.ndarray, total_faces: int) -> None:
+        """Reserved single-column texture for the directional (sun) shadow
+        factor, indexed like `shadowTex` but with a fixed light index of 0."""
+        size = (1, max(total_faces, 1))
+        if self._dl_shadow_tex_obj is None or self._dl_shadow_tex_size != size:
+            if self._dl_shadow_tex_obj is not None:
+                self._dl_shadow_tex_obj.release()
+            self._dl_shadow_tex_obj = self.ctx.texture(size, 1, dtype="f4")
+            self._dl_shadow_tex_obj.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self._dl_shadow_tex_size = size
+        self._dl_shadow_tex_obj.write(np.ascontiguousarray(data, dtype=np.float32).tobytes())
+
+    def _upload_gi_tex(self, data: np.ndarray, total_faces: int) -> None:
+        """Per-face RGB indirect-light texture, same face-id indexing."""
+        size = (1, max(total_faces, 1))
+        if self._gi_tex_obj is None or self._gi_tex_size != size:
+            if self._gi_tex_obj is not None:
+                self._gi_tex_obj.release()
+            self._gi_tex_obj = self.ctx.texture(size, 3, dtype="f4")
+            self._gi_tex_obj.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self._gi_tex_size = size
+        self._gi_tex_obj.write(np.ascontiguousarray(data, dtype=np.float32).tobytes())
+
     # ------------------------------------------------------------------
     def release(self) -> None:
         """Free GL resources (buffers/textures/programs). Does not free `ctx`."""
@@ -504,6 +736,12 @@ class GLRenderer:
         if self._shadow_tex_obj is not None:
             self._shadow_tex_obj.release()
             self._shadow_tex_obj = None
+        if self._dl_shadow_tex_obj is not None:
+            self._dl_shadow_tex_obj.release()
+            self._dl_shadow_tex_obj = None
+        if self._gi_tex_obj is not None:
+            self._gi_tex_obj.release()
+            self._gi_tex_obj = None
         self._ies_tex.release()
         self._sky_vao.release()
         self._sky_vbo.release()

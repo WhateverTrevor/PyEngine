@@ -1,0 +1,7 @@
+{
+  "name": "Fog Volume",
+  "category": "environment",
+  "casts_shadow": false,
+  "collidable": false,
+  "fog_volume": {"density": 0.4, "color": [180, 190, 210], "height_falloff": 0.0, "enabled": true}
+}

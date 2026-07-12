@@ -215,6 +215,107 @@ false` on a light skips tracing entirely; `casts_shadow: false` on an entity
 (the ghost, the floor) removes it from the occluder set — a moving caster
 invalidates the whole cache, so keep animated things out of it when you can.
 
+### Sun (time-of-day directional light + sky disc + shadows)
+
+Drag the **Sun** asset in and its rotation drives `scene.light.direction`
+every frame (`behaviors.SunController`, light travels along the entity's -Z,
+same convention as spotlights) — the rotate gizmo becomes a time-of-day
+control. The Details panel on a Sun entity is the world-lighting hub:
+directional intensity/color/ambient, sky disc size/softness/glow, shadow
+softness/depth, GI enable/intensity/samples, and (if the scene has fog) haze
+height-falloff/sun-scatter.
+
+The disc + a wider additive glow halo render in both sky paths (the CPU
+deferred sky in `renderer.py` and the GL sky shader) wherever a pixel's view
+ray aligns with the light's source direction within `disc_size` degrees,
+smoothstepped by `disc_softness`. **Directional shadows** extend the same
+ray-traced-shadow machinery: rays leave each face centroid along the sun's
+reverse direction, jittered across a disk (radius `tan(shadow_softness)`,
+not a sphere — the sun is infinitely far away) against the same occluder
+soup, cached exactly like point/spot factors. `shadow_depth` (0-1) blends
+the raw traced factor toward "off" (`factor = 1 - depth*(1-raw)`) without
+invalidating the cache, so it's free to tune live.
+
+### Global illumination (one-bounce, cached)
+
+Toggle GI from the Sun entity's Details panel (`scene.gi = {"enabled",
+"intensity", "samples"}`, persisted with the scene). For every face of a
+shadow-casting mesh entity, `N` cosine-weighted hemisphere rays sample the
+same occluder soup the shadow tracer already built; each hit contributes the
+hit face's *direct* radiance (`albedo/255 * (shadowed directional +
+shadowed point/spot)`, deliberately excluding ambient) times the receiver's
+own albedo, averaged over the samples and scaled by `intensity`. Because
+receivers are exactly the occluder-soup faces, animated entities
+(`casts_shadow: false`) don't bounce light either — consistent with why they
+don't cast shadows. Cached with the same world-version rule as everything
+else in `raytrace.py`: a static scene bakes once, then GI costs nothing per
+frame until geometry moves. A red wall next to a white floor under a bright
+point light visibly warms the nearby floor faces with GI on; see
+`engine/raytrace.GITracer` and `engine/renderer._gi_direct_lighting`.
+
+### HDRI import + editable sky material
+
+**+ Import HDRI** (content browser or File menu) copies a `.hdr` into
+`assets/hdri/` and writes a matching sky-sphere asset JSON, exactly like FBX
+import does for models. Opening the node editor (**M**, or the *material*
+button in Details) on a sky-sphere entity edits its **sky material**: the
+same `MaterialGraph` machinery from mesh materials, but evaluated in a
+second context. Face context (regular meshes) samples one point per face;
+sky context samples a direction grid at the source HDRI's own resolution
+(capped 1024x512), where `position`/`normal` both return `direction*0.5+0.5`
+and a new **hdri** node (`TextureSample`) samples the entity's original
+loaded image (`Environment.source`, untouched by baking) along that
+direction — or, in face context, along the face normal. Every edit re-bakes
+the graph into a float32 equirect image and rebuilds `entity.environment`'s
+image *and* ambient cube live (sky-context output is linear HDR radiance,
+clamped at >=0 only — no upper clamp, unlike the 0..255 face-context
+output). Baking at full resolution on every slider-drag frame measured
+~0.15-0.3s on the bundled `night_sky.hdr` (256x128 source) — noticeable but
+not painful at that size, and larger HDRIs would compound it, so drags bake
+at a 256x128 draft resolution and the release re-bakes at full resolution.
+
+New node types, added to both contexts and the palette/`PARAM_RANGES`:
+`add`, `power` (`exp` param), `clamp` (`min`/`max` params), `one_minus`,
+`lerp` (mix's semantics, registered as its own type so graphs can express
+either name), and `hdri`. This matches Unreal Material Editor's *core*
+vocabulary — not its full node library.
+
+### Atmospheric fog + volumetric Fog Volumes
+
+Scene fog (`enable_shadows`'s sibling, `scene.fog`) gained two knobs, tuned
+from "haze" rows on the Sun entity's Details panel, applied on the per-pixel
+paths only (the flat path keeps its original simple distance fog):
+`height_falloff` scales density by `exp(-max(height, 0) * falloff)` so haze
+thickens near the ground, and `sun_scatter` (0-1) tints the fog color toward
+the sun's color by `pow(max(dot(ray_dir, sun_dir), 0), 8) * sun_scatter` —
+a cheap forward-scattering glow when looking toward the sun through fog.
+
+The **Fog Volume** asset drops a local fog box: `entity.position +/-
+entity.scale`, world-axis-aligned (v1 — the entity's rotation does not
+affect the box, only translate/scale gizmos actually change it). It shows in
+the outliner, draws a wireframe AABB + center marker in the viewport
+(clickable — mesh-less entities can't be mouse-raycast, so Sun and Fog
+Volume are picked by screen-space proximity to their marker instead) so it
+can be selected without going through the outliner. Rendering: per pixel, a
+ray-AABB slab test clipped to `[near, surface-hit-distance]` (or a far
+constant for sky pixels — fog volumes fog the sky too) gives a path length;
+`density` (height-falloff-scaled at the segment midpoint) turns that into a
+transmittance `exp(-density * length)`, blended in *before* the global
+atmospheric fog. Both the CPU deferred path and the GL renderer support up
+to 4 simultaneously active volumes.
+
+**DirectX 12 / Vulkan gap:** this whole feature set (Sun disc/glow, ray-traced
+directional shadows, GI, atmospheric height-falloff/sun-scatter, and Fog
+Volumes) targets the CPU and OpenGL paths only. The `wgpu_renderer.py`
+backend still renders everything it already supported (ambient/HDRI ambient
+cube, directional light, point/spot with shadows, plain distance fog) and
+does not crash with a Sun or Fog Volume entity in the scene — it just
+doesn't draw the disc, doesn't shadow the sun, skips GI, and ignores fog
+volumes and the atmospheric upgrades, silently falling back to plain
+distance fog. The Fog Volume's editor-drawn wireframe box and the Sun's
+glyph are pygame UI overlay, so they still show up in the viewport
+regardless of which 3D backend is rendering underneath.
+
 ### Self-contained assets
 
 One JSON file per asset in `assets/` — mesh, light, and behaviors together,

@@ -56,6 +56,8 @@ class Entity:
         self.collidable = True           # blocks the player (see FlyController)
         self.environment = None          # Environment (HDRI sky + ambient) carrier
         self.material = None             # MaterialGraph baked onto this mesh
+        self.sun = None                  # SunDisc: sky-disc + shadow tuning (see lighting.py)
+        self.fog_volume = None           # FogVolume: local volumetric fog box (see lighting.py)
         self.asset_name: str | None = None  # set when spawned from an asset file
 
     def add_behavior(self, behavior: Behavior) -> "Entity":
@@ -73,6 +75,9 @@ class Scene:
         self.background = background
         self.sky = sky  # (top_color, horizon_color) vertical gradient, or None
         self.enable_shadows = enable_shadows
+        # one-bounce global illumination (see raytrace.GITracer); persisted with
+        # the scene, controlled from the Sun entity's Details panel
+        self.gi = {"enabled": False, "intensity": 1.0, "samples": 16}
 
     def add(self, entity: Entity) -> Entity:
         self.entities.append(entity)

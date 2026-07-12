@@ -87,7 +87,8 @@ def build_starter_scene(engine, lib):
     scene = engine.Scene(
         light=engine.DirectionalLight(Vec3(-0.4, -1.0, -0.25), ambient=0.07,
                                       color=(90, 105, 150), intensity=0.35),
-        fog=engine.Fog(color=(7, 8, 12), start=10.0, end=42.0),
+        fog=engine.Fog(color=(7, 8, 12), start=10.0, end=42.0,
+                       height_falloff=0.12, sun_scatter=0.4),
         sky=((3, 4, 8), (14, 16, 26)),
         background=(5, 6, 9),
     )
@@ -116,6 +117,22 @@ def build_starter_scene(engine, lib):
     put("Lantern", 3.4, 2.2)
     ghost = put("Ghost", -3.5, -1.5)
     ghost.transform.position.y = 1.5
+
+    # Sun: pale moonlight, its rotation matches the DirectionalLight above so
+    # the first frame doesn't jump; the rotate gizmo becomes a time-of-day
+    # control from here on. Soft directional shadows, disc/glow visible in
+    # the sky, GI left off by default (opt in from the Details panel).
+    sun = lib.instantiate("Sun")
+    sun.transform.rotation = Vec3(-1.13, 1.01, 0.0)
+    scene.add(sun)
+
+    # Fog Volume: a low ground-hugging haze bank across the courtyard floor.
+    fog_vol = lib.instantiate("Fog Volume")
+    fog_vol.fog_volume.density = 0.12
+    fog_vol.fog_volume.color = (60, 66, 78)
+    fog_vol.transform.position = Vec3(0.0, 1.1, -2.0)
+    fog_vol.transform.scale = Vec3(7.0, 1.6, 6.0)
+    scene.add(fog_vol)
     return scene
 
 
@@ -306,7 +323,8 @@ class Editor:
     def _outliner_rows(self):
         return [e for e in self.scene.entities
                 if e.mesh is not None or e.light is not None
-                or e.environment is not None]
+                or e.environment is not None or e.sun is not None
+                or e.fog_volume is not None]
 
     def _copy_entity_state(self, src, dst) -> None:
         """Carry per-entity edited state from src onto a freshly instantiated dst.
@@ -334,10 +352,18 @@ class Editor:
             if flicker_base is not None and hasattr(dst.light, "intensity"):
                 dst.light.intensity = flicker_base
 
-        if src.material is not None and dst.mesh is not None:
+        if src.material is not None and (dst.mesh is not None or dst.environment is not None):
             dst.material = self.engine_mod.MaterialGraph.from_dict(
                 src.material.to_dict())
-            dst.material.apply(dst.mesh)
+            dst.material.apply(dst)
+
+        if src.sun is not None and dst.sun is not None:
+            for key in self.engine_mod.assets._SUN_PROPS:
+                setattr(dst.sun, key, getattr(src.sun, key))
+
+        if src.fog_volume is not None and dst.fog_volume is not None:
+            for key in self.engine_mod.assets._FOG_VOLUME_PROPS:
+                setattr(dst.fog_volume, key, getattr(src.fog_volume, key))
 
     # ---- transform gizmo: W/E/R select translate / rotate / scale ----
     _GIZMO_AXES = (((1.0, 0.0, 0.0), (225, 85, 85)),
@@ -491,13 +517,81 @@ class Editor:
             e.transform.scale = Vec3(*s)
         self.dirty = True
 
-    # ---- details panel rows for the selected light ----
+    # ---- details panel rows for the selected light / sun / fog volume ----
+    @staticmethod
+    def _slider_row(label, lo, hi, get, set_, fmt="{:.2f}"):
+        return {"kind": "slider", "label": label, "min": lo, "max": hi,
+                "get": get, "set": set_, "fmt": fmt}
+
+    @staticmethod
+    def _color_rows(get_color, set_color):
+        def setter(i):
+            def _set(v):
+                c = list(get_color())
+                c[i] = int(v)
+                set_color(tuple(c))
+            return _set
+        return [Editor._slider_row("red", 0, 255, lambda: get_color()[0], setter(0), "{:.0f}"),
+                Editor._slider_row("green", 0, 255, lambda: get_color()[1], setter(1), "{:.0f}"),
+                Editor._slider_row("blue", 0, 255, lambda: get_color()[2], setter(2), "{:.0f}")]
+
+    def _sun_rows(self, e):
+        sun, scene, dl = e.sun, self.scene, self.scene.light
+        slider = self._slider_row
+        rows = [
+            slider("intensity", 0.0, 8.0, lambda: dl.intensity,
+                   lambda v: setattr(dl, "intensity", v)),
+            *self._color_rows(lambda: dl.color, lambda c: setattr(dl, "color", c)),
+            slider("ambient", 0.0, 1.0, lambda: dl.ambient,
+                   lambda v: setattr(dl, "ambient", v)),
+            slider("disc size", 0.2, 10.0, lambda: sun.disc_size,
+                   lambda v: setattr(sun, "disc_size", v), "{:.1f}°"),
+            slider("disc softness", 0.0, 1.0, lambda: sun.disc_softness,
+                   lambda v: setattr(sun, "disc_softness", v)),
+            slider("glow", 0.0, 1.0, lambda: sun.glow, lambda v: setattr(sun, "glow", v)),
+            {"kind": "toggle", "label": "disc enabled", "get": lambda: sun.enabled,
+             "set": lambda v: setattr(sun, "enabled", v)},
+            slider("shadow softness", 0.0, 5.0, lambda: sun.shadow_softness,
+                   lambda v: setattr(sun, "shadow_softness", v), "{:.1f}°"),
+            slider("shadow depth", 0.0, 1.0, lambda: sun.shadow_depth,
+                   lambda v: setattr(sun, "shadow_depth", v)),
+            {"kind": "toggle", "label": "GI enabled",
+             "get": lambda: scene.gi.get("enabled", False),
+             "set": lambda v: scene.gi.__setitem__("enabled", v)},
+            slider("GI intensity", 0.0, 4.0, lambda: scene.gi.get("intensity", 1.0),
+                   lambda v: scene.gi.__setitem__("intensity", v)),
+            slider("GI samples", 4.0, 64.0, lambda: scene.gi.get("samples", 16),
+                   lambda v: scene.gi.__setitem__("samples", int(round(v))), "{:.0f}"),
+        ]
+        if scene.fog is not None:
+            fog = scene.fog
+            rows += [
+                slider("haze height falloff", 0.0, 2.0, lambda: fog.height_falloff,
+                       lambda v: setattr(fog, "height_falloff", v)),
+                slider("haze sun scatter", 0.0, 1.0, lambda: fog.sun_scatter,
+                       lambda v: setattr(fog, "sun_scatter", v)),
+            ]
+        return rows
+
+    def _fog_volume_rows(self, e):
+        fv = e.fog_volume
+        slider = self._slider_row
+        return [
+            slider("density", 0.0, 3.0, lambda: fv.density,
+                   lambda v: setattr(fv, "density", v)),
+            *self._color_rows(lambda: fv.color, lambda c: setattr(fv, "color", c)),
+            slider("height falloff", 0.0, 2.0, lambda: fv.height_falloff,
+                   lambda v: setattr(fv, "height_falloff", v)),
+            {"kind": "toggle", "label": "enabled", "get": lambda: fv.enabled,
+             "set": lambda v: setattr(fv, "enabled", v)},
+        ]
+
     def _details_rows(self):
         e = self.selected
         if e is None:
             return []
         rows = []
-        if e.mesh is not None:
+        if e.mesh is not None or e.environment is not None:
             rows.append({"kind": "button", "label": "material",
                          "text": "open node editor  (M)",
                          "action": lambda: setattr(self, "mat_ui",
@@ -508,6 +602,10 @@ class Editor:
                             "max": 3.0, "get": lambda: env.strength,
                             "set": lambda v: setattr(env, "strength", v),
                             "fmt": "{:.2f}"}]
+        if e.sun is not None:
+            return rows + self._sun_rows(e)
+        if e.fog_volume is not None:
+            return rows + self._fog_volume_rows(e)
         if e.light is None:
             return rows
         light = e.light
@@ -599,6 +697,7 @@ class Editor:
                 ("Save", self._save_scene, True),
                 ("Save As...", self._save_scene_as_dialog, True),
                 ("Import FBX...", self._import_fbx_dialog, True),
+                ("Import HDRI...", self._import_hdri_dialog, True),
                 ("Exit", self._quit, True),
             ],
             "Edit": [
@@ -963,6 +1062,10 @@ class Editor:
         import pygame
         return pygame.Rect(brect.right - 130, brect.y + 4, 120, 20)
 
+    def _import_hdri_btn_rect(self, brect):
+        import pygame
+        return pygame.Rect(brect.right - 262, brect.y + 4, 126, 20)
+
     def _import_fbx_dialog(self) -> None:
         try:
             import tkinter as tk
@@ -981,6 +1084,30 @@ class Editor:
             return
         try:
             name = self.engine_mod.import_fbx(path, self.lib.directory)
+            self.lib.reload()
+            self.icons[name] = make_icon(self.engine_mod, self.lib.by_name[name])
+            self.status = (f"imported '{name}' — drag it from the browser", 5.0)
+        except Exception as ex:
+            self.status = (f"import failed: {ex}", 6.0)
+
+    def _import_hdri_dialog(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                title="Import HDRI",
+                filetypes=[("Radiance HDR", "*.hdr"), ("All files", "*.*")])
+            root.destroy()
+        except Exception as ex:
+            self.status = (f"file dialog unavailable: {ex}", 5.0)
+            return
+        if not path:
+            return
+        try:
+            name = self.engine_mod.import_hdri(path, self.lib.directory)
             self.lib.reload()
             self.icons[name] = make_icon(self.engine_mod, self.lib.by_name[name])
             self.status = (f"imported '{name}' — drag it from the browser", 5.0)
@@ -1080,7 +1207,7 @@ class Editor:
             elif inp.pressed(pygame.K_r):
                 self.gizmo_mode, self.gizmo_drag = "scale", None
         if inp.pressed(pygame.K_m) and self.selected is not None \
-                and self.selected.mesh is not None:
+                and (self.selected.mesh is not None or self.selected.environment is not None):
             self.mat_ui = MaterialEditorUI(self, self.selected)
 
         # rotate / scale the selection
@@ -1125,6 +1252,8 @@ class Editor:
         elif pid == "browser":
             if self._import_btn_rect(content).collidepoint(mp):
                 self._import_fbx_dialog()
+            elif self._import_hdri_btn_rect(content).collidepoint(mp):
+                self._import_hdri_dialog()
             else:
                 asset = self._tile_at(mp, content)
                 if asset is not None:
@@ -1178,7 +1307,27 @@ class Editor:
                 return None, origin + direction * t
         return None, origin + direction * 8.0
 
+    def _pick_marker(self, mp, w, h):
+        """Screen-space proximity pick for mesh-less entities (Sun, Fog
+        Volume) that a raycast can't hit: whichever marker's projected
+        center is within a small pixel radius, nearest wins."""
+        best, best_d = None, 14.0
+        for e in self.scene.entities:
+            if e.sun is None and e.fog_volume is None:
+                continue
+            pt = self.camera.project(e.transform.position, w, h)
+            if pt is None:
+                continue
+            d = math.hypot(pt[0] - mp[0], pt[1] - mp[1])
+            if d < best_d:
+                best, best_d = e, d
+        return best
+
     def _click_viewport(self, mp, w, h) -> None:
+        marker = self._pick_marker(mp, w, h)
+        if marker is not None:
+            self.selected = marker
+            return
         entity, _ = self._mouse_hit(mp, w, h)
         self.selected = entity
 
@@ -1432,6 +1581,45 @@ class Editor:
             color = tuple(e.light.color) if e.light.enabled else (70, 70, 70)
             pygame.draw.circle(surf, color, (x, y), 4)
             pygame.draw.circle(surf, color, (x, y), 8, 1)
+        # sun glyph (a small sunburst at the entity position)
+        for e in self.scene.entities:
+            if e.sun is None:
+                continue
+            pt = self.camera.project(e.transform.position, w, h)
+            if pt is None:
+                continue
+            x, y = int(pt[0]), int(pt[1])
+            color = (255, 224, 150) if e.sun.enabled else (110, 108, 96)
+            pygame.draw.circle(surf, color, (x, y), 5, 1)
+            for k in range(8):
+                a = k * math.pi / 4.0
+                x0, y0 = x + math.cos(a) * 7, y + math.sin(a) * 7
+                x1, y1 = x + math.cos(a) * 11, y + math.sin(a) * 11
+                pygame.draw.line(surf, color, (x0, y0), (x1, y1))
+        # fog volume: wireframe AABB + center marker (world-axis-aligned;
+        # rotation is not applied to the box, see engine/lighting.FogVolume)
+        for e in self.scene.entities:
+            if e.fog_volume is None:
+                continue
+            p, s = e.transform.position, e.transform.scale
+            lo = (p.x - abs(s.x), p.y - abs(s.y), p.z - abs(s.z))
+            hi = (p.x + abs(s.x), p.y + abs(s.y), p.z + abs(s.z))
+            corners = [(x, y, z) for x in (lo[0], hi[0])
+                      for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]
+            pts = [self.camera.project(self.engine_mod.Vec3(*c), w, h) for c in corners]
+            color = tuple(e.fog_volume.color) if e.fog_volume.enabled else (90, 90, 95)
+            edges = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
+                     (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7))
+            for a, b in edges:
+                if pts[a] is not None and pts[b] is not None:
+                    pygame.draw.line(surf, color, (int(pts[a][0]), int(pts[a][1])),
+                                     (int(pts[b][0]), int(pts[b][1])), 1)
+            center = self.camera.project(p, w, h)
+            if center is not None:
+                cx, cy = int(center[0]), int(center[1])
+                pygame.draw.circle(surf, color, (cx, cy), 5, 1)
+                pygame.draw.line(surf, color, (cx - 7, cy), (cx + 7, cy))
+                pygame.draw.line(surf, color, (cx, cy - 7), (cx, cy + 7))
         # selection brackets + transform gizmo
         e = self.selected
         if e is None:
@@ -1576,6 +1764,12 @@ class Editor:
         pygame.draw.rect(surf, PANEL_EDGE, btn, 1, border_radius=4)
         label = self.font_small.render("+ Import FBX", True, ACCENT)
         surf.blit(label, (btn.x + (btn.width - label.get_width()) // 2, btn.y + 4))
+        hbtn = self._import_hdri_btn_rect(rect)
+        pygame.draw.rect(surf, HOVER_BG if hbtn.collidepoint(mp) else (33, 36, 44),
+                         hbtn, border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, hbtn, 1, border_radius=4)
+        hlabel = self.font_small.render("+ Import HDRI", True, ACCENT)
+        surf.blit(hlabel, (hbtn.x + (hbtn.width - hlabel.get_width()) // 2, hbtn.y + 4))
         if self.status[1] > 0:
             msg = self.font_small.render(self.status[0][:60], True, (235, 210, 140))
             surf.blit(msg, (rect.x + 10, rect.y + 6))
@@ -1607,8 +1801,8 @@ class MaterialEditorUI:
     its 18px title bar to move it, click X (or M/Esc) to close.
     """
 
-    PALETTE = ("color", "position", "normal", "checker", "noise",
-               "gradient", "mix", "multiply")
+    PALETTE = ("color", "position", "normal", "checker", "noise", "gradient",
+               "mix", "multiply", "add", "power", "clamp", "one_minus", "lerp", "hdri")
     DEFAULT_SIZE = (900, 560)
 
     def __init__(self, editor: Editor, entity):
@@ -1679,8 +1873,11 @@ class MaterialEditorUI:
         return out
 
     # ---- interaction ----
-    def apply(self) -> None:
-        self.graph.apply(self.entity.mesh)
+    def apply(self, draft: bool = False) -> None:
+        """Re-bake the graph. `draft=True` (used while dragging a param
+        slider) bakes a sky material at quarter resolution -- cheap enough
+        for every frame; the final release re-bakes at full resolution."""
+        self.graph.apply(self.entity, draft=draft)
         self.editor.dirty = True
 
     def update(self, engine, dt: float) -> None:
@@ -1723,10 +1920,12 @@ class MaterialEditorUI:
                     lo, hi = self.editor.engine_mod.PARAM_RANGES.get(pname, (0, 1))
                     f = min(max((mp[0] - (rr.x + 46)) / max(rr.width - 52, 1), 0.0), 1.0)
                     node["params"][pname] = lo + f * (hi - lo)
-                    self.apply()
+                    self.apply(draft=True)
         else:
             if self.drag_link is not None:
                 self._finish_link(mp, panel)
+            if self.drag_param is not None:
+                self.apply(draft=False)  # full-res bake once the drag releases
             self.drag_node = self.drag_param = self.drag_link = self.drag_title = None
 
     def _press(self, mp, panel) -> None:

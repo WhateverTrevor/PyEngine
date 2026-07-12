@@ -1,0 +1,10 @@
+{
+  "name": "Sun",
+  "category": "environment",
+  "casts_shadow": false,
+  "collidable": false,
+  "rotation": [-1.13, 1.01, 0.0],
+  "sun": {"disc_size": 1.0, "disc_softness": 0.35, "glow": 0.4, "enabled": true,
+          "shadow_softness": 0.5, "shadow_depth": 0.85, "shadow_samples": 6},
+  "behaviors": [{"type": "SunController"}]
+}

@@ -79,16 +79,67 @@ def save_hdr(path: str, image: np.ndarray) -> None:
         fh.write(rgbe.tobytes())
 
 
+def import_hdri(src_path: str, assets_dir: str) -> str:
+    """Copy an .hdr file into assets/hdri/ and write a sky-sphere asset JSON.
+
+    Mirrors `fbx.import_fbx`'s pattern: validate it parses, copy it into the
+    asset library's hdri/ folder, generate a self-contained
+    `{"environment": {"hdri": ...}}` asset (same shape as sky_sphere.json),
+    and return the new asset's display name so the caller can reload the
+    library and grab a thumbnail.
+    """
+    import json
+    import shutil
+
+    load_hdr(src_path)  # raises if the file doesn't parse as a Radiance .hdr
+    stem = os.path.splitext(os.path.basename(src_path))[0]
+    hdri_dir = os.path.join(assets_dir, "hdri")
+    os.makedirs(hdri_dir, exist_ok=True)
+    dest_name = os.path.basename(src_path)
+    dest = os.path.join(hdri_dir, dest_name)
+    if os.path.abspath(dest) != os.path.abspath(src_path):
+        shutil.copyfile(src_path, dest)
+    name = stem.replace("_", " ").replace("-", " ").title()
+    asset = {"name": name, "category": "environment",
+             "environment": {"hdri": f"hdri/{dest_name}", "strength": 1.0}}
+    with open(os.path.join(assets_dir, f"{stem}.json"), "w", encoding="utf-8") as f:
+        json.dump(asset, f, indent=2)
+    return name
+
+
 _CUBE_AXES = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0],
                        [0, -1, 0], [0, 0, 1], [0, 0, -1]], dtype=np.float32)
 
 
+def sample_equirect(image: np.ndarray, dirs: np.ndarray) -> np.ndarray:
+    """Radiance along unit direction(s) from an equirect image: (N, 3) -> (N, 3)."""
+    h, w = image.shape[:2]
+    theta = np.arccos(np.clip(dirs[:, 1], -1.0, 1.0))
+    phi = np.arctan2(dirs[:, 2], dirs[:, 0]) % (2.0 * np.pi)
+    y = np.clip((theta / np.pi * h).astype(np.int32), 0, h - 1)
+    x = np.clip((phi / (2.0 * np.pi) * w).astype(np.int32), 0, w - 1)
+    return image[y, x]
+
+
 class Environment:
-    """Equirectangular HDR environment: sky sampling + diffuse ambient."""
+    """Equirectangular HDR environment: sky sampling + diffuse ambient.
+
+    `source` is the originally loaded HDR image and never changes; `image` is
+    what actually renders and starts out equal to it, but a sky MaterialGraph
+    (see materials.py) can re-bake `image` (and, via `set_image`, the ambient
+    cube derived from it) while leaving `source` alone as the thing `hdri`
+    material nodes sample from.
+    """
 
     def __init__(self, image: np.ndarray, strength: float = 1.0):
         self.image = np.asarray(image, dtype=np.float32)
+        self.source = self.image.copy()
         self.strength = strength
+        self._build_ambient_cube()
+
+    def set_image(self, image: np.ndarray) -> None:
+        """Swap the rendered equirect image and rebuild the ambient cube."""
+        self.image = np.asarray(image, dtype=np.float32)
         self._build_ambient_cube()
 
     def _build_ambient_cube(self) -> None:
@@ -113,12 +164,7 @@ class Environment:
 
     def sample(self, dirs: np.ndarray) -> np.ndarray:
         """Radiance along unit direction(s): (N, 3) -> (N, 3) float32."""
-        h, w = self.image.shape[:2]
-        theta = np.arccos(np.clip(dirs[:, 1], -1.0, 1.0))
-        phi = np.arctan2(dirs[:, 2], dirs[:, 0]) % (2.0 * np.pi)
-        y = np.clip((theta / np.pi * h).astype(np.int32), 0, h - 1)
-        x = np.clip((phi / (2.0 * np.pi) * w).astype(np.int32), 0, w - 1)
-        return self.image[y, x]
+        return sample_equirect(self.image, dirs)
 
     def ambient(self, normals: np.ndarray) -> np.ndarray:
         """Diffuse environment light for unit normals: (M, 3) -> (M, 3)."""

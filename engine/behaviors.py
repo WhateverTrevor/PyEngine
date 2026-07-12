@@ -200,6 +200,25 @@ class FlyController(Behavior):
                                               self.collide_radius)
 
 
+class SunController(Behavior):
+    """Drives `scene.light.direction` from this entity's rotation.
+
+    The light travels along the entity's -Z axis -- the same aim convention
+    spotlights use -- so the rotate gizmo (E) becomes a time-of-day control:
+    spin the Sun entity and the directional light (and its sky disc) follow.
+    """
+
+    def update(self, entity: Entity, dt: float, engine) -> None:
+        scene = getattr(engine, "scene", None)
+        if scene is None:
+            return
+        m = entity.transform.matrix()
+        axis = m[:3, :3] @ np.array([0.0, 0.0, -1.0])
+        norm = np.linalg.norm(axis)
+        if norm > 1e-9:
+            scene.light.direction = Vec3(*(axis / norm))
+
+
 class FlashlightController(Behavior):
     """Keep the entity's spotlight glued to the camera; toggle with a key."""
 
