@@ -218,7 +218,8 @@ def make_material_icon(engine, graph, size=ICON):
     surf = pygame.Surface((size, size))
     surf.fill((29, 31, 37))
     sphere = engine.icosphere(radius=1.0, subdivisions=2)
-    sphere.face_colors = graph.evaluate(sphere)
+    (sphere.face_colors, sphere.face_roughness,
+     sphere.face_metallic, sphere.face_emissive) = graph.evaluate_pbr(sphere)
     mini = engine.Scene(
         light=engine.DirectionalLight(engine.Vec3(-0.5, -0.9, -0.6), ambient=0.42),
         background=(29, 31, 37))

@@ -105,6 +105,39 @@ def _face_light_strength(info: _LightInfo, normals: np.ndarray,
     return strength
 
 
+def _ggx_specular(n: np.ndarray, v: np.ndarray, l: np.ndarray,
+                  alpha: np.ndarray, f0: np.ndarray) -> np.ndarray:
+    """Cook-Torrance/GGX specular BRDF (D*G*F / (4*NdotV*NdotL)) for a batch
+    of pixels, all arrays float32. `n`/`v`/`l` are (P, 3) unit vectors
+    (normal/view/to-light); `alpha` is (P,) perceptual-roughness^2; `f0` is
+    (P, 3) the metallic-lerp reflectance at normal incidence. Caller still
+    multiplies the result by NdotL*radiance (the standard rendering
+    equation) -- this returns the BRDF term alone.
+
+    Smith-GGX geometry term uses the direct-lighting `k = (a+1)^2/8` remap
+    (Karis/UE4), a compact closed form that avoids a second visibility pass.
+    """
+    h = v + l
+    h /= np.maximum(np.linalg.norm(h, axis=1, keepdims=True), 1e-8)
+    ndoth = np.clip(np.einsum("ij,ij->i", n, h), 0.0, 1.0)
+    ndotv = np.clip(np.einsum("ij,ij->i", n, v), 1e-4, 1.0)
+    ndotl = np.clip(np.einsum("ij,ij->i", n, l), 1e-4, 1.0)
+    vdoth = np.clip(np.einsum("ij,ij->i", v, h), 0.0, 1.0)
+
+    a2 = alpha * alpha
+    denom = ndoth * ndoth * (a2 - 1.0) + 1.0
+    d = a2 / np.maximum(np.pi * denom * denom, 1e-8)
+
+    k = (alpha + 1.0) ** 2 / 8.0
+    g1v = ndotv / np.maximum(ndotv * (1.0 - k) + k, 1e-8)
+    g1l = ndotl / np.maximum(ndotl * (1.0 - k) + k, 1e-8)
+    g = g1v * g1l
+
+    f = f0 + (1.0 - f0) * ((1.0 - vdoth) ** 5)[:, None]
+    spec = (d * g / np.maximum(4.0 * ndotv * ndotl, 1e-4))[:, None] * f
+    return spec.astype(np.float32)
+
+
 def _scene_sun(scene):
     """First enabled-or-not Sun entity's SunDisc, or None."""
     for e in scene.entities:
@@ -310,7 +343,12 @@ class Renderer:
     def _directional_base(self, scene, entity, normals, centroids, env, tracer):
         """Ambient + directional term for one entity's faces. Only the
         directional (lambert) part is shadowed -- ambient/sky light isn't
-        blocked by the sun's ray-traced occlusion test."""
+        blocked by the sun's ray-traced occlusion test.
+
+        Returns (base (M, 3), shadowed_lambert (M,)) -- the latter is the
+        same shadowed NdotL the diffuse term used, reused by the deferred
+        pass's per-pixel sun specular so shadow/lambert stay consistent
+        between the two terms without recomputing the ray-traced shadow."""
         dl = scene.light
         dl_dir = dl.direction.to_array()
         to_light = -dl_dir / max(np.linalg.norm(dl_dir), 1e-12)
@@ -325,8 +363,10 @@ class Renderer:
                     centroids, normals, active)
                 lambert = lambert * (1.0 - sun.shadow_depth * (1.0 - raw))
         if env is not None:  # image-based ambient from the HDRI environment
-            return env.ambient(normals) + dl_color[None, :] * lambert[:, None]
-        return dl.ambient + dl_color[None, :] * ((1.0 - dl.ambient) * lambert)[:, None]
+            base = env.ambient(normals) + dl_color[None, :] * lambert[:, None]
+        else:
+            base = dl.ambient + dl_color[None, :] * ((1.0 - dl.ambient) * lambert)[:, None]
+        return base, lambert
 
     def _gi_contrib(self, scene, tracer) -> dict:
         """{id(entity): (M, 3) indirect-light array} from the cached GI bake,
@@ -432,7 +472,8 @@ class Renderer:
                 continue
             normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
 
-            lum = self._directional_base(scene, entity, normals, centroids, env, tracer)
+            lum, _sun_lambert = self._directional_base(scene, entity, normals, centroids,
+                                                        env, tracer)
             gi = gi_map.get(id(entity))
             if gi is not None:
                 lum = lum + gi
@@ -446,7 +487,13 @@ class Renderer:
                         entity, info.light, info.pos, centroids, normals, active)
                 lum += info.colorf[None, :] * strength[:, None]
 
-            colors = entity.mesh.face_colors * lum
+            # Flat mode: per-face centroid lighting has no sensible per-pixel
+            # view vector for a specular lobe, so PBR here is diffuse-only
+            # (metallic darkens the diffuse response, same as the deferred
+            # path) + an unconditional emissive term -- no specular highlight.
+            # Documented approximation (see class docstring / HANDOFF).
+            lum = lum * (1.0 - entity.mesh.face_metallic)[:, None]
+            colors = entity.mesh.face_colors * lum + entity.mesh.face_emissive
             if fog is not None:
                 f = np.clip((depth - fog.start) / (fog.end - fog.start), 0.0, 1.0)[:, None]
                 colors = colors * (1.0 - f) + fog_color * f
@@ -514,6 +561,7 @@ class Renderer:
 
         # --- collect geometry + per-face attributes across all entities ---
         f_normals, f_centroids, f_albedo, f_base = [], [], [], []
+        f_roughness, f_metallic, f_emissive, f_sun_lambert = [], [], [], []
         f_shadow = [[] for _ in lights]
         polys = []  # (depth, global_face_id, points)
         offset = 0
@@ -529,11 +577,20 @@ class Renderer:
             f_normals.append(normals)
             f_centroids.append(centroids)
             f_albedo.append(entity.mesh.face_colors)
-            base = self._directional_base(scene, entity, normals, centroids, env, tracer)
+            f_roughness.append(entity.mesh.face_roughness)
+            f_metallic.append(entity.mesh.face_metallic)
+            f_emissive.append(entity.mesh.face_emissive)
+            base, sun_lambert = self._directional_base(scene, entity, normals, centroids,
+                                                        env, tracer)
             gi = gi_map.get(id(entity))
             if gi is not None:
                 base = base + gi
+            # PBR diffuse response: metals have (near-)zero diffuse albedo,
+            # ambient/directional/GI all treated as diffuse-only terms here.
+            # At the default metallic=0 this is a no-op (*1.0).
+            base = base * (1.0 - entity.mesh.face_metallic)[:, None]
             f_base.append(base)
+            f_sun_lambert.append(sun_lambert)
             for li, info in enumerate(lights):
                 if tracer is not None and info.light.cast_shadows:
                     strength = _face_light_strength(info, normals, centroids)
@@ -580,6 +637,10 @@ class Renderer:
         centroids = np.concatenate(f_centroids).astype(np.float32)
         albedo = np.concatenate(f_albedo).astype(np.float32)
         base = np.concatenate(f_base).astype(np.float32)
+        roughness = np.concatenate(f_roughness).astype(np.float32)
+        metallic = np.concatenate(f_metallic).astype(np.float32)
+        emissive = np.concatenate(f_emissive).astype(np.float32)
+        sun_lambert = np.concatenate(f_sun_lambert).astype(np.float32)
         shadows = [np.concatenate(s).astype(np.float32) for s in f_shadow]
 
         # --- per-pixel pass, run only on visible (non-sky) pixels ---
@@ -664,7 +725,50 @@ class Renderer:
         n = normals[fid]                       # (V, 3)
         pos = cam[None, :] + dirs * t[:, None]
 
-        lum = base[fid].copy()
+        # Fast-path gate: skip all PBR per-pixel work when every face in the
+        # frame is at the default params (roughness=1, metallic=0) -- the
+        # common case, and the whole point of the backward-compat contract.
+        # `pbr_active`/`has_emissive` are cheap checks over the small
+        # per-face arrays, done once for the whole frame.
+        pbr_active = bool(np.any(metallic > 1e-6) or np.any(roughness < 1.0 - 1e-6))
+        has_emissive = bool(np.any(emissive > 1e-6))
+
+        lum = base[fid].copy()          # diffuse-ish (ambient+directional+GI), already *(1-metallic)
+        spec = None                     # additive specular, NOT multiplied by albedo
+
+        if pbr_active:
+            # PBR per-pixel params, gathered once for the whole visible set.
+            # spec_scale is the backward-compat gate: at the default params
+            # it is exactly 0, so a default-param face gets zero specular
+            # contribution even inside an otherwise-PBR frame.
+            rough_px = roughness[fid]
+            metal_px = metallic[fid]
+            albedo01 = albedo[fid] / 255.0
+            alpha_px = np.clip(rough_px, 0.02, 1.0) ** 2
+            f0_px = 0.04 * (1.0 - metal_px)[:, None] + albedo01 * metal_px[:, None]
+            spec_scale_px = 1.0 - rough_px * (1.0 - metal_px)
+            view_dir = -dirs
+            view_dir /= np.maximum(np.linalg.norm(view_dir, axis=1, keepdims=True), 1e-8)
+            spec = np.zeros_like(lum)
+
+            # sun (directional) specular -- reuses the shadowed NdotL the
+            # diffuse term already computed in `_directional_base`, so
+            # shadow/lambert stay consistent between the two terms.
+            if spec_scale_px.any():
+                dl = scene.light
+                dl_dir = dl.direction.to_array()
+                dnorm = max(np.linalg.norm(dl_dir), 1e-12)
+                to_light = (-dl_dir / dnorm).astype(np.float32)
+                dl_color = (np.asarray(dl.color, dtype=np.float32) / 255.0) * dl.intensity
+                sl = sun_lambert[fid]
+                active = np.flatnonzero((sl > 1e-4) & (spec_scale_px > 1e-6))
+                if len(active):
+                    l_dir = np.broadcast_to(to_light, (len(active), 3))
+                    brdf = _ggx_specular(n[active], view_dir[active], l_dir,
+                                         alpha_px[active], f0_px[active])
+                    spec[active] += (dl_color[None, :] * brdf
+                                     * (sl[active] * spec_scale_px[active])[:, None])
+
         for li, info in enumerate(lights):
             light = info.light
             delta_all = info.pos.astype(np.float32)[None, :] - pos
@@ -678,7 +782,7 @@ class Renderer:
             atten *= atten
             lambert = np.clip(
                 np.einsum("ij,ij->i", n[sel], delta) / dist, 0.0, 1.0)
-            strength = (light.intensity * atten) * lambert
+            radiance = light.intensity * atten   # no lambert yet -- shared by diffuse+specular
             if info.cos_in is not None or info.curve is not None:
                 to_px = -delta / dist[:, None]
                 cos_ang = to_px @ info.axis.astype(np.float32)
@@ -686,19 +790,38 @@ class Renderer:
                     cone = np.clip((cos_ang - info.cos_out)
                                    / max(info.cos_in - info.cos_out, 1e-6),
                                    0.0, 1.0)
-                    strength *= cone * cone
+                    radiance *= cone * cone
                 if info.curve is not None:
                     ang = np.degrees(np.arccos(np.clip(cos_ang, -1.0, 1.0)))
-                    strength *= info.curve[ang.astype(np.int32)]
-            strength *= shadows[li][fid[sel]]
+                    radiance *= info.curve[ang.astype(np.int32)]
+            radiance *= shadows[li][fid[sel]]
+            if pbr_active:
+                strength = radiance * lambert * (1.0 - metal_px[sel])
+            else:
+                strength = radiance * lambert
             lum[sel] += info.colorf.astype(np.float32)[None, :] * strength[:, None]
 
+            if pbr_active:
+                spec_active = np.flatnonzero((radiance > 1e-4) & (spec_scale_px[sel] > 1e-6))
+                if len(spec_active):
+                    s = sel[spec_active]
+                    l_dir = delta[spec_active] / dist[spec_active, None]
+                    brdf = _ggx_specular(n[s], view_dir[s], l_dir,
+                                         alpha_px[s], f0_px[s])
+                    spec_strength = (radiance[spec_active] * lambert[spec_active]
+                                    * spec_scale_px[s])
+                    spec[s] += info.colorf.astype(np.float32)[None, :] * brdf * spec_strength[:, None]
+
         out = albedo[fid] * lum
+        if spec is not None:
+            out += spec * 255.0
         if vols:
             near_arr = np.full(len(vis), near, dtype=np.float32)
             self._apply_fog_volumes(out, cam, dirs, near_arr, t, vols)
         if fog is not None:
             self._apply_atmosphere(out, scene, dirs, t, pos, fog)
+        if has_emissive:
+            out += emissive[fid]         # emissive is unconditional -- visible even unlit/in shadow
         np.clip(out, 0.0, 255.0, out=out)
         frame.reshape(-1, 3)[vis] = out.astype(np.uint8)
 

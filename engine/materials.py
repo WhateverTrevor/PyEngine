@@ -30,13 +30,15 @@ from .environment import sample_equirect
 # node type -> (input port names, {param: default})
 #
 # Unreal Material Editor alignment: names/inputs/params mirror UE's node
-# library where this engine's flat-per-face-color pipeline can honor them.
-# The Output node exposes UE's Material Attributes vocabulary (BaseColor,
-# Emissive Color, Roughness, Metallic) even though only BaseColor + Emissive
-# are actually consumed (see `_evaluate_common`'s "output" case) -- Roughness
-# and Metallic are wired, evaluated (so upstream graph errors still surface),
-# and stored, but INERT: this renderer has no PBR shading model, only flat
-# per-face albedo. That is a deliberate, documented limitation, not a bug.
+# library where this engine's per-face materials can honor them. The Output
+# node exposes UE's Material Attributes vocabulary (BaseColor, Emissive
+# Color, Roughness, Metallic); all four are baked to per-face arrays
+# (`evaluate_pbr` / `Mesh.face_roughness` / `face_metallic` / `face_emissive`)
+# and consumed by the CPU deferred renderer's metallic-roughness shading
+# model. Unconnected pins bake their NODE_DEFS-implied defaults (roughness=1,
+# metallic=0, emissive=0) -- the same defaults `Mesh` uses when no material
+# has ever baked onto it, so a default-param mesh renders identically to the
+# pre-PBR lambert-only pipeline (see renderer.py's deferred pass).
 NODE_DEFS = {
     "output":   (("base_color", "emissive", "roughness", "metallic"), {}),
     # -- Constants (Unreal: Constant / Constant2Vector / Constant3Vector /
@@ -198,7 +200,7 @@ class MaterialGraph:
     # ---- evaluation ----
     def _evaluate_common(self, m: int, sample_pts: np.ndarray, pos01: np.ndarray,
                          normal_out: np.ndarray, face_uv: np.ndarray, hdri_fn,
-                         output_default: np.ndarray) -> np.ndarray:
+                         output_default: np.ndarray, pbr_out: dict | None = None) -> np.ndarray:
         """Shared node walk for both contexts (all arrays are (m, 3) float64).
 
         `sample_pts` is the "world position" procedural nodes (checker/noise)
@@ -206,6 +208,12 @@ class MaterialGraph:
         `normal_out` is what the `normal` node returns; `face_uv` (m, 2) is
         what an unconnected TextureSample / TexCoord(0) reads; `hdri_fn()`
         computes the `hdri` node lazily (only called if the graph uses it).
+
+        `pbr_out`, if given, is filled with the Output node's raw roughness/
+        metallic/emissive (m, 3) arrays and the returned array is BaseColor
+        alone (emissive is a separate per-face term, not summed in); with
+        `pbr_out=None` (the sky context) the legacy base+emissive sum is
+        returned instead, since a sky has no separate emissive/PBR concept.
         """
         memo: dict[int, object] = {}
 
@@ -346,9 +354,15 @@ class MaterialGraph:
             elif kind == "output":
                 base = inp("base_color", output_default)
                 emissive = inp("emissive", const(0.0))
-                inp("roughness", const(0.5))   # evaluated for graph validity; inert -- see NODE_DEFS docstring
-                inp("metallic", const(0.0))    # inert, same reason
-                out = base + emissive
+                roughness = inp("roughness", const(1.0))
+                metallic = inp("metallic", const(0.0))
+                if pbr_out is not None:
+                    pbr_out["roughness"] = roughness
+                    pbr_out["metallic"] = metallic
+                    pbr_out["emissive"] = emissive
+                    out = base
+                else:
+                    out = base + emissive
             else:
                 out = const(0.5)
             memo[nid] = out
@@ -375,6 +389,36 @@ class MaterialGraph:
         out = self._evaluate_common(m, centroids, pos01, normal_out, mesh.face_uvs,
                                     hdri_fn, mesh.face_colors / 255.0)
         return np.clip(out, 0.0, 1.0) * 255.0
+
+    def evaluate_pbr(self, mesh, source_image: np.ndarray | None = None):
+        """Bake the graph's BaseColor/Roughness/Metallic/Emissive pins to
+        per-face arrays -- face context, same sample points as `evaluate`.
+        Returns (base_color (M,3) 0..255, roughness (M,), metallic (M,),
+        emissive (M,3) 0..255), matching `Mesh.face_colors`/`face_roughness`/
+        `face_metallic`/`face_emissive` shapes and scales exactly, so callers
+        can assign straight onto a mesh. Unconnected Roughness/Metallic/
+        Emissive pins bake to the same defaults `Mesh` uses (1.0 / 0.0 / 0),
+        which is what keeps a default-param bake byte-identical to a mesh
+        that was never baked at all."""
+        centroids = mesh.vertices[mesh.faces].mean(axis=1)
+        extent = np.maximum(mesh.aabb_max - mesh.aabb_min, 1e-9)
+        pos01 = np.clip((centroids - mesh.aabb_min) / extent, 0.0, 1.0)
+        m = len(centroids)
+        normal_out = mesh.normals * 0.5 + 0.5
+
+        def hdri_fn():
+            if source_image is None:
+                return np.full((m, 3), 0.5)
+            return sample_equirect(source_image, mesh.normals)
+
+        pbr: dict = {}
+        out = self._evaluate_common(m, centroids, pos01, normal_out, mesh.face_uvs,
+                                    hdri_fn, mesh.face_colors / 255.0, pbr_out=pbr)
+        base_color = np.clip(out, 0.0, 1.0) * 255.0
+        roughness = np.clip(pbr.get("roughness", np.ones((m, 3))), 0.0, 1.0).mean(axis=1)
+        metallic = np.clip(pbr.get("metallic", np.zeros((m, 3))), 0.0, 1.0).mean(axis=1)
+        emissive = np.maximum(pbr.get("emissive", np.zeros((m, 3))), 0.0) * 255.0
+        return base_color, roughness, metallic, emissive
 
     def evaluate_sky(self, source_image: np.ndarray, max_w: int = 1024,
                      max_h: int = 512) -> np.ndarray:
@@ -412,7 +456,11 @@ class MaterialGraph:
         release for the full-resolution result."""
         if entity.mesh is not None:
             source = entity.environment.source if entity.environment is not None else None
-            entity.mesh.face_colors = self.evaluate(entity.mesh, source)
+            base, rough, metal, emis = self.evaluate_pbr(entity.mesh, source)
+            entity.mesh.face_colors = base
+            entity.mesh.face_roughness = rough
+            entity.mesh.face_metallic = metal
+            entity.mesh.face_emissive = emis
         elif entity.environment is not None:
             max_w, max_h = (256, 128) if draft else (1024, 512)
             image = self.evaluate_sky(entity.environment.source, max_w, max_h)

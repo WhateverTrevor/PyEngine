@@ -17,13 +17,25 @@ import numpy as np
 
 class Mesh:
     def __init__(self, vertices, faces, base_color=(200, 200, 200), face_colors=None,
-                 face_uvs=None):
+                 face_uvs=None, face_roughness=None, face_metallic=None,
+                 face_emissive=None):
         self.vertices = np.asarray(vertices, dtype=np.float64)   # (N, 3)
         self._polys = [tuple(int(i) for i in f) for f in faces]
         if face_colors is None:
             face_colors = np.tile(np.asarray(base_color, dtype=np.float64),
                                   (len(self._polys), 1))
         self.face_colors = np.asarray(face_colors, dtype=np.float64)  # (M, 3)
+        # PBR per-face params, parallel to face_colors. Defaults (roughness=1,
+        # metallic=0, emissive=0) are the backward-compat contract: a mesh
+        # with default params must shade numerically identically to the old
+        # lambert-only pipeline (see renderer.py's deferred pass).
+        m = len(self._polys)
+        self.face_roughness = (np.asarray(face_roughness, dtype=np.float64)
+                               if face_roughness is not None else np.ones(m))
+        self.face_metallic = (np.asarray(face_metallic, dtype=np.float64)
+                              if face_metallic is not None else np.zeros(m))
+        self.face_emissive = (np.asarray(face_emissive, dtype=np.float64)
+                              if face_emissive is not None else np.zeros((m, 3)))
         # explicit per-face UV (e.g. from an FBX LayerElementUV) -- kept
         # separate from the box-projection fallback so re-`_build()`s (winding
         # flips) don't silently discard imported UVs

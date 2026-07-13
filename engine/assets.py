@@ -81,10 +81,21 @@ class AssetDef:
                                if "face_colors" in data else None)
                 face_uvs = (data["face_uvs"].astype(np.float64)
                            if "face_uvs" in data else None)
+                # PBR arrays are optional in the npz -- absent for plain
+                # FBX-imported geometry (diffuse-only import, no PBR source);
+                # Mesh supplies the backward-compat defaults when omitted.
+                face_roughness = (data["face_roughness"].astype(np.float64)
+                                  if "face_roughness" in data else None)
+                face_metallic = (data["face_metallic"].astype(np.float64)
+                                 if "face_metallic" in data else None)
+                face_emissive = (data["face_emissive"].astype(np.float64)
+                                 if "face_emissive" in data else None)
                 entity.mesh = mesh_mod.Mesh(
                     data["vertices"], [tuple(f) for f in data["faces"]],
                     base_color=spec.get("color", (170, 170, 175)),
-                    face_colors=face_colors, face_uvs=face_uvs)
+                    face_colors=face_colors, face_uvs=face_uvs,
+                    face_roughness=face_roughness, face_metallic=face_metallic,
+                    face_emissive=face_emissive)
             else:
                 entity.mesh = _MESH_FACTORIES[primitive](**spec)
 
