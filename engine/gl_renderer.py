@@ -27,7 +27,8 @@ import math
 import moderngl
 import numpy as np
 
-from .gpu_geometry import _build_color, _build_geometry, _entity_world_faces, _scene_environment
+from .gpu_geometry import (_build_color, _build_geometry, _build_pbr,
+                           _entity_world_faces, _scene_environment)
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
 from .raytrace import GITracer
@@ -47,6 +48,8 @@ in vec3 in_pos;
 in vec3 in_normal;
 in vec3 in_color;
 in float in_faceid;
+in vec2 in_rm;
+in vec3 in_emissive;
 
 uniform mat4 mvp;
 uniform mat4 model;
@@ -56,6 +59,9 @@ out vec3 vWorldPos;
 out vec3 vNormal;
 out vec3 vColor;
 flat out int vFaceId;
+out float vRoughness;
+out float vMetallic;
+out vec3 vEmissive;
 
 void main() {
     vec4 world = model * vec4(in_pos, 1.0);
@@ -63,6 +69,9 @@ void main() {
     vNormal = normalize(normalMat * in_normal);
     vColor = in_color;
     vFaceId = int(in_faceid + 0.5);
+    vRoughness = in_rm.x;
+    vMetallic = in_rm.y;
+    vEmissive = in_emissive;
     gl_Position = mvp * vec4(in_pos, 1.0);
 }
 """
@@ -75,6 +84,11 @@ in vec3 vWorldPos;
 in vec3 vNormal;
 in vec3 vColor;
 flat in int vFaceId;
+in float vRoughness;
+in float vMetallic;
+in vec3 vEmissive;
+
+const float PI = 3.14159265359;
 
 uniform vec3 cameraPos;
 uniform int faceOffset;
@@ -159,6 +173,29 @@ vec3 evalAmbientCube(vec3 n) {{
     return (c / wsum) * envStrength;
 }}
 
+// Cook-Torrance/GGX specular BRDF, mirroring renderer.py's `_ggx_specular`
+// exactly: Smith-GGX geometry with the direct-lighting k=(a+1)^2/8 remap
+// (Karis/UE4), Schlick Fresnel. Caller multiplies by NdotL*radiance.
+vec3 ggxSpecular(vec3 n, vec3 v, vec3 l, float alpha, vec3 f0) {{
+    vec3 h = normalize(v + l);
+    float ndoth = clamp(dot(n, h), 0.0, 1.0);
+    float ndotv = clamp(dot(n, v), 1e-4, 1.0);
+    float ndotl = clamp(dot(n, l), 1e-4, 1.0);
+    float vdoth = clamp(dot(v, h), 0.0, 1.0);
+
+    float a2 = alpha * alpha;
+    float denom = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    float d = a2 / max(PI * denom * denom, 1e-8);
+
+    float k = (alpha + 1.0) * (alpha + 1.0) / 8.0;
+    float g1v = ndotv / max(ndotv * (1.0 - k) + k, 1e-8);
+    float g1l = ndotl / max(ndotl * (1.0 - k) + k, 1e-8);
+    float g = g1v * g1l;
+
+    vec3 f = f0 + (1.0 - f0) * pow(1.0 - vdoth, 5.0);
+    return (d * g / max(4.0 * ndotv * ndotl, 1e-4)) * f;
+}}
+
 void main() {{
     vec3 n = normalize(vNormal);
     vec3 toLight = normalize(-dlDir);
@@ -173,13 +210,28 @@ void main() {{
     }}
     lum += texelFetch(giTex, ivec2(0, faceOffset + vFaceId), 0).rgb;
 
+    // PBR setup -- alpha/f0/specScale mirror renderer.py's per-pixel gather
+    // exactly. specScale = 1 - roughness*(1-metallic) is the backward-compat
+    // gate: zero at the default params (roughness=1, metallic=0).
+    float alpha = clamp(vRoughness, 0.02, 1.0);
+    alpha *= alpha;
+    vec3 f0 = mix(vec3(0.04), vColor, vMetallic);
+    float specScale = 1.0 - vRoughness * (1.0 - vMetallic);
+    vec3 viewDir = normalize(cameraPos - vWorldPos);
+    vec3 spec = vec3(0.0);
+
+    if (specScale > 1e-6 && lambert > 1e-4) {{
+        vec3 brdf = ggxSpecular(n, viewDir, toLight, alpha, f0);
+        spec += dlColor * brdf * (lambert * specScale);
+    }}
+
     for (int i = 0; i < nLights; i++) {{
         vec3 delta = lightPos[i] - vWorldPos;
         float dist = max(length(delta), 1e-6);
         float atten = clamp(1.0 - dist / lightRange[i], 0.0, 1.0);
         atten *= atten;
         float lambertL = clamp(dot(n, delta) / dist, 0.0, 1.0);
-        float strength = lightIntensity[i] * atten * lambertL;
+        float radiance = lightIntensity[i] * atten;
 
         bool isSpot = lightCosIn[i] > -1.5;
         bool hasIes = lightIesRow[i] >= 0;
@@ -189,26 +241,37 @@ void main() {{
             if (isSpot) {{
                 float cone = clamp((cosAng - lightCosOut[i])
                     / max(lightCosIn[i] - lightCosOut[i], 1e-6), 0.0, 1.0);
-                strength *= cone * cone;
+                radiance *= cone * cone;
             }}
             if (hasIes) {{
                 float ang = degrees(acos(clamp(cosAng, -1.0, 1.0)));
                 float mul = texelFetch(iesTex, ivec2(int(ang), lightIesRow[i]), 0).r;
-                strength *= mul;
+                radiance *= mul;
             }}
         }}
 
         float shadow = texelFetch(shadowTex, ivec2(i, faceOffset + vFaceId), 0).r;
-        strength *= shadow;
+        radiance *= shadow;
 
-        lum += lightColor[i] * strength;
+        lum += lightColor[i] * (radiance * lambertL);
+
+        if (specScale > 1e-6 && radiance > 1e-4) {{
+            vec3 lDir = delta / dist;
+            vec3 brdf = ggxSpecular(n, viewDir, lDir, alpha, f0);
+            spec += lightColor[i] * brdf * (radiance * lambertL * specScale);
+        }}
     }}
 
-    vec3 outColor = vColor * lum;
+    // Metallic diffuse gate applies to the whole accumulated diffuse-ish
+    // term at once (ambient+directional+GI+point/spot lambert) -- a single
+    // scalar multiplier distributes linearly over the sum, matching
+    // renderer.py's per-term gating exactly.
+    lum *= (1.0 - vMetallic);
+    vec3 outColor = vColor * lum + spec;
 
-    vec3 viewDir = vWorldPos - cameraPos;
-    float fragDist = length(viewDir);
-    vec3 rayDir = viewDir / max(fragDist, 1e-6);
+    vec3 viewDelta = vWorldPos - cameraPos;
+    float fragDist = length(viewDelta);
+    vec3 rayDir = viewDelta / max(fragDist, 1e-6);
     if (fogVolCount > 0) {{
         outColor = applyFogVolumes(outColor, cameraPos, rayDir, 0.0, fragDist);
     }}
@@ -226,6 +289,10 @@ void main() {{
         }}
         outColor = mix(outColor, fogCol, f);
     }}
+
+    // Emissive is unconditional -- visible even unlit/in shadow, added
+    // after fog, matching renderer.py's deferred pass.
+    outColor += vEmissive;
     fragColor = vec4(clamp(outColor, 0.0, 1.0), 1.0);
 }}
 """
@@ -655,18 +722,33 @@ class GLRenderer:
             vbo_geom = self.ctx.buffer(np.ascontiguousarray(geom).tobytes())
             color = _build_color(mesh, face_id_tri)
             vbo_color = self.ctx.buffer(color.tobytes())
+            rm, emissive = _build_pbr(mesh, face_id_tri)
+            pbr = np.concatenate([rm, emissive], axis=1)
+            vbo_pbr = self.ctx.buffer(np.ascontiguousarray(pbr).tobytes())
             vao = self.ctx.vertex_array(self._mesh_prog, [
                 (vbo_geom, "3f 3f 1f", "in_pos", "in_normal", "in_faceid"),
                 (vbo_color, "3f", "in_color"),
+                (vbo_pbr, "2f 3f", "in_rm", "in_emissive"),
             ])
-            cache = {"vbo_geom": vbo_geom, "vbo_color": vbo_color, "vao": vao,
+            cache = {"vbo_geom": vbo_geom, "vbo_color": vbo_color,
+                     "vbo_pbr": vbo_pbr, "vao": vao,
                      "count": pos.shape[0], "num_faces": m,
-                     "face_id_tri": face_id_tri, "color_id": id(mesh.face_colors)}
+                     "face_id_tri": face_id_tri, "color_id": id(mesh.face_colors),
+                     "pbr_id": (id(mesh.face_roughness), id(mesh.face_metallic),
+                                id(mesh.face_emissive))}
             self._geo_cache[key] = cache
-        elif cache["color_id"] != id(mesh.face_colors):
-            color = _build_color(mesh, cache["face_id_tri"])
-            cache["vbo_color"].write(color.tobytes())
-            cache["color_id"] = id(mesh.face_colors)
+        else:
+            if cache["color_id"] != id(mesh.face_colors):
+                color = _build_color(mesh, cache["face_id_tri"])
+                cache["vbo_color"].write(color.tobytes())
+                cache["color_id"] = id(mesh.face_colors)
+            pbr_id = (id(mesh.face_roughness), id(mesh.face_metallic),
+                     id(mesh.face_emissive))
+            if cache["pbr_id"] != pbr_id:
+                rm, emissive = _build_pbr(mesh, cache["face_id_tri"])
+                pbr = np.concatenate([rm, emissive], axis=1)
+                cache["vbo_pbr"].write(np.ascontiguousarray(pbr).tobytes())
+                cache["pbr_id"] = pbr_id
         return cache
 
     def _prune_geo_cache(self, live_entities) -> None:
@@ -676,6 +758,7 @@ class GLRenderer:
             c["vao"].release()
             c["vbo_geom"].release()
             c["vbo_color"].release()
+            c["vbo_pbr"].release()
 
     def _get_env_tex(self, env) -> "moderngl.Texture":
         key = id(env.image)

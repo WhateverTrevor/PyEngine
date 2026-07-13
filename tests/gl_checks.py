@@ -114,4 +114,71 @@ img = gl_frame(sc, engine.Camera(position=engine.Vec3(0.5, 0.5, 0.5),
 red = ((img[..., 0] > 120) & (img[..., 0] > 2 * img[..., 1])).sum()
 assert red > 1500, red
 print(f"gpu depth OK: {red} red pixels")
+
+# 6. PBR: metallic/roughness/emissive parity CPU vs GL, highlight + emissive
+# on GL specifically. Camera looks straight down -z at a single box lit
+# mostly by a point light placed near the camera so its reflection off the
+# box's front face lands almost dead-on -- a real specular lobe to see
+# (checks 1-5's plain diffuse scenes never touch the new PBR path at all;
+# spec_scale is 0 there). Ambient/directional kept dim so a diffuse-only
+# box never saturates, while the metallic+shiny highlight does.
+def build_pbr_scene(box_roughness=1.0, box_metallic=0.0, box_emissive=(0.0, 0.0, 0.0),
+                    pt_intensity=0.6):
+    sc = engine.Scene(light=engine.DirectionalLight(engine.Vec3(-0.4, -1.0, -0.3),
+                                                    ambient=0.02, intensity=0.05))
+    box_mesh = engine.cube(size=1.6, color=(200, 60, 60))
+    box_mesh.face_roughness[:] = box_roughness
+    box_mesh.face_metallic[:] = box_metallic
+    box_mesh.face_emissive[:] = box_emissive
+    box_e = engine.Entity("box", mesh=box_mesh, position=engine.Vec3(0, 0, 0))
+    sc.add(box_e)
+    sc.add(engine.Entity("lamp", light=engine.PointLight(
+        intensity=pt_intensity, range=15, cast_shadows=False),
+        position=engine.Vec3(0.3, 0.3, 5.0)))
+    return sc
+
+pbr_cam = engine.Camera(position=engine.Vec3(0.0, 0.0, 5.0))
+
+# 6a. CPU-vs-GL mean-brightness parity on a metallic+rough-varying PBR scene
+sc_pbr = build_pbr_scene(box_roughness=0.15, box_metallic=1.0)
+img_pbr_gpu = gl_frame(sc_pbr, pbr_cam).astype(float)
+r2 = Renderer()
+r2.render_scale = 1
+surf2 = pygame.Surface((W, H))
+r2.render(surf2, sc_pbr, pbr_cam)
+img_pbr_cpu = pygame.surfarray.array3d(surf2).transpose(1, 0, 2).astype(float)
+pbr_diff = abs(img_pbr_gpu.mean() - img_pbr_cpu.mean())
+assert pbr_diff < 12.0, f"PBR GPU/CPU mean brightness diverges: {pbr_diff:.1f}"
+print(f"pbr parity OK: mean brightness gpu={img_pbr_gpu.mean():.1f} "
+      f"cpu={img_pbr_cpu.mean():.1f} (diff {pbr_diff:.1f})")
+
+# 6b. GL specular highlight: metallic+shiny box shows very-bright pixels
+# that the same scene at default params (roughness=1, metallic=0, spec_scale
+# gated to 0 -- no highlight possible) never reaches.
+sc_default = build_pbr_scene()  # defaults: legacy diffuse-only look
+img_default_gpu = gl_frame(sc_default, pbr_cam).astype(float)
+bright_pbr = int((img_pbr_gpu.max(axis=-1) > 240).sum())
+bright_default = int((img_default_gpu.max(axis=-1) > 240).sum())
+assert bright_pbr > bright_default, (bright_pbr, bright_default)
+assert bright_default == 0, ("default-param scene unexpectedly saturated -- "
+                             "test scene isn't isolating the highlight", bright_default)
+print(f"gl highlight OK: bright pixels pbr={bright_pbr} default={bright_default}")
+
+# 6c. GL emissive-in-the-dark: emissive face visible with all lights off
+def build_pbr_dark_scene(emissive):
+    sc = engine.Scene(light=engine.DirectionalLight(engine.Vec3(-0.4, -1.0, -0.3),
+                                                    ambient=0.0, color=(0, 0, 0),
+                                                    intensity=0.0),
+                      background=(0, 0, 0))
+    box_mesh = engine.cube(size=1.6, color=(10, 10, 10))
+    box_mesh.face_emissive[:] = emissive
+    sc.add(engine.Entity("box", mesh=box_mesh, position=engine.Vec3(0, 0, 0)))
+    return sc
+
+img_dark_off = gl_frame(build_pbr_dark_scene((0.0, 0.0, 0.0)), pbr_cam).astype(float)
+img_dark_emis = gl_frame(build_pbr_dark_scene((220.0, 40.0, 40.0)), pbr_cam).astype(float)
+assert img_dark_off.max() <= 2, f"expected near-black with no lights/emissive: {img_dark_off.max()}"
+assert img_dark_emis.max() > 100, f"emissive face not bright in the dark on GL: {img_dark_emis.max()}"
+print(f"gl emissive-in-dark OK: off max={img_dark_off.max():.0f} emissive max={img_dark_emis.max():.0f}")
+
 print("JUDGE GPU CHECKS PASSED")

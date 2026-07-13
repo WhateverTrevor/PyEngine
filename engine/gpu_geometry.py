@@ -37,6 +37,17 @@ def _build_color(mesh, face_id_tri) -> np.ndarray:
     return np.repeat((mesh.face_colors[face_id_tri] / 255.0).astype(np.float32), 3, axis=0)
 
 
+def _build_pbr(mesh, face_id_tri):
+    """Per-vertex (roughness, metallic) and emissive (0..1), same repeat-per-
+    triangle-vertex flow as `_build_color` -- these are per-face data baked
+    by `Material.evaluate_pbr` (see engine/materials.py), so a flat repeat
+    across a face's vertices is exact, not an approximation."""
+    rm = np.stack([mesh.face_roughness[face_id_tri],
+                   mesh.face_metallic[face_id_tri]], axis=1).astype(np.float32)
+    emissive = (mesh.face_emissive[face_id_tri] / 255.0).astype(np.float32)
+    return (np.repeat(rm, 3, axis=0), np.repeat(emissive, 3, axis=0))
+
+
 def _entity_world_faces(entity):
     """World-space per-face centroids + normals, mirroring _entity_geometry."""
     mesh = entity.mesh
