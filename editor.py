@@ -177,6 +177,14 @@ def make_icon(engine, asset, size=ICON):
     entity = asset.instantiate()
     surf = pygame.Surface((size, size))
     surf.fill((29, 31, 37))
+    if "texture" in asset.data:  # texture asset: thumbnail is the image itself
+        from engine.texture import load_texture_rel
+        img = load_texture_rel(asset.data["texture"]["path"])
+        if img is not None:
+            arr = np.clip(img[:, :, :3] * 255.0, 0, 255).astype(np.uint8)
+            tsurf = pygame.surfarray.make_surface(np.transpose(arr, (1, 0, 2)))
+            pygame.transform.smoothscale(tsurf, (size, size), surf)
+        return surf
     if entity.environment is not None:  # panorama thumbnail, exposure-boosted
         img = entity.environment.image
         step = max(1, img.shape[0] // size)
@@ -1650,8 +1658,10 @@ class Editor:
             root.attributes("-topmost", True)
             path = filedialog.askopenfilename(
                 title="Import asset",
-                filetypes=[("Supported", "*.fbx *.hdr"), ("FBX models", "*.fbx"),
-                          ("Radiance HDR", "*.hdr"), ("All files", "*.*")])
+                filetypes=[("Supported", "*.fbx *.hdr *.png *.jpg *.jpeg *.bmp"),
+                          ("FBX models", "*.fbx"), ("Radiance HDR", "*.hdr"),
+                          ("Textures", "*.png *.jpg *.jpeg *.bmp"),
+                          ("All files", "*.*")])
             root.destroy()
         except Exception as ex:
             self.status = (f"file dialog unavailable: {ex}", 5.0)
@@ -1673,6 +1683,8 @@ class Editor:
                 name = self.engine_mod.import_fbx(path, self.lib.directory)
             elif ext == ".hdr":
                 name = self.engine_mod.import_hdri(path, self.lib.directory)
+            elif ext in (".png", ".jpg", ".jpeg", ".bmp"):
+                name = self.engine_mod.import_texture(path, self.lib.directory)
             else:
                 self.status = (f"unsupported file type: {ext}", 5.0)
                 return
@@ -1990,8 +2002,9 @@ class Editor:
                     self._commit_rename()
                 asset = self._tile_at(mp, blay["grid"])
                 if asset is not None:
-                    self.drag_asset = asset
                     self.selected_asset = asset
+                    if "texture" not in asset.data:  # textures aren't placeable
+                        self.drag_asset = asset
 
     def _click_details(self, mp, rect) -> None:
         e = self.selected
@@ -2655,7 +2668,8 @@ class MaterialEditorUI:
     """
 
     PALETTE = ("color", "position", "normal", "checker", "noise", "gradient",
-               "mix", "multiply", "add", "power", "clamp", "one_minus", "lerp", "hdri")
+               "mix", "multiply", "add", "power", "clamp", "one_minus", "lerp", "hdri",
+               "tex_coord", "tex_sample")
     DEFAULT_SIZE = (900, 560)
 
     def __init__(self, editor: Editor, entity):
@@ -2700,11 +2714,26 @@ class MaterialEditorUI:
         return pygame.Rect(outer.x, outer.y + PANEL_TITLE_H, outer.width,
                            max(0, outer.height - PANEL_TITLE_H))
 
+    def _out_ports(self, node_type):
+        return self.editor.engine_mod.NODE_OUTPUTS.get(node_type, ("out",))
+
+    def _rows_top(self, nid):
+        """Row count reserved for input/output ports (whichever has more) --
+        a node with only the implicit single output doesn't reserve a row for
+        it (drawn centered on the node instead), so this only grows for
+        multi-output nodes like tex_sample."""
+        node = self.graph.nodes[nid]
+        inputs, _ = self.editor.engine_mod.NODE_DEFS[node["type"]]
+        outputs = self._out_ports(node["type"])
+        n_out = len(outputs) if len(outputs) > 1 else 0
+        return max(len(inputs), n_out)
+
     def node_rect(self, nid, panel):
         import pygame
         node = self.graph.nodes[nid]
-        inputs, params = self.editor.engine_mod.NODE_DEFS[node["type"]]
-        height = 24 + len(inputs) * 18 + len(node["params"]) * 18 + 6
+        rows_top = self._rows_top(nid)
+        extra = 1 if node["type"] == "tex_sample" else 0  # texture-picker row
+        height = 24 + rows_top * 18 + (len(node["params"]) + extra) * 18 + 6
         return pygame.Rect(int(panel.x + node["pos"][0]),
                            int(panel.y + node["pos"][1]), NODE_W, height)
 
@@ -2712,17 +2741,25 @@ class MaterialEditorUI:
         r = self.node_rect(nid, panel)
         return (r.x, r.y + 24 + index * 18 + 9)
 
-    def output_pos(self, nid, panel):
+    def output_pos(self, nid, panel, port=None):
         r = self.node_rect(nid, panel)
-        return (r.right, r.y + r.height // 2)
+        node = self.graph.nodes[nid]
+        outputs = self._out_ports(node["type"])
+        if len(outputs) <= 1 or port is None:
+            return (r.right, r.y + r.height // 2)
+        return (r.right, r.y + 24 + outputs.index(port) * 18 + 9)
 
     def _param_row(self, nid, j, panel):
         import pygame
-        node = self.graph.nodes[nid]
-        inputs, _ = self.editor.engine_mod.NODE_DEFS[node["type"]]
         r = self.node_rect(nid, panel)
-        return pygame.Rect(r.x + 6, r.y + 24 + (len(inputs) + j) * 18,
+        rows_top = self._rows_top(nid)
+        return pygame.Rect(r.x + 6, r.y + 24 + (rows_top + j) * 18,
                            NODE_W - 12, 16)
+
+    def _texture_row_rect(self, nid, panel):
+        import pygame
+        node = self.graph.nodes[nid]
+        return self._param_row(nid, len(node["params"]), panel)
 
     def _palette_rects(self, panel):
         import pygame
@@ -2807,20 +2844,23 @@ class MaterialEditorUI:
         for nid in reversed(list(self.graph.nodes)):
             node = self.graph.nodes[nid]
             r = self.node_rect(nid, panel)
-            # output port
-            ox, oy = self.output_pos(nid, panel)
-            if node["type"] != "output" and math.hypot(mp[0] - ox, mp[1] - oy) < 9:
-                self.drag_link = nid
-                return
+            # output port(s) -- most node types have one; tex_sample has five
+            if node["type"] != "output":
+                outputs = self._out_ports(node["type"])
+                for oport in outputs:
+                    ox, oy = self.output_pos(nid, panel, oport if len(outputs) > 1 else None)
+                    if math.hypot(mp[0] - ox, mp[1] - oy) < 9:
+                        self.drag_link = (nid, oport)
+                        return
             # input ports: click to unplug (and grab the wire), or nothing
             inputs, _ = NODE_DEFS[node["type"]]
             for i, name in enumerate(inputs):
                 ix, iy = self.input_pos(nid, i, panel)
                 if math.hypot(mp[0] - ix, mp[1] - iy) < 9:
-                    src = self.graph.link_into(nid, name)
-                    if src is not None:
+                    link = self.graph.link_into(nid, name)
+                    if link is not None:
                         self.graph.disconnect(nid, name)
-                        self.drag_link = src  # re-route the existing wire
+                        self.drag_link = link  # re-route the existing wire
                         self.apply()
                     return
             if not r.collidepoint(mp):
@@ -2836,18 +2876,36 @@ class MaterialEditorUI:
                 if self._param_row(nid, j, panel).collidepoint(mp):
                     self.drag_param = (nid, pname)
                     return
+            # texture picker row (tex_sample): click cycles the assigned asset
+            if node["type"] == "tex_sample" and self._texture_row_rect(nid, panel
+                                                                        ).collidepoint(mp):
+                self._cycle_texture(nid)
+                self.apply()
+                return
             # body drag
             self.drag_node = (nid, mp[0] - r.x, mp[1] - r.y)
             return
 
+    def _cycle_texture(self, nid) -> None:
+        """Cycle a tex_sample node's assigned texture through every texture
+        asset in the library (plus "" for none), sorted by rel path."""
+        rel_paths = sorted(a.data["texture"]["path"] for a in self.editor.lib.assets
+                           if "texture" in a.data)
+        options = [""] + rel_paths
+        node = self.graph.nodes[nid]
+        cur = node.get("texture", "")
+        i = (options.index(cur) + 1) % len(options) if cur in options else 0
+        node["texture"] = options[i]
+
     def _finish_link(self, mp, panel) -> None:
         NODE_DEFS = self.editor.engine_mod.NODE_DEFS
+        src_id, src_port = self.drag_link
         for nid, node in self.graph.nodes.items():
             inputs, _ = NODE_DEFS[node["type"]]
             for i, name in enumerate(inputs):
                 ix, iy = self.input_pos(nid, i, panel)
                 if math.hypot(mp[0] - ix, mp[1] - iy) < 12:
-                    if self.graph.connect(self.drag_link, nid, name):
+                    if self.graph.connect(src_id, nid, name, src_port):
                         self.apply()
                     return
 
@@ -2887,19 +2945,22 @@ class MaterialEditorUI:
 
         NODE_DEFS = self.editor.engine_mod.NODE_DEFS
         # wires
-        for src, dst, name in self.graph.links:
+        for src, dst, name, port in self.graph.links:
             if src not in self.graph.nodes or dst not in self.graph.nodes:
                 continue
             inputs, _ = NODE_DEFS[self.graph.nodes[dst]["type"]]
             if name not in inputs:
                 continue
-            a = self.output_pos(src, panel)
+            outputs = self._out_ports(self.graph.nodes[src]["type"])
+            a = self.output_pos(src, panel, port if len(outputs) > 1 else None)
             b = self.input_pos(dst, inputs.index(name), panel)
             mid = ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
             pygame.draw.lines(surf, (150, 160, 185), False,
                               [a, (a[0] + 18, a[1]), mid, (b[0] - 18, b[1]), b], 2)
         if self.drag_link is not None:
-            a = self.output_pos(self.drag_link, panel)
+            src_id, src_port = self.drag_link
+            outputs = self._out_ports(self.graph.nodes[src_id]["type"])
+            a = self.output_pos(src_id, panel, src_port if len(outputs) > 1 else None)
             pygame.draw.line(surf, ACCENT, a, pygame.mouse.get_pos(), 2)
 
         # nodes
@@ -2914,8 +2975,13 @@ class MaterialEditorUI:
                                  (r.right - 7, r.y + 15), 2)
                 pygame.draw.line(surf, (120, 80, 80), (r.right - 7, r.y + 6),
                                  (r.right - 16, r.y + 15), 2)
-                ox, oy = self.output_pos(nid, panel)
-                pygame.draw.circle(surf, (210, 190, 120), (ox, oy), 5)
+                outputs = self._out_ports(node["type"])
+                for oport in outputs:
+                    ox, oy = self.output_pos(nid, panel, oport if len(outputs) > 1 else None)
+                    pygame.draw.circle(surf, (210, 190, 120), (ox, oy), 5)
+                    if len(outputs) > 1:
+                        lab = self.editor.font_small.render(oport, True, TEXT_DIM)
+                        surf.blit(lab, (ox - 8 - lab.get_width(), oy - 7))
             inputs, _ = NODE_DEFS[node["type"]]
             for i, iname in enumerate(inputs):
                 ix, iy = self.input_pos(nid, i, panel)
@@ -2934,6 +3000,11 @@ class MaterialEditorUI:
                 kx = int(track_x0 + f * (track_x1 - track_x0))
                 pygame.draw.line(surf, ACCENT, (track_x0, cy), (kx, cy), 3)
                 pygame.draw.circle(surf, (230, 230, 235), (kx, cy), 4)
+            if node["type"] == "tex_sample":
+                rr = self._texture_row_rect(nid, panel)
+                shown = node.get("texture", "") or "<none>"
+                lab = self.editor.font_small.render(f"tex: {shown}", True, TEXT_DIM)
+                surf.blit(lab, (rr.x, rr.y + 2))
             if node["type"] == "color":
                 p = node["params"]
                 sw = (int(p["r"] * 255), int(p["g"] * 255), int(p["b"] * 255))

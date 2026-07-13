@@ -16,13 +16,19 @@ import numpy as np
 
 
 class Mesh:
-    def __init__(self, vertices, faces, base_color=(200, 200, 200), face_colors=None):
+    def __init__(self, vertices, faces, base_color=(200, 200, 200), face_colors=None,
+                 face_uvs=None):
         self.vertices = np.asarray(vertices, dtype=np.float64)   # (N, 3)
         self._polys = [tuple(int(i) for i in f) for f in faces]
         if face_colors is None:
             face_colors = np.tile(np.asarray(base_color, dtype=np.float64),
                                   (len(self._polys), 1))
         self.face_colors = np.asarray(face_colors, dtype=np.float64)  # (M, 3)
+        # explicit per-face UV (e.g. from an FBX LayerElementUV) -- kept
+        # separate from the box-projection fallback so re-`_build()`s (winding
+        # flips) don't silently discard imported UVs
+        self._user_face_uvs = (np.asarray(face_uvs, dtype=np.float64)
+                               if face_uvs is not None else None)
         self._build()
 
     def _build(self) -> None:
@@ -42,6 +48,11 @@ class Mesh:
         self.aabb_min = self.vertices.min(axis=0)
         self.aabb_max = self.vertices.max(axis=0)
         self.bound = float(np.linalg.norm(self.vertices, axis=1).max())
+        if self._user_face_uvs is not None and len(self._user_face_uvs) == len(self.faces):
+            self.face_uvs = self._user_face_uvs               # (M, 2)
+        else:
+            self.face_uvs = box_project_uv(self.vertices, self.faces, self.normals,
+                                           self.aabb_min, self.aabb_max)
 
     def _face_normals(self) -> np.ndarray:
         tri = self.vertices[self.faces[:, :3]]
@@ -60,6 +71,25 @@ class Mesh:
                        for f, flipped in zip(self._polys, flip)]
         self._build()
         return self
+
+
+_UV_AXIS_PAIRS = {0: (1, 2), 1: (0, 2), 2: (0, 1)}  # dominant normal axis -> (u axis, v axis)
+
+
+def box_project_uv(vertices, faces, normals, aabb_min, aabb_max) -> np.ndarray:
+    """Trivial auto-unwrap: per-face planar UV from the face's dominant
+    normal axis, scaled 0..1 across the mesh's own bounding box on the two
+    non-dominant axes. Default UV for any mesh without real (imported) UVs.
+    """
+    centroids = vertices[faces].mean(axis=1)
+    extent = np.maximum(aabb_max - aabb_min, 1e-9)
+    dominant = np.argmax(np.abs(normals), axis=1)  # 0=x, 1=y, 2=z
+    uv = np.zeros((len(centroids), 2), dtype=np.float64)
+    for axis, (ua, va) in _UV_AXIS_PAIRS.items():
+        m = dominant == axis
+        uv[m, 0] = (centroids[m, ua] - aabb_min[ua]) / extent[ua]
+        uv[m, 1] = (centroids[m, va] - aabb_min[va]) / extent[va]
+    return uv
 
 
 def box(width: float = 1.0, height: float = 1.0, depth: float = 1.0,

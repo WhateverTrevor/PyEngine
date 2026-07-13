@@ -79,10 +79,12 @@ class AssetDef:
                                             spec.pop("path")))
                 face_colors = (data["face_colors"].astype(np.float64)
                                if "face_colors" in data else None)
+                face_uvs = (data["face_uvs"].astype(np.float64)
+                           if "face_uvs" in data else None)
                 entity.mesh = mesh_mod.Mesh(
                     data["vertices"], [tuple(f) for f in data["faces"]],
                     base_color=spec.get("color", (170, 170, 175)),
-                    face_colors=face_colors)
+                    face_colors=face_colors, face_uvs=face_uvs)
             else:
                 entity.mesh = _MESH_FACTORIES[primitive](**spec)
 
@@ -133,6 +135,8 @@ class AssetLibrary:
         self.folders: dict[str, dict] = {}
         self.folder_of: dict[str, str] = {}
         self._next_folder_id = 1
+        from . import texture as texture_mod
+        texture_mod.set_texture_root(directory)  # material TextureSample nodes resolve here
         self.reload()
 
     def reload(self) -> None:

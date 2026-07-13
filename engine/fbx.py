@@ -202,13 +202,49 @@ def _geometry_materials(geo) -> tuple[list[int] | None, str]:
     return [int(v) for v in np.asarray(arr.props[0])], mapping
 
 
+def _geometry_uvs(geo, count: int) -> np.ndarray | None:
+    """Per-polygon-vertex UV (count, 2), aligned 1:1 with PolygonVertexIndex
+    entries, or None if the geometry has no LayerElementUV (or one this
+    minimal reader doesn't understand -- e.g. ByVertice mapping, which needs
+    a control-point index we don't track here)."""
+    layer = geo.first("LayerElementUV")
+    if layer is None:
+        return None
+    ref, mapping = "Direct", "ByPolygonVertex"
+    rnode = layer.first("ReferenceInformationType")
+    if rnode is not None and rnode.props:
+        ref = str(rnode.props[0])
+    mnode = layer.first("MappingInformationType")
+    if mnode is not None and mnode.props:
+        mapping = str(mnode.props[0])
+    if mapping != "ByPolygonVertex":
+        return None
+    uv_node = layer.first("UV")
+    if uv_node is None or not uv_node.props or not len(uv_node.props[0]):
+        return None
+    uv_flat = np.asarray(uv_node.props[0], dtype=np.float64).reshape(-1, 2)
+    if ref == "IndexToDirect":
+        idx_node = layer.first("UVIndex")
+        if idx_node is None or not idx_node.props:
+            return None
+        per_vertex = uv_flat[np.asarray(idx_node.props[0], dtype=np.int64)]
+    else:
+        per_vertex = uv_flat
+    if len(per_vertex) < count:
+        return None
+    return per_vertex[:count]
+
+
 def extract_geometry(path: str):
     """All geometry in the file, merged.
 
-    Returns (vertices (N,3), polygon index tuples, per-face colors (M,3) 0..1).
+    Returns (vertices (N,3), polygon index tuples, per-face colors (M,3) 0..1,
+    per-face UV (M,2) or None if no geometry carried LayerElementUV data).
     Face colors come from each geometry's material layer, resolved through the
     FBX connection graph (geometry -> model <- materials, in connection order).
-    """
+    Face UV is the mean of the polygon's own UV vertices (this engine bakes
+    materials per-face, so one UV sample per face is the structure that
+    actually gets used -- see materials.py's face-context evaluation)."""
     roots, _version = parse_fbx(path)
     up_axis, unit_scale = _global_settings(roots)
     mat_colors = _material_colors(roots)
@@ -234,7 +270,8 @@ def extract_geometry(path: str):
         elif child in mat_colors and parent in model_ids:
             model_mats.setdefault(parent, []).append(child)
 
-    all_verts, all_faces, all_colors = [], [], []
+    all_verts, all_faces, all_colors, all_uvs = [], [], [], []
+    any_uv = False
     offset = 0
     for root in roots:
         if root.name != "Objects":
@@ -245,6 +282,9 @@ def extract_geometry(path: str):
                 continue
             verts = np.asarray(vnode.props[0], dtype=np.float64).reshape(-1, 3)
             idx = np.asarray(inode.props[0], dtype=np.int64)
+            uv_per_pv = _geometry_uvs(geo, len(idx))
+            if uv_per_pv is not None:
+                any_uv = True
 
             gid = int(geo.props[0]) if geo.props else -1
             palette = [mat_colors.get(mid, _DEFAULT_DIFFUSE)
@@ -260,23 +300,37 @@ def extract_geometry(path: str):
                 return palette[i] if 0 <= i < len(palette) else palette[0]
 
             poly: list[int] = []
+            poly_uv: list = []
             poly_i = 0
+            pv_pos = 0
             for raw in idx:
                 if raw < 0:
                     poly.append(int(~raw))
+                    if uv_per_pv is not None:
+                        poly_uv.append(uv_per_pv[pv_pos])
                     color = poly_color(poly_i)
                     if len(poly) == 3 or len(poly) == 4:
                         all_faces.append(tuple(i + offset for i in poly))
                         all_colors.append(color)
+                        all_uvs.append(np.mean(poly_uv, axis=0) if poly_uv else (0.0, 0.0))
                     elif len(poly) > 4:  # fan-split n-gons
                         for k in range(1, len(poly) - 1):
                             all_faces.append((poly[0] + offset, poly[k] + offset,
                                               poly[k + 1] + offset))
                             all_colors.append(color)
+                            if poly_uv:
+                                all_uvs.append(np.mean(
+                                    [poly_uv[0], poly_uv[k], poly_uv[k + 1]], axis=0))
+                            else:
+                                all_uvs.append((0.0, 0.0))
                     poly = []
+                    poly_uv = []
                     poly_i += 1
                 else:
                     poly.append(int(raw))
+                    if uv_per_pv is not None:
+                        poly_uv.append(uv_per_pv[pv_pos])
+                pv_pos += 1
             all_verts.append(verts)
             offset += len(verts)
 
@@ -286,13 +340,14 @@ def extract_geometry(path: str):
     vertices *= unit_scale * 0.01  # FBX native units are centimeters
     if up_axis == 2:  # Z-up -> engine Y-up
         vertices = vertices[:, [0, 2, 1]] * np.array([1.0, 1.0, -1.0])
-    return vertices, all_faces, np.asarray(all_colors, dtype=np.float64)
+    face_uvs = np.asarray(all_uvs, dtype=np.float64) if any_uv else None
+    return vertices, all_faces, np.asarray(all_colors, dtype=np.float64), face_uvs
 
 
 def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
                max_bound: float = 4.0) -> str:
     """Convert an .fbx into a content-browser asset. Returns the asset name."""
-    vertices, faces, face_colors = extract_geometry(path)
+    vertices, faces, face_colors, face_uvs = extract_geometry(path)
 
     # center on the ground and normalize outlandish scales
     vertices = vertices - vertices.mean(axis=0)
@@ -307,11 +362,15 @@ def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
     os.makedirs(models_dir, exist_ok=True)
 
     padded = [f if len(f) == 4 else (f[0], f[1], f[2], f[2]) for f in faces]
+    extra = {}
+    if face_uvs is not None:
+        extra["face_uvs"] = face_uvs.astype(np.float32)
     np.savez_compressed(os.path.join(models_dir, f"{stem}.npz"),
                         vertices=vertices.astype(np.float32),
                         faces=np.asarray(padded, dtype=np.int32),
                         face_colors=np.clip(face_colors * 255.0, 0, 255
-                                            ).astype(np.uint8))
+                                            ).astype(np.uint8),
+                        **extra)
 
     asset = {
         "name": name,
@@ -416,13 +475,18 @@ def export_fbx(mesh, path: str, name: str = "Mesh") -> None:
 
     pvi: list[int] = []
     normals_flat: list[float] = []
-    for face_row, normal in zip(mesh.faces, mesh.normals):
+    uv_flat: list[float] = []
+    for face_row, normal, uv in zip(mesh.faces, mesh.normals, mesh.face_uvs):
         poly = (face_row[:3] if face_row[3] == face_row[2] else face_row)
         poly = [int(i) for i in poly]
         for i in poly[:-1]:
             pvi.append(i)
         pvi.append(~poly[-1])
         normals_flat.extend(float(c) for c in normal)
+        # one UV per polygon-vertex (ByPolygonVertex/Direct) -- this engine
+        # only stores one UV per *face*, so every vertex of the face writes
+        # the same value; re-import averages them back to the same value.
+        uv_flat.extend([float(uv[0]), float(uv[1])] * len(poly))
 
     GID, MODEL_ID = 1000, 2000
     mat_ids = [3000 + i for i in range(len(palette))]
@@ -460,8 +524,18 @@ def export_fbx(mesh, path: str, name: str = "Mesh") -> None:
         ("ReferenceInformationType", ["Direct"], []),
         ("Normals", [np.asarray(normals_flat, dtype=np.float64)], []),
     ])
+    uv_layer = ("LayerElementUV", [0], [
+        ("Version", [101], []),
+        ("Name", [""], []),
+        ("MappingInformationType", ["ByPolygonVertex"], []),
+        ("ReferenceInformationType", ["Direct"], []),
+        ("UV", [np.asarray(uv_flat, dtype=np.float64)], []),
+    ])
     layer_elements = [("LayerElement", [], [
         ("Type", ["LayerElementNormal"], []),
+        ("TypedIndex", [0], []),
+    ]), ("LayerElement", [], [
+        ("Type", ["LayerElementUV"], []),
         ("TypedIndex", [0], []),
     ])]
     if material_layer is not None:
@@ -476,6 +550,7 @@ def export_fbx(mesh, path: str, name: str = "Mesh") -> None:
         ("Vertices", [verts_cm], []),
         ("PolygonVertexIndex", [np.asarray(pvi, dtype=np.int32)], []),
         normal_layer,
+        uv_layer,
     ]
     if material_layer is not None:
         geometry_children.append(material_layer)

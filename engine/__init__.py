@@ -7,11 +7,13 @@ from .environment import Environment, import_hdri, load_hdr, save_hdr
 from .fbx import export_asset_fbx, has_mesh, import_fbx
 from .lighting import (IES_PROFILES, DirectionalLight, Fog, FogVolume, PointLight,
                        SpotLight, SunDisc)
-from .materials import NODE_DEFS, PARAM_RANGES, MaterialGraph
+from .materials import NODE_DEFS, NODE_OUTPUTS, PARAM_RANGES, MaterialGraph
 from .math3d import Vec3
 from .mesh import Mesh, box, checkerboard, cone, cube, cylinder, icosphere, torus
 from .raytrace import GITracer, ShadowTracer, pick_entity
 from .scene import Behavior, Entity, Scene, Transform
+from . import texture
+from .texture import import_texture
 
 __all__ = [
     "Engine", "Scene", "Entity", "Behavior", "Transform", "Camera",
@@ -19,8 +21,8 @@ __all__ = [
     "DirectionalLight", "PointLight", "SpotLight", "Fog", "Vec3", "IES_PROFILES",
     "SunDisc", "FogVolume",
     "Environment", "load_hdr", "save_hdr", "import_hdri", "import_fbx",
-    "export_asset_fbx", "has_mesh",
-    "MaterialGraph", "NODE_DEFS", "PARAM_RANGES",
+    "export_asset_fbx", "has_mesh", "import_texture", "texture",
+    "MaterialGraph", "NODE_DEFS", "NODE_OUTPUTS", "PARAM_RANGES",
     "AssetLibrary", "save_scene", "load_scene", "ShadowTracer", "GITracer", "pick_entity",
     "behaviors",
 ]

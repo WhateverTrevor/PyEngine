@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import texture as texture_mod
 from .environment import sample_equirect
 
 # node type -> (input port names, {param: default})
@@ -43,12 +44,29 @@ NODE_DEFS = {
     "one_minus": (("a",), {}),
     "lerp":     (("a", "b", "fac"), {}),
     "hdri":     ((), {}),
+    # Unreal TexCoord: UV output, tiled. `index` is UE's CoordinateIndex --
+    # kept as a property since UE exposes it, but this engine only has one
+    # UV set (per-face box-projected or FBX-imported), so it's a no-op knob.
+    "tex_coord": ((), {"index": 0.0, "u_tiling": 1.0, "v_tiling": 1.0}),
+    # Unreal TextureSample: `uv` is optional, defaulting to TexCoord(0) when
+    # unconnected (exactly like UE); the texture asset reference is a node
+    # property (not a numeric param -- the editor gives it its own picker
+    # row), not an input pin. Output pins mirror UE's set.
+    "tex_sample": (("uv",), {}),
 }
+
+# extra non-numeric fields a node type carries beyond "params" (persisted by
+# to_dict/from_dict alongside type/pos/params)
+NODE_EXTRA_DEFAULTS = {"tex_sample": {"texture": ""}}
+
+# node type -> output pin names; anything absent has the single implicit "out"
+NODE_OUTPUTS = {"tex_sample": ("RGB", "R", "G", "B", "A")}
 
 # slider ranges for the editor UI
 PARAM_RANGES = {"r": (0.0, 1.0), "g": (0.0, 1.0), "b": (0.0, 1.0),
                 "scale": (0.05, 8.0), "seed": (0.0, 100.0), "axis": (0.0, 2.0),
-                "exp": (0.1, 8.0), "min": (0.0, 1.0), "max": (0.0, 1.0)}
+                "exp": (0.1, 8.0), "min": (0.0, 1.0), "max": (0.0, 1.0),
+                "index": (0.0, 0.0), "u_tiling": (0.1, 8.0), "v_tiling": (0.1, 8.0)}
 
 
 def _hash_noise(cells: np.ndarray) -> np.ndarray:
@@ -72,7 +90,8 @@ class MaterialGraph:
         nid = self.next_id
         self.next_id += 1
         self.nodes[nid] = {"type": node_type, "pos": [float(pos[0]), float(pos[1])],
-                           "params": dict(params)}
+                           "params": dict(params),
+                           **dict(NODE_EXTRA_DEFAULTS.get(node_type, {}))}
         return nid
 
     def remove(self, nid: int) -> None:
@@ -85,18 +104,18 @@ class MaterialGraph:
         stack = [nid]
         while stack:
             cur = stack.pop()
-            for src, dst, _name in self.links:
+            for src, dst, _name, _port in self.links:
                 if dst == cur and src not in seen:
                     seen.add(src)
                     stack.append(src)
         return seen
 
-    def connect(self, src: int, dst: int, input_name: str) -> bool:
+    def connect(self, src: int, dst: int, input_name: str, src_port: str = "out") -> bool:
         if src == dst or dst in self.upstream(src):  # would create a cycle
             return False
         self.links = [l for l in self.links
                       if not (l[1] == dst and l[2] == input_name)]
-        self.links.append([src, dst, input_name])
+        self.links.append([src, dst, input_name, src_port])
         return True
 
     def disconnect(self, dst: int, input_name: str) -> None:
@@ -104,9 +123,10 @@ class MaterialGraph:
                       if not (l[1] == dst and l[2] == input_name)]
 
     def link_into(self, dst: int, input_name: str):
-        for src, d, name in self.links:
+        """(src_id, src_port) feeding `dst`'s `input_name`, or None."""
+        for src, d, name, port in self.links:
             if d == dst and name == input_name:
-                return src
+                return src, port
         return None
 
     def output_id(self) -> int:
@@ -117,21 +137,22 @@ class MaterialGraph:
 
     # ---- evaluation ----
     def _evaluate_common(self, m: int, sample_pts: np.ndarray, pos01: np.ndarray,
-                         normal_out: np.ndarray, hdri_fn, output_default: np.ndarray
-                         ) -> np.ndarray:
+                         normal_out: np.ndarray, face_uv: np.ndarray, hdri_fn,
+                         output_default: np.ndarray) -> np.ndarray:
         """Shared node walk for both contexts (all arrays are (m, 3) float64).
 
         `sample_pts` is the "world position" procedural nodes (checker/noise)
         key off; `pos01` is what `position`/`gradient` read (0..1-mapped);
-        `normal_out` is what the `normal` node returns; `hdri_fn()` computes
-        the `hdri` node lazily (only called if the graph actually uses it).
+        `normal_out` is what the `normal` node returns; `face_uv` (m, 2) is
+        what an unconnected TextureSample / TexCoord(0) reads; `hdri_fn()`
+        computes the `hdri` node lazily (only called if the graph uses it).
         """
-        memo: dict[int, np.ndarray] = {}
+        memo: dict[int, object] = {}
 
         def const(v):
             return np.full((m, 3), v, dtype=np.float64)
 
-        def ev(nid: int, depth: int = 0) -> np.ndarray:
+        def ev(nid: int, depth: int = 0):
             if depth > 32 or nid not in self.nodes:
                 return const(0.5)
             if nid in memo:
@@ -141,10 +162,33 @@ class MaterialGraph:
             p = node["params"]
 
             def inp(name, default):
-                src = self.link_into(nid, name)
-                return ev(src, depth + 1) if src is not None else default
+                link = self.link_into(nid, name)
+                if link is None:
+                    return default
+                src, port = link
+                val = ev(src, depth + 1)
+                return val[port] if isinstance(val, dict) else val
 
-            if kind == "color":
+            if kind == "tex_coord":
+                uv = np.stack([face_uv[:, 0] * p["u_tiling"],
+                               face_uv[:, 1] * p["v_tiling"],
+                               np.zeros(m)], axis=1)
+                out = uv
+            elif kind == "tex_sample":
+                uv_in = inp("uv", None)  # None -> TexCoord(0), untiled, like UE
+                u, v = (face_uv[:, 0], face_uv[:, 1]) if uv_in is None \
+                    else (uv_in[:, 0], uv_in[:, 1])
+                img = texture_mod.load_texture_rel(node.get("texture", ""))
+                if img is None:
+                    rgb, a = const(0.5), np.ones(m)
+                else:
+                    rgb, a = texture_mod.sample_texture(img, np.stack([u, v], axis=1))
+                out = {"RGB": rgb,
+                       "R": np.repeat(rgb[:, 0:1], 3, axis=1),
+                       "G": np.repeat(rgb[:, 1:2], 3, axis=1),
+                       "B": np.repeat(rgb[:, 2:3], 3, axis=1),
+                       "A": np.repeat(a[:, None], 3, axis=1)}
+            elif kind == "color":
                 out = np.tile([p["r"], p["g"], p["b"]], (m, 1))
             elif kind == "position":
                 out = pos01.copy()
@@ -208,8 +252,8 @@ class MaterialGraph:
                 return np.full((m, 3), 0.5)
             return sample_equirect(source_image, mesh.normals)
 
-        out = self._evaluate_common(m, centroids, pos01, normal_out, hdri_fn,
-                                    mesh.face_colors / 255.0)
+        out = self._evaluate_common(m, centroids, pos01, normal_out, mesh.face_uvs,
+                                    hdri_fn, mesh.face_colors / 255.0)
         return np.clip(out, 0.0, 1.0) * 255.0
 
     def evaluate_sky(self, source_image: np.ndarray, max_w: int = 1024,
@@ -227,11 +271,15 @@ class MaterialGraph:
                          st * np.sin(phi)[None, :]], axis=-1).reshape(-1, 3)
         pos01 = dirs * 0.5 + 0.5
         m = len(dirs)
+        # equirect UV: u wraps around the horizon, v=0 at the top (theta=0)
+        face_uv = np.stack([np.broadcast_to(phi[None, :] / (2.0 * np.pi), (h, w)).reshape(-1),
+                            np.broadcast_to((1.0 - theta / np.pi)[:, None], (h, w)).reshape(-1)],
+                           axis=1)
 
         def hdri_fn():
             return sample_equirect(source_image, dirs)
 
-        out = self._evaluate_common(m, dirs, pos01, pos01, hdri_fn,
+        out = self._evaluate_common(m, dirs, pos01, pos01, face_uv, hdri_fn,
                                     np.zeros((m, 3)))
         return np.maximum(out, 0.0).astype(np.float32).reshape(h, w, 3)
 
@@ -260,11 +308,20 @@ class MaterialGraph:
     def from_dict(cls, data: dict) -> "MaterialGraph":
         g = cls.__new__(cls)
         g.nodes = {}
-        g.links = [list(l) for l in data.get("links", [])]
+        g.links = []
+        for l in data.get("links", []):
+            l = list(l)
+            if len(l) == 3:      # scenes saved before multi-output-pin nodes existed
+                l.append("out")
+            g.links.append(l)
         g.next_id = 1
         for n in data.get("nodes", []):
             nid = int(n["id"])
-            g.nodes[nid] = {"type": n["type"], "pos": list(n["pos"]),
-                            "params": dict(n.get("params", {}))}
+            node = {"type": n["type"], "pos": list(n["pos"]),
+                   "params": dict(n.get("params", {}))}
+            for k, v in n.items():  # extra fields (e.g. tex_sample's "texture")
+                if k not in ("id", "type", "pos", "params"):
+                    node[k] = v
+            g.nodes[nid] = node
             g.next_id = max(g.next_id, nid + 1)
         return g

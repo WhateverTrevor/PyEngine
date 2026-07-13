@@ -270,7 +270,7 @@ try:
     assert os.path.exists(export_path), "export must write the file at the chosen path"
 
     crate_entity = crate.instantiate()
-    exp_verts, exp_faces, exp_colors = engine.fbx.extract_geometry(export_path)
+    exp_verts, exp_faces, exp_colors, _exp_uvs = engine.fbx.extract_geometry(export_path)
     assert len(exp_verts) == len(crate_entity.mesh.vertices), \
         "exported vertex count must match the source mesh"
     assert len(exp_faces) == len(crate_entity.mesh.faces), \
