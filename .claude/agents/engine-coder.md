@@ -69,11 +69,15 @@ agent that judges it before anything is committed.
   `casts_shadow` governs OCCLUDING/bounce-sourcing only; every visible mesh
   receives shadows and GI regardless (a review once rejected gating
   receivers on it).
-- GPU backends: `engine/gl_renderer.py` (OpenGL 3.3/moderngl, feature-
-  complete vs CPU) and `engine/wgpu_renderer.py` (DX12/Vulkan via wgpu,
-  offscreen+readback; MISSING sun disc/GI/fog volumes — parity is the top
-  backlog item); `engine/gpu_geometry.py` holds the shared vertex-soup
-  helpers. Engine picks via `api=` with a dx12/vulkan -> gl -> cpu fallback.
+- GPU backends: `engine/gl_renderer.py` (OpenGL 3.3/moderngl) and
+  `engine/wgpu_renderer.py` (DX12/Vulkan via wgpu, offscreen+readback);
+  both are feature-complete vs CPU (sun disc, GI, fog volumes, PBR) except
+  wgpu lacks directional sun-shadow attenuation on mesh faces (GL's
+  dlShadowTex). `engine/gpu_geometry.py` holds the shared vertex-soup +
+  PBR-attribute helpers. Engine picks via `api=` with a dx12/vulkan -> gl
+  -> cpu fallback. Materials bake per-face PBR arrays (face_roughness/
+  face_metallic/face_emissive; defaults 1.0/0.0/0 render identical to
+  legacy — preserve the spec_scale default gate in all three paths).
 - `engine/scene.py` — Entity/Transform/Behavior. `Transform.matrix()` is
   memoized; never mutate the returned array.
 - `engine/lighting.py` (Point/Spot/IES, `SunDisc`, `FogVolume`),
