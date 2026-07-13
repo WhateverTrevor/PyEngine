@@ -12,3 +12,6 @@ settings.json
 
 # Transient agent worktrees
 .claude/worktrees/
+
+# Per-user material-editor node usage counts
+mat_node_usage.json

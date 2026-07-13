@@ -76,12 +76,16 @@ assert header_rect.y == search_rect.bottom, "header row must sit directly below 
 assert entry_rects[0].y == header_rect.bottom, "entries must start directly below the header"
 print("add-menu search/header/entry rows are distinct, stacked, non-overlapping OK")
 
-matches = mui._ctx_search_matches("mult")
+mui.ctx_menu["search"] = "mult"
+matches = mui._ctx_search_matches(mui.ctx_menu)
 assert matches == ["multiply"], f"search 'mult' should narrow to exactly ['multiply']: {matches}"
-matches_tex = mui._ctx_search_matches("tex")
+mui.ctx_menu["search"] = "tex"
+matches_tex = mui._ctx_search_matches(mui.ctx_menu)
 assert set(matches_tex) >= {"tex_coord", "tex_sample"}, matches_tex
-matches_none = mui._ctx_search_matches("zzz_not_a_node")
+mui.ctx_menu["search"] = "zzz_not_a_node"
+matches_none = mui._ctx_search_matches(mui.ctx_menu)
 assert matches_none == [], matches_none
+mui.ctx_menu["search"] = ""
 print("add-menu live search filter narrows correctly OK")
 
 # rows drawn == rows hit-tested (house rule: same rect list for both)
@@ -101,7 +105,7 @@ mui._open_add_menu((panel.x + 120, panel.y + 200), panel)
 mui.ctx_menu["search"] = "noise"
 before_n = len(mui.graph.nodes)
 target_pos = mui.ctx_menu["graph_pos"]
-matches = mui._ctx_search_matches("noise")
+matches = mui._ctx_search_matches(mui.ctx_menu)
 assert matches and matches[0] == "noise"
 mui._add_node_from_menu(matches[0], target_pos)
 assert len(mui.graph.nodes) == before_n + 1
@@ -292,5 +296,96 @@ editor._update_rename(fi3)
 assert editor.rename_buffer == "newname", \
     f"rename buffer must not duplicate typed text across update steps: {editor.rename_buffer!r}"
 print("consume-once OK: rename buffer 'newname' not duplicated across 3 update steps")
+
+# ---- 8. event-driven regression: add-menu click-through must not crash.
+#          Drives the REAL input path (pygame events -> eng.input.process ->
+#          ed.update -> mat_ui.update -> _update_ctx_menu/_click_ctx_menu),
+#          not direct handler calls -- a prior crash ("'NoneType' object is
+#          not subscriptable" from _ctx_search_matches reading a nulled
+#          self.ctx_menu mid-click) only reproduced through this real path
+#          because the earlier direct-call tests above never exercised
+#          _click_ctx_menu via mouse_button_pressed(1) inside ed.update. ----
+import unittest.mock as _um
+
+editor.mat_ui = None
+editor.selected = crate
+editor._toggle_material_editor()
+assert editor.mat_ui is not None, "material editor failed to open for event test"
+mui_evt = editor.mat_ui
+panel_evt = mui_evt.graph_panel(W, H)
+
+
+def _step(events):
+    eng.input.process(events)
+    editor.update(eng, 1 / 60)
+    eng.input.consume_edges()
+
+
+# this entity's graph accumulated nodes from earlier sections, so pick an
+# empty spot (not over any existing node) for the right-click, same as the
+# real editor would need the user to do
+rc_pos = (panel_evt.right - 60, panel_evt.bottom - 60)
+assert mui_evt._node_at(rc_pos, panel_evt) is None, "test right-click point must be empty canvas"
+with _um.patch.object(_pg.mouse, "get_pos", return_value=rc_pos):
+    _step([_pg.event.Event(_pg.MOUSEBUTTONDOWN, button=3, pos=rc_pos)])
+    _step([_pg.event.Event(_pg.MOUSEBUTTONUP, button=3, pos=rc_pos)])
+assert mui_evt.ctx_menu is not None and mui_evt.ctx_menu["kind"] == "add", \
+    "right-click via real events must open the add-node menu"
+print("event-driven: right-click opens add-node menu OK")
+
+rows_evt = mui_evt._ctx_menu_rows(mui_evt.ctx_menu)
+first_rect = rows_evt[0][1]
+first_type = rows_evt[0][2]
+click_pos = first_rect.center
+before_nodes = len(mui_evt.graph.nodes)
+with _um.patch.object(_pg.mouse, "get_pos", return_value=click_pos):
+    _step([_pg.event.Event(_pg.MOUSEBUTTONDOWN, button=1, pos=click_pos)])
+    _step([_pg.event.Event(_pg.MOUSEBUTTONUP, button=1, pos=click_pos)])
+assert mui_evt.ctx_menu is None, "menu must close after clicking an entry"
+assert len(mui_evt.graph.nodes) == before_nodes + 1, \
+    "left-click on the first entry row must add exactly one node"
+new_node_id = max(mui_evt.graph.nodes)
+assert mui_evt.graph.nodes[new_node_id]["type"] == first_type, \
+    "the added node must match the clicked entry's payload type"
+print(f"event-driven: click on entry row adds '{first_type}' node, no crash, menu closed OK")
+
+# click-outside (well past the menu's bottom-right corner) closes without
+# adding any node
+mui_evt._open_add_menu((panel_evt.x + 60, panel_evt.y + 60), panel_evt)
+outside_pos = (panel_evt.right - 5, panel_evt.bottom - 5)
+total_evt = mui_evt._ctx_menu_total_rect(mui_evt.ctx_menu)
+assert not total_evt.collidepoint(outside_pos), "test point must be truly outside the menu"
+before_nodes2 = len(mui_evt.graph.nodes)
+with _um.patch.object(_pg.mouse, "get_pos", return_value=outside_pos):
+    _step([_pg.event.Event(_pg.MOUSEBUTTONDOWN, button=1, pos=outside_pos)])
+    _step([_pg.event.Event(_pg.MOUSEBUTTONUP, button=1, pos=outside_pos)])
+assert mui_evt.ctx_menu is None, "click outside the menu must close it"
+assert len(mui_evt.graph.nodes) == before_nodes2, "click outside must not add a node"
+print("event-driven: click outside the menu closes it without adding a node OK")
+
+# search-then-Enter via real KEYDOWN events adds the top match at the
+# right-click position
+mui_evt._open_add_menu((panel_evt.x + 40, panel_evt.y + 40), panel_evt)
+target_pos_evt = mui_evt.ctx_menu["graph_pos"]
+before_nodes3 = len(mui_evt.graph.nodes)
+key_events = []
+for ch in "noise":
+    ev = _pg.event.Event(_pg.KEYDOWN, key=getattr(_pg, f"K_{ch}"), unicode=ch, mod=0)
+    key_events.append(ev)
+with _um.patch.object(_pg.mouse, "get_pos", return_value=mui_evt.ctx_menu["screen_pos"]):
+    _step(key_events)
+    _step([_pg.event.Event(_pg.KEYDOWN, key=_pg.K_RETURN, unicode="\r", mod=0)])
+assert mui_evt.ctx_menu is None, "Enter must close the menu"
+assert len(mui_evt.graph.nodes) == before_nodes3 + 1, \
+    "Enter must add exactly the top search match"
+noise_id_evt = max(mui_evt.graph.nodes)
+assert mui_evt.graph.nodes[noise_id_evt]["type"] == "noise"
+assert list(mui_evt.graph.nodes[noise_id_evt]["pos"]) == \
+    [float(target_pos_evt[0]), float(target_pos_evt[1])]
+print("event-driven: type 'noise' + real Enter keydown adds noise node at click pos OK")
+
+editor.mat_ui = None
+if os.path.exists(USAGE_PATH):
+    os.remove(USAGE_PATH)
 
 print("ALL MATERIAL-EDITOR-UI JUDGE CHECKS PASSED")

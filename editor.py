@@ -3131,7 +3131,7 @@ class MaterialEditorUI:
                     menu["search"] += ch
             if inp.pressed(pygame.K_BACKSPACE):
                 menu["search"] = menu["search"][:-1]
-            matches = self._ctx_search_matches(menu["search"])
+            matches = self._ctx_search_matches(menu)
             if inp.pressed(pygame.K_RETURN) or inp.pressed(pygame.K_KP_ENTER):
                 if matches:
                     self._add_node_from_menu(matches[0], menu["graph_pos"])
@@ -3143,9 +3143,14 @@ class MaterialEditorUI:
         if inp.mouse_button_pressed(3):
             self.ctx_menu = None  # right-clicking elsewhere dismisses it too
 
-    def _ctx_search_matches(self, search: str) -> list[str]:
+    def _ctx_search_matches(self, menu) -> list[str]:
+        """Matches for the add-menu's current search text, computed purely
+        from `menu` (never `self.ctx_menu` -- this is called from
+        `_ctx_menu_rows` with a locally-captured menu dict after
+        `self.ctx_menu` may already have been cleared, e.g. mid-click)."""
+        search = menu["search"]
         if not search:
-            return self.ctx_menu["top10"]
+            return menu["top10"]
         s = search.lower()
         return [t for t in self.ADDABLE_TYPES
                if s in NODE_DISPLAY.get(t, t).lower() or s in t][:20]
@@ -3156,8 +3161,17 @@ class MaterialEditorUI:
         self.apply()
 
     def _click_ctx_menu(self, mp) -> None:
+        """Hit-test the click against the SAME total rect `_draw_ctx_menu`
+        draws (search bar + header + rows), handle a hit entry, THEN close.
+        A click truly outside that rect closes the menu without running any
+        entry action. Closing only after the action keeps `menu` (the local
+        capture) the sole source of truth for `_ctx_menu_rows` /
+        `_ctx_search_matches` while they run -- `self.ctx_menu` must not go
+        None out from under them mid-click."""
         menu = self.ctx_menu
-        self.ctx_menu = None
+        if not self._ctx_menu_total_rect(menu).collidepoint(mp):
+            self.ctx_menu = None
+            return
         for _label, rect, payload in self._ctx_menu_rows(menu):
             if not rect.collidepoint(mp):
                 continue
@@ -3165,7 +3179,8 @@ class MaterialEditorUI:
                 self._add_node_from_menu(payload, menu["graph_pos"])
             else:
                 self._run_node_action(menu["nid"], payload)
-            return
+            break
+        self.ctx_menu = None
 
     def _run_node_action(self, nid, action) -> None:
         kind, arg = action
@@ -3212,6 +3227,17 @@ class MaterialEditorUI:
         x, y = menu["screen_pos"]
         return pygame.Rect(x, y + self.CTX_SEARCH_H, self.CTX_MENU_W, self.CTX_HEADER_H)
 
+    def _ctx_menu_total_rect(self, menu):
+        """The full menu rect (search bar + header + rows) -- the single
+        source of truth for both drawing and click hit-testing, so they can
+        never disagree."""
+        import pygame
+        x, y = menu["screen_pos"]
+        search_h = self.CTX_SEARCH_H if menu["kind"] == "add" else 0
+        header_h = self.CTX_HEADER_H if self._ctx_header_rect(menu) is not None else 0
+        total_h = search_h + header_h + len(self._ctx_menu_rows(menu)) * self.CTX_ROW_H
+        return pygame.Rect(x, y, self.CTX_MENU_W, total_h)
+
     def _ctx_menu_rows(self, menu):
         """[(label, rect, payload), ...] -- same list drives draw + hit-test.
         `payload` is a node type string for the "add" menu, or an
@@ -3224,7 +3250,7 @@ class MaterialEditorUI:
             header = self._ctx_header_rect(menu)
             if header is not None:
                 y += self.CTX_HEADER_H  # section label isn't a clickable row either
-            for t in self._ctx_search_matches(menu["search"]):
+            for t in self._ctx_search_matches(menu):
                 rows.append((NODE_DISPLAY.get(t, t),
                             pygame.Rect(x, y, self.CTX_MENU_W, self.CTX_ROW_H), t))
                 y += self.CTX_ROW_H
@@ -3518,10 +3544,9 @@ class MaterialEditorUI:
         rows = self._ctx_menu_rows(menu)
         x, y = menu["screen_pos"]
         mp = pygame.mouse.get_pos()
-        search_h = self.CTX_SEARCH_H if menu["kind"] == "add" else 0
         header = self._ctx_header_rect(menu)
-        header_h = self.CTX_HEADER_H if header is not None else 0
-        total_h = search_h + header_h + len(rows) * self.CTX_ROW_H
+        total = self._ctx_menu_total_rect(menu)
+        total_h = total.height
         pygame.draw.rect(surf, (24, 26, 32), (x, y, self.CTX_MENU_W, total_h))
         if menu["kind"] == "add":
             search_r = pygame.Rect(x, y, self.CTX_MENU_W, self.CTX_SEARCH_H)
