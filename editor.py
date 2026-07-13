@@ -1999,6 +1999,9 @@ class Editor:
             self.settings_open = False
             return True
         if self.mat_ui is not None:
+            if self.mat_ui.ctx_menu is not None:
+                self.mat_ui.ctx_menu = None
+                return True
             self.mat_ui.close()
             return True
         if self.selected is not None:
@@ -2759,21 +2762,62 @@ class Editor:
 NODE_W = 150
 
 
+# node type -> UE-ish display name (search matches anywhere in this string)
+NODE_DISPLAY = {
+    "constant": "Constant", "constant2vector": "Constant2Vector",
+    "constant3vector": "Constant3Vector", "constant4vector": "Constant4Vector",
+    "position": "Position", "normal": "Normal", "checker": "Checker",
+    "noise": "Noise", "gradient": "Gradient", "mix": "Mix", "lerp": "Lerp",
+    "multiply": "Multiply", "add": "Add", "subtract": "Subtract",
+    "divide": "Divide", "power": "Power", "clamp": "Clamp",
+    "one_minus": "OneMinus", "abs": "Abs", "floor": "Floor", "frac": "Frac",
+    "sine": "Sine", "cosine": "Cosine", "dot_product": "DotProduct",
+    "vmax": "Max", "vmin": "Min", "component_mask": "ComponentMask",
+    "hdri": "HDRI", "tex_coord": "TexCoord", "tex_sample": "TextureSample",
+}
+# node type -> title-bar category, driving CATEGORY_COLOR (incremental UE-ish
+# restyle -- doesn't touch the rest of the node body drawing)
+NODE_CATEGORY = {"output": "output",
+                 **{t: "constant" for t in ("constant", "constant2vector",
+                                            "constant3vector", "constant4vector",
+                                            "position", "normal")},
+                 **{t: "texture" for t in ("checker", "noise", "gradient", "hdri",
+                                          "tex_coord", "tex_sample")}}
+CATEGORY_COLOR = {"output": (68, 38, 38), "constant": (36, 56, 64),
+                  "texture": (38, 60, 42), "math": (42, 42, 60)}
+# seed usage counts (descending) so the right-click "add node" menu's top-10
+# is useful before any real usage history has accumulated
+DEFAULT_NODE_USAGE = {"constant3vector": 100, "multiply": 90, "add": 80,
+                      "lerp": 70, "clamp": 60, "noise": 50, "tex_sample": 40,
+                      "power": 30, "one_minus": 20, "checker": 10}
+
+
 class MaterialEditorUI:
     """Node-based material editor: drag ports to connect, drag params to tune.
 
     The graph bakes to the entity mesh's per-face colors on every change, so
     the 3D viewport behind the panel is a live preview. Floating only — drag
     its 18px title bar to move it, click X (or M/Esc) to close.
+
+    UE-style workflow: nodes are added via a right-click context menu on the
+    canvas (search bar + top-10-by-usage), not a top-bar palette. Right-click
+    on a node opens Delete/Disconnect/Duplicate/Preview actions. A preview
+    panel docks to the left, rendering the current (or isolated-node) graph
+    output on a sphere.
     """
 
-    PALETTE = ("constant", "constant2vector", "constant3vector", "constant4vector",
-               "position", "normal", "checker", "noise", "gradient",
-               "mix", "lerp", "multiply", "add", "subtract", "divide", "power",
-               "clamp", "one_minus", "abs", "floor", "frac", "sine", "cosine",
-               "dot_product", "vmax", "vmin", "component_mask", "hdri",
-               "tex_coord", "tex_sample")
+    ADDABLE_TYPES = ("constant", "constant2vector", "constant3vector", "constant4vector",
+                     "position", "normal", "checker", "noise", "gradient",
+                     "mix", "lerp", "multiply", "add", "subtract", "divide", "power",
+                     "clamp", "one_minus", "abs", "floor", "frac", "sine", "cosine",
+                     "dot_product", "vmax", "vmin", "component_mask", "hdri",
+                     "tex_coord", "tex_sample")
     DEFAULT_SIZE = (900, 560)
+    PREVIEW_W = 150       # left preview-panel strip width, inside content_rect
+    PREVIEW_SIZE = 108    # rendered preview sphere resolution
+    CTX_MENU_W = 220
+    CTX_ROW_H = 20
+    CTX_SEARCH_H = 22
 
     def __init__(self, editor: Editor, entity):
         self.editor = editor
@@ -2789,6 +2833,11 @@ class MaterialEditorUI:
         self.drag_title = None   # (grab_dx, grab_dy) while dragging the title bar
         self.minimized = False
         self._spawn_i = 0
+        self.ctx_menu = None      # dict, see _open_add_menu/_open_node_menu
+        self.preview_nid = None   # None == showing the real Output; else isolated node id
+        self._preview_surf = None
+        self._preview_dirty = True
+        self._preview_stop_rect = None
 
     def close(self) -> None:
         self.editor.mat_ui = None
@@ -2816,6 +2865,22 @@ class MaterialEditorUI:
         outer = self.rect(w, h)
         return pygame.Rect(outer.x, outer.y + PANEL_TITLE_H, outer.width,
                            max(0, outer.height - PANEL_TITLE_H))
+
+    def preview_rect(self, w, h):
+        """Left preview-panel strip (UE-style), inside content_rect."""
+        import pygame
+        content = self.content_rect(w, h)
+        pw = min(self.PREVIEW_W, max(0, content.width - 200))
+        return pygame.Rect(content.x, content.y, pw, content.height)
+
+    def graph_panel(self, w, h):
+        """Node-graph canvas -- content_rect minus the preview strip. All node
+        positions/hit-tests are relative to THIS rect's origin, not content_rect's."""
+        import pygame
+        content = self.content_rect(w, h)
+        prev = self.preview_rect(w, h)
+        return pygame.Rect(content.x + prev.width, content.y,
+                           max(0, content.width - prev.width), content.height)
 
     def _out_ports(self, node_type):
         return self.editor.engine_mod.NODE_OUTPUTS.get(node_type, ("out",))
@@ -2864,15 +2929,23 @@ class MaterialEditorUI:
         node = self.graph.nodes[nid]
         return self._param_row(nid, len(node["params"]), panel)
 
-    def _palette_rects(self, panel):
-        import pygame
-        out = []
-        x = panel.x + 10
-        for t in self.PALETTE:
-            w = 24 + 7 * len(t)
-            out.append((t, pygame.Rect(x, panel.y + 6, w, 20)))
-            x += w + 6
-        return out
+    # ---- node usage tracking (drives the add-node menu's top-10) ----
+    def _usage_path(self) -> str:
+        d = os.path.dirname(self.editor.settings_path) or "."
+        return os.path.join(d, "mat_node_usage.json")
+
+    def _load_usage(self) -> dict:
+        data = load_settings(self._usage_path())
+        return data if data else dict(DEFAULT_NODE_USAGE)
+
+    def _bump_usage(self, node_type: str) -> None:
+        usage = self._load_usage()
+        usage[node_type] = usage.get(node_type, 0) + 1
+        save_settings(usage, self._usage_path())
+
+    def _top10(self) -> list[str]:
+        usage = self._load_usage()
+        return sorted(self.ADDABLE_TYPES, key=lambda t: -usage.get(t, 0))[:10]
 
     # ---- interaction ----
     def apply(self, draft: bool = False) -> None:
@@ -2881,6 +2954,7 @@ class MaterialEditorUI:
         for every frame; the final release re-bakes at full resolution."""
         self.graph.apply(self.entity, draft=draft)
         self.editor.dirty = True
+        self._preview_dirty = True
         if not draft and self.entity.mesh is not None:
             # keep the Details-panel material slot preview in sync with
             # live node-editor edits (requirement: "slot preview updates
@@ -2915,9 +2989,17 @@ class MaterialEditorUI:
         minimize = pygame.Rect(outer.right - 44, outer.y + 2, 16, 16)
         save_asset = pygame.Rect(outer.right - 140, outer.y + 2, 90, 16)
 
+        if self.ctx_menu is not None:
+            self._update_ctx_menu(inp, mp)
+            return
         if inp.pressed(pygame.K_m):
             self.close()
             return
+        if inp.mouse_button_pressed(3) and not self.minimized:
+            panel = self.graph_panel(w, h)
+            if panel.collidepoint(mp):
+                self._open_context_menu(mp, panel)
+                return
         if inp.mouse_button_pressed(1):
             if close.collidepoint(mp):
                 self.close()
@@ -2930,14 +3012,18 @@ class MaterialEditorUI:
                 return
             if title_bar.collidepoint(mp):
                 self.drag_title = (mp[0] - outer.x, mp[1] - outer.y)
+            elif not self.minimized and self._preview_stop_rect is not None \
+                    and self._preview_stop_rect.collidepoint(mp):
+                self.preview_nid = None
+                self._preview_dirty = True
             elif not self.minimized:
-                self._press(mp, self.content_rect(w, h))
+                self._press(mp, self.graph_panel(w, h))
         if inp.mouse_held(1):
             if self.drag_title is not None:
                 dx, dy = self.drag_title
                 self.pos = [mp[0] - dx, mp[1] - dy]
             if not self.minimized:
-                panel = self.content_rect(w, h)
+                panel = self.graph_panel(w, h)
                 if self.drag_node is not None:
                     nid, dx, dy = self.drag_node
                     if nid in self.graph.nodes:
@@ -2956,19 +3042,169 @@ class MaterialEditorUI:
                         self.apply(draft=True)
         else:
             if self.drag_link is not None and not self.minimized:
-                self._finish_link(mp, self.content_rect(w, h))
+                self._finish_link(mp, self.graph_panel(w, h))
             if self.drag_param is not None:
                 self.apply(draft=False)  # full-res bake once the drag releases
             self.drag_node = self.drag_param = self.drag_link = self.drag_title = None
 
+    def _node_at(self, mp, panel):
+        """Topmost node whose body rect contains `mp`, or None."""
+        for nid in reversed(list(self.graph.nodes)):
+            if self.node_rect(nid, panel).collidepoint(mp):
+                return nid
+        return None
+
+    # ---- right-click context menu (UE-style add-node / node-actions) ----
+    def _open_context_menu(self, mp, panel) -> None:
+        nid = self._node_at(mp, panel)
+        if nid is not None:
+            self._open_node_menu(mp, nid, panel)
+        else:
+            self._open_add_menu(mp, panel)
+
+    def _open_add_menu(self, mp, panel) -> None:
+        self.ctx_menu = {"kind": "add", "screen_pos": mp,
+                         "graph_pos": (mp[0] - panel.x, mp[1] - panel.y),
+                         "search": "", "top10": self._top10()}
+
+    def _open_node_menu(self, mp, nid, panel) -> None:
+        NODE_DEFS = self.editor.engine_mod.NODE_DEFS
+        node = self.graph.nodes[nid]
+        inputs, _ = NODE_DEFS[node["type"]]
+        connected = [name for name in inputs if self.graph.link_into(nid, name) is not None]
+        items = []  # (label, action_key, payload)
+        is_output = node["type"] == "output"
+        if not is_output:
+            items.append(("Delete", "delete", None))
+        if connected:
+            items.append(("Break All Node Links", "disconnect_all", None))
+            for name in connected:
+                items.append((f"Break Link: {name}", "disconnect_one", name))
+        if not is_output:
+            items.append(("Duplicate", "duplicate", None))
+            label = ("Stop Previewing Node" if self.preview_nid == nid
+                    else "Start Previewing Node")
+            items.append((label, "toggle_preview", None))
+        self.ctx_menu = {"kind": "node", "screen_pos": mp, "nid": nid, "items": items}
+
+    def _update_ctx_menu(self, inp, mp) -> None:
+        import pygame
+        menu = self.ctx_menu
+        if inp.pressed(pygame.K_ESCAPE):
+            self.ctx_menu = None
+            return
+        if menu["kind"] == "add":
+            for ch in inp.text_typed:
+                if ch.isprintable():
+                    menu["search"] += ch
+            if inp.pressed(pygame.K_BACKSPACE):
+                menu["search"] = menu["search"][:-1]
+            matches = self._ctx_search_matches(menu["search"])
+            if inp.pressed(pygame.K_RETURN) or inp.pressed(pygame.K_KP_ENTER):
+                if matches:
+                    self._add_node_from_menu(matches[0], menu["graph_pos"])
+                self.ctx_menu = None
+                return
+        if inp.mouse_button_pressed(1):
+            self._click_ctx_menu(mp)
+            return
+        if inp.mouse_button_pressed(3):
+            self.ctx_menu = None  # right-clicking elsewhere dismisses it too
+
+    def _ctx_search_matches(self, search: str) -> list[str]:
+        if not search:
+            return self.ctx_menu["top10"]
+        s = search.lower()
+        return [t for t in self.ADDABLE_TYPES
+               if s in NODE_DISPLAY.get(t, t).lower() or s in t][:20]
+
+    def _add_node_from_menu(self, node_type: str, graph_pos) -> None:
+        self.graph.add(node_type, graph_pos)
+        self._bump_usage(node_type)
+        self.apply()
+
+    def _click_ctx_menu(self, mp) -> None:
+        menu = self.ctx_menu
+        self.ctx_menu = None
+        for _label, rect, payload in self._ctx_menu_rows(menu):
+            if not rect.collidepoint(mp):
+                continue
+            if menu["kind"] == "add":
+                self._add_node_from_menu(payload, menu["graph_pos"])
+            else:
+                self._run_node_action(menu["nid"], payload)
+            return
+
+    def _run_node_action(self, nid, action) -> None:
+        kind, arg = action
+        if nid not in self.graph.nodes:
+            return
+        if kind == "delete":
+            if self.preview_nid == nid:
+                self.preview_nid = None
+            self.graph.remove(nid)
+            self.apply()
+        elif kind == "disconnect_all":
+            NODE_DEFS = self.editor.engine_mod.NODE_DEFS
+            inputs, _ = NODE_DEFS[self.graph.nodes[nid]["type"]]
+            for name in inputs:
+                self.graph.disconnect(nid, name)
+            self.graph.links = [l for l in self.graph.links if l[0] != nid]
+            self.apply()
+        elif kind == "disconnect_one":
+            self.graph.disconnect(nid, arg)
+            self.apply()
+        elif kind == "duplicate":
+            src = self.graph.nodes[nid]
+            new_id = self.graph.add(src["type"],
+                                    (src["pos"][0] + 24, src["pos"][1] + 24))
+            self.graph.nodes[new_id]["params"] = dict(src["params"])
+            for k, v in src.items():
+                if k not in ("type", "pos", "params"):
+                    self.graph.nodes[new_id][k] = v
+            self.apply()
+        elif kind == "toggle_preview":
+            self.preview_nid = None if self.preview_nid == nid else nid
+            self._preview_dirty = True
+
+    CTX_HEADER_H = 16  # "Common" section-label row, add-menu only
+
+    def _ctx_header_rect(self, menu):
+        """The "Common" section-label row (add-menu, empty search, non-empty
+        top-10 only) -- its own row, stacked below the search bar and above
+        the entries, never overlapping either (house rule: same rect for
+        draw + layout math)."""
+        import pygame
+        if menu["kind"] != "add" or menu["search"] or not menu["top10"]:
+            return None
+        x, y = menu["screen_pos"]
+        return pygame.Rect(x, y + self.CTX_SEARCH_H, self.CTX_MENU_W, self.CTX_HEADER_H)
+
+    def _ctx_menu_rows(self, menu):
+        """[(label, rect, payload), ...] -- same list drives draw + hit-test.
+        `payload` is a node type string for the "add" menu, or an
+        (action_kind, arg) pair for the "node" menu."""
+        import pygame
+        x, y = menu["screen_pos"]
+        rows = []
+        if menu["kind"] == "add":
+            y += self.CTX_SEARCH_H  # search bar itself isn't a clickable row
+            header = self._ctx_header_rect(menu)
+            if header is not None:
+                y += self.CTX_HEADER_H  # section label isn't a clickable row either
+            for t in self._ctx_search_matches(menu["search"]):
+                rows.append((NODE_DISPLAY.get(t, t),
+                            pygame.Rect(x, y, self.CTX_MENU_W, self.CTX_ROW_H), t))
+                y += self.CTX_ROW_H
+        else:
+            for label, action_kind, payload in menu["items"]:
+                rows.append((label, pygame.Rect(x, y, self.CTX_MENU_W, self.CTX_ROW_H),
+                            (action_kind, payload)))
+                y += self.CTX_ROW_H
+        return rows
+
     def _press(self, mp, panel) -> None:
         import pygame
-        for t, r in self._palette_rects(panel):
-            if r.collidepoint(mp):
-                self._spawn_i += 1
-                self.graph.add(t, (30 + (self._spawn_i % 5) * 40,
-                                   60 + (self._spawn_i % 7) * 30))
-                return
         NODE_DEFS = self.editor.engine_mod.NODE_DEFS
         for nid in reversed(list(self.graph.nodes)):
             node = self.graph.nodes[nid]
@@ -3068,13 +3304,11 @@ class MaterialEditorUI:
         if self.minimized:
             return
 
-        panel = self.content_rect(w, h)
-        for t, r in self._palette_rects(panel):
-            hov = r.collidepoint(pygame.mouse.get_pos())
-            pygame.draw.rect(surf, HOVER_BG if hov else (30, 33, 40), r,
-                             border_radius=4)
-            lab = self.editor.font_small.render("+" + t, True, TEXT)
-            surf.blit(lab, (r.x + 6, r.y + 4))
+        content = self.content_rect(w, h)
+        prev_r = self.preview_rect(w, h)
+        panel = self.graph_panel(w, h)
+        self._draw_preview_panel(surf, prev_r)
+        pygame.draw.line(surf, PANEL_EDGE, (panel.x, content.y), (panel.x, content.bottom))
 
         NODE_DEFS = self.editor.engine_mod.NODE_DEFS
         # wires
@@ -3100,8 +3334,15 @@ class MaterialEditorUI:
         for nid, node in self.graph.nodes.items():
             r = self.node_rect(nid, panel)
             pygame.draw.rect(surf, (33, 36, 44), r, border_radius=5)
-            pygame.draw.rect(surf, (70, 75, 88), r, 1, border_radius=5)
-            name = self.editor.font_small.render(node["type"], True, TEXT)
+            category = NODE_CATEGORY.get(node["type"], "math")
+            title_r = pygame.Rect(r.x, r.y, r.width, 18)
+            pygame.draw.rect(surf, CATEGORY_COLOR[category], title_r,
+                             border_top_left_radius=5, border_top_right_radius=5)
+            edge_color = ACCENT if nid == self.preview_nid else (70, 75, 88)
+            pygame.draw.rect(surf, edge_color, r, 2 if nid == self.preview_nid else 1,
+                             border_radius=5)
+            name = self.editor.font_small.render(
+                NODE_DISPLAY.get(node["type"], node["type"]), True, TEXT)
             surf.blit(name, (r.x + 8, r.y + 5))
             if node["type"] != "output":
                 pygame.draw.line(surf, (120, 80, 80), (r.right - 16, r.y + 6),
@@ -3142,6 +3383,93 @@ class MaterialEditorUI:
                 p = node["params"]
                 sw = (int(p["r"] * 255), int(p["g"] * 255), int(p["b"] * 255))
                 pygame.draw.rect(surf, sw, (r.x + 60, r.y + 4, 40, 12))
+
+        if self.ctx_menu is not None:
+            self._draw_ctx_menu(surf)
+
+    def _draw_preview_panel(self, surf, prev_r) -> None:
+        import pygame
+        pygame.draw.rect(surf, (26, 28, 34), prev_r)
+        pygame.draw.line(surf, PANEL_EDGE, (prev_r.x, prev_r.y), (prev_r.right, prev_r.y))
+        if self._preview_dirty or self._preview_surf is None:
+            self._preview_surf = self._render_preview()
+            self._preview_dirty = False
+        sw = min(self.PREVIEW_SIZE, prev_r.width - 16)
+        sx = prev_r.x + (prev_r.width - sw) // 2
+        sy = prev_r.y + 10
+        if sw > 0:
+            scaled = pygame.transform.smoothscale(self._preview_surf, (sw, sw))
+            surf.blit(scaled, (sx, sy))
+            pygame.draw.rect(surf, PANEL_EDGE, (sx, sy, sw, sw), 1)
+        label = ("Output" if self.preview_nid is None
+                else NODE_DISPLAY.get(self.graph.nodes.get(self.preview_nid, {}).get("type", ""),
+                                     "?"))
+        lab = self.editor.font_small.render(f"Preview: {label}", True, TEXT_DIM)
+        surf.blit(lab, (prev_r.x + 8, sy + sw + 8))
+        if self.preview_nid is not None:
+            stop = pygame.Rect(prev_r.x + 8, sy + sw + 26, prev_r.width - 16, 18)
+            pygame.draw.rect(surf, (40, 44, 54), stop, border_radius=3)
+            slab = self.editor.font_small.render("Stop Previewing", True, TEXT)
+            surf.blit(slab, (stop.x + 6, stop.y + 2))
+            self._preview_stop_rect = stop
+        else:
+            self._preview_stop_rect = None
+
+    def _render_preview(self):
+        """Bake a small preview sphere with the current graph (or, while
+        isolating a node, that node's own output) -- cheap and only
+        re-rendered when the graph or the isolated node changes."""
+        import pygame
+        eng = self.editor.engine_mod
+        size = self.PREVIEW_SIZE
+        surf = pygame.Surface((size, size))
+        surf.fill((29, 31, 37))
+        sphere = eng.icosphere(radius=1.0, subdivisions=2)
+        if self.preview_nid is not None and self.preview_nid in self.graph.nodes:
+            colors = self.graph.preview_value(sphere, self.preview_nid)
+            sphere.face_colors = colors
+        else:
+            (sphere.face_colors, sphere.face_roughness,
+             sphere.face_metallic, sphere.face_emissive) = self.graph.evaluate_pbr(sphere)
+        mini = eng.Scene(
+            light=eng.DirectionalLight(eng.Vec3(-0.5, -0.9, -0.6), ambient=0.42),
+            background=(29, 31, 37))
+        mini.add(eng.Entity("preview", mesh=sphere))
+        cam = eng.Camera(yaw=0.65, pitch=-0.5)
+        fwd = cam.forward()
+        cam.position = eng.Vec3(-fwd.x, -fwd.y, -fwd.z) * 2.6
+        from engine.renderer import Renderer
+        Renderer().render(surf, mini, cam)
+        return surf
+
+    def _draw_ctx_menu(self, surf) -> None:
+        import pygame
+        menu = self.ctx_menu
+        rows = self._ctx_menu_rows(menu)
+        x, y = menu["screen_pos"]
+        mp = pygame.mouse.get_pos()
+        search_h = self.CTX_SEARCH_H if menu["kind"] == "add" else 0
+        header = self._ctx_header_rect(menu)
+        header_h = self.CTX_HEADER_H if header is not None else 0
+        total_h = search_h + header_h + len(rows) * self.CTX_ROW_H
+        pygame.draw.rect(surf, (24, 26, 32), (x, y, self.CTX_MENU_W, total_h))
+        if menu["kind"] == "add":
+            search_r = pygame.Rect(x, y, self.CTX_MENU_W, self.CTX_SEARCH_H)
+            pygame.draw.rect(surf, (16, 18, 22), search_r)
+            pygame.draw.rect(surf, PANEL_EDGE, search_r, 1)
+            txt = menu["search"] or "Search nodes..."
+            color = TEXT if menu["search"] else TEXT_DIM
+            lab = self.editor.font_small.render(txt, True, color)
+            surf.blit(lab, (search_r.x + 6, search_r.y + 4))
+            if header is not None:
+                hdr = self.editor.font_small.render("Common", True, TEXT_DIM)
+                surf.blit(hdr, (header.x + 6, header.y + 2))
+        pygame.draw.rect(surf, PANEL_EDGE, (x, y, self.CTX_MENU_W, total_h), 1)
+        for label, rect, _payload in rows:
+            if rect.collidepoint(mp):
+                pygame.draw.rect(surf, HOVER_BG, rect)
+            lab = self.editor.font_small.render(label, True, TEXT)
+            surf.blit(lab, (rect.x + 8, rect.y + 3))
 
 
 class EditorBehavior:

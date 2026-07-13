@@ -420,6 +420,30 @@ class MaterialGraph:
         emissive = np.maximum(pbr.get("emissive", np.zeros((m, 3))), 0.0) * 255.0
         return base_color, roughness, metallic, emissive
 
+    def preview_value(self, mesh, nid: int, source_image: np.ndarray | None = None) -> np.ndarray:
+        """Bake as if node `nid`'s own output fed Output.BaseColor directly --
+        the material editor's node-isolation preview (UE: "Start Previewing
+        Node"). Scalar node outputs come back as r==g==b (grayscale), vectors
+        as color, matching UE's preview behavior. Non-destructive: the real
+        BaseColor wiring is restored before returning, even on error, so
+        isolating a node for preview never mutates the saved/baked graph."""
+        out_id = self.output_id()
+        if nid not in self.nodes or nid == out_id:
+            return self.evaluate(mesh, source_image)
+        saved_link = self.link_into(out_id, "base_color")
+        self.disconnect(out_id, "base_color")
+        outputs = NODE_OUTPUTS.get(self.nodes[nid]["type"], ("out",))
+        connected = self.connect(nid, out_id, "base_color", outputs[0])
+        try:
+            if not connected:  # e.g. would-be cycle -- fall back to the real bake
+                return self.evaluate(mesh, source_image)
+            return self.evaluate(mesh, source_image)
+        finally:
+            self.disconnect(out_id, "base_color")
+            if saved_link is not None:
+                src, sport = saved_link
+                self.links.append([src, out_id, "base_color", sport])
+
     def evaluate_sky(self, source_image: np.ndarray, max_w: int = 1024,
                      max_h: int = 512) -> np.ndarray:
         """Bake the graph to an equirect radiance image (h, w, 3) float32 --
