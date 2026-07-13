@@ -33,3 +33,4 @@ death never loses more than one milestone.
 | 2026-07-12 | PBR foundation + CPU renderer (PBR 1/3) | 190,326 | completed clean; judged + squash-merged b97f515. Over budget (golden-fixture infra + FPS fast-path work). Good spec_scale compat-gate design |
 | 2026-07-12 | PBR OpenGL parity (PBR 2/3) | 135,531 | completed clean under budget; judged + squash-merged 53db243. Naming all ten suites in the brief worked — full battery run |
 | 2026-07-12 | PBR wgpu parity (PBR 3/3) | 140,209 | completed clean under budget; judged + squash-merged c314422. 3-way parity diffs exactly 0.0; also fixed latent missing-PI WGSL bug and flagged stale line in engine-coder.md (supervisor corrected it) |
+| 2026-07-13 | DX12 default renderer (CPU opt-in) | 82,477 | completed clean under budget; judged + squash-merged 2df73cd. User preference saved to supervisor memory |
