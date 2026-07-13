@@ -256,7 +256,7 @@ checker = g.add("checker", (100, 100))
 red = g.add("color", (10, 60))
 g.nodes[red]["params"].update(r=1.0, g=0.15, b=0.15)
 assert g.connect(red, checker, "a")
-assert g.connect(checker, g.output_id(), "color")
+assert g.connect(checker, g.output_id(), "base_color")
 assert not g.connect(g.output_id(), checker, "b")   # cycle rejected
 board2 = engine.checkerboard(4, 1.0)
 baked = g.evaluate(board2)

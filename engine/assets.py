@@ -118,6 +118,24 @@ class AssetDef:
         return entity
 
 
+class MaterialAsset:
+    """A reusable material graph saved to assets/materials/<name>.json --
+    dragged from the content browser onto a mesh entity's Details panel to
+    assign it (see MaterialEditorUI's "Save as Asset" button and the
+    Details material slot in editor.py)."""
+
+    def __init__(self, name: str, graph_dict: dict, path: str):
+        self.name = name
+        self.graph_dict = graph_dict
+        self.path = path
+
+    def graph(self) -> "MaterialGraph":
+        """A fresh, independent copy -- assigning never aliases the asset's
+        own graph, so editing an assigned entity's material doesn't mutate
+        (or get mutated by) the library asset or other entities using it."""
+        return MaterialGraph.from_dict(self.graph_dict)
+
+
 class AssetLibrary:
     """Owns the on-disk assets/*.json plus the content-browser folder tree.
 
@@ -132,12 +150,17 @@ class AssetLibrary:
         self.directory = directory
         self.assets: list[AssetDef] = []
         self.by_name: dict[str, AssetDef] = {}
+        self.materials: list[MaterialAsset] = []
+        self.material_by_name: dict[str, MaterialAsset] = {}
         self.folders: dict[str, dict] = {}
         self.folder_of: dict[str, str] = {}
         self._next_folder_id = 1
         from . import texture as texture_mod
         texture_mod.set_texture_root(directory)  # material TextureSample nodes resolve here
         self.reload()
+
+    def _materials_dir(self) -> str:
+        return os.path.join(self.directory, "materials")
 
     def reload(self) -> None:
         self.assets.clear()
@@ -151,7 +174,35 @@ class AssetLibrary:
                 self.assets.append(asset)
                 self.by_name[asset.name] = asset
         self.assets.sort(key=lambda a: (a.category, a.name))
+        self.materials.clear()
+        self.material_by_name.clear()
+        mdir = self._materials_dir()
+        if os.path.isdir(mdir):
+            for fn in sorted(os.listdir(mdir)):
+                if not fn.lower().endswith(".json"):
+                    continue
+                with open(os.path.join(mdir, fn), encoding="utf-8") as f:
+                    data = json.load(f)
+                mat = MaterialAsset(data["name"], data["graph"], os.path.join(mdir, fn))
+                self.materials.append(mat)
+                self.material_by_name[mat.name] = mat
+        self.materials.sort(key=lambda m: m.name)
         self._load_folders()
+
+    def save_material(self, name: str, graph: "MaterialGraph") -> MaterialAsset:
+        """Save (or overwrite) `name` as a reusable material asset."""
+        os.makedirs(self._materials_dir(), exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip() or "material"
+        path = os.path.join(self._materials_dir(), safe.replace(" ", "_").lower() + ".json")
+        graph_dict = graph.to_dict()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"name": name, "graph": graph_dict}, f, indent=2)
+        mat = MaterialAsset(name, graph_dict, path)
+        self.material_by_name[name] = mat
+        if mat not in self.materials:
+            self.materials = [m for m in self.materials if m.name != name] + [mat]
+            self.materials.sort(key=lambda m: m.name)
+        return mat
 
     def instantiate(self, name: str, entity_name: str | None = None) -> Entity:
         return self.by_name[name].instantiate(entity_name)
@@ -235,6 +286,8 @@ def _entity_dict(e: Entity) -> dict:
         d["light"] = light
     if e.material is not None:
         d["material"] = e.material.to_dict()
+        if e.material_asset:
+            d["material_asset"] = e.material_asset
     if e.sun is not None:
         d["sun"] = {k: getattr(e.sun, k) for k in _SUN_PROPS}
     if e.fog_volume is not None:
@@ -309,6 +362,7 @@ def load_scene(path: str, library: AssetLibrary,
             fv.enabled = fvd.get("enabled", fv.enabled)
         if "material" in spec and (entity.mesh is not None or entity.environment is not None):
             entity.material = MaterialGraph.from_dict(spec["material"])
+            entity.material_asset = spec.get("material_asset")
             entity.material.apply(entity)
         scene.add(entity)
 

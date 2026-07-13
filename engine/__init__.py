@@ -1,6 +1,6 @@
 """PyEngine — a compact real-time 3D game engine in pure Python (pygame + numpy)."""
 from . import behaviors
-from .assets import AssetLibrary, load_scene, save_scene
+from .assets import AssetLibrary, MaterialAsset, load_scene, save_scene
 from .camera import Camera
 from .core import Engine
 from .environment import Environment, import_hdri, load_hdr, save_hdr
@@ -23,6 +23,7 @@ __all__ = [
     "Environment", "load_hdr", "save_hdr", "import_hdri", "import_fbx",
     "export_asset_fbx", "has_mesh", "import_texture", "texture",
     "MaterialGraph", "NODE_DEFS", "NODE_OUTPUTS", "PARAM_RANGES",
-    "AssetLibrary", "save_scene", "load_scene", "ShadowTracer", "GITracer", "pick_entity",
+    "AssetLibrary", "MaterialAsset", "save_scene", "load_scene",
+    "ShadowTracer", "GITracer", "pick_entity",
     "behaviors",
 ]

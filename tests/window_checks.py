@@ -83,7 +83,7 @@ ui = MaterialEditorUI(editor, crate)
 g = ui.graph
 c = g.add("color", (40, 60))
 g.nodes[c]["params"].update(r=1.0, g=0.05, b=0.05)
-g.connect(c, g.output_id(), "color")
+g.connect(c, g.output_id(), "base_color")
 ui.apply()
 fc = crate.mesh.face_colors
 assert fc[:, 0].mean() > fc[:, 1].mean() * 3, "material bake broken post-merge"

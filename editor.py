@@ -210,6 +210,28 @@ def make_icon(engine, asset, size=ICON):
     return surf
 
 
+def make_material_icon(engine, graph, size=ICON):
+    """Bake `graph` onto a small preview sphere and render it -- the
+    thumbnail for a material asset tile / Details material slot swatch."""
+    import pygame
+
+    surf = pygame.Surface((size, size))
+    surf.fill((29, 31, 37))
+    sphere = engine.icosphere(radius=1.0, subdivisions=2)
+    sphere.face_colors = graph.evaluate(sphere)
+    mini = engine.Scene(
+        light=engine.DirectionalLight(engine.Vec3(-0.5, -0.9, -0.6), ambient=0.42),
+        background=(29, 31, 37))
+    entity = engine.Entity("preview", mesh=sphere)
+    mini.add(entity)
+    cam = engine.Camera(yaw=0.65, pitch=-0.5)
+    fwd = cam.forward()
+    cam.position = engine.Vec3(-fwd.x, -fwd.y, -fwd.z) * 2.6
+    from engine.renderer import Renderer
+    Renderer().render(surf, mini, cam)
+    return surf
+
+
 class Editor:
     _MENU_NAMES = ("File", "Edit", "Window", "Help")
     _WINDOW_PANEL_LABELS = {"Outliner": "outliner", "Details": "details",
@@ -290,6 +312,10 @@ class Editor:
         for i, a in enumerate(lib.assets):
             eng.loading_step(f"rendering thumbnail: {a.name}", 0.25 + 0.45 * i / count)
             self.icons[a.name] = make_icon(engine_mod, a)
+        self.mat_icons = {}          # material asset name -> thumbnail Surface
+        for m in lib.materials:
+            self.mat_icons[m.name] = make_material_icon(engine_mod, m.graph())
+        self.mat_icon_cache = {}     # id(entity) -> live Details-slot preview Surface
 
     # ---- layout: the single source of truth for panel/viewport rects ----
     def _float_rect_for(self, pid, w, h):
@@ -931,6 +957,8 @@ class Editor:
                          "text": "open node editor  (M)",
                          "action": lambda: setattr(self, "mat_ui",
                                                    MaterialEditorUI(self, e))})
+        if e.mesh is not None:
+            rows.append({"kind": "material_slot", "label": "material slot", "entity": e})
         if e.environment is not None:
             env = e.environment
             return rows + [{"kind": "slider", "label": "env strength", "min": 0.0,
@@ -1903,8 +1931,9 @@ class Editor:
                 self.active_slider = None
 
         if self.drag_asset is not None and inp.mouse_button_released(1):
-            if not self.over_ui(mp):
-                self._place_asset(self.drag_asset, mp, w, h)
+            if not self._try_drop_material_slot(mp, layout):
+                if not self.over_ui(mp):
+                    self._place_asset(self.drag_asset, mp, w, h)
             self.drag_asset = None
 
         if inp.pressed(pygame.K_F2) and self.selected_folder is not None:
@@ -1988,8 +2017,9 @@ class Editor:
             elif self._import_btn_rect(blay["topbar"]).collidepoint(mp):
                 self._import_dialog_to_folder()
             elif self._export_btn_rect(blay["topbar"]).collidepoint(mp):
-                if self.selected_asset is not None and self.engine_mod.has_mesh(
-                        self.selected_asset):
+                if (self.selected_asset is not None
+                        and not isinstance(self.selected_asset, self.engine_mod.MaterialAsset)
+                        and self.engine_mod.has_mesh(self.selected_asset)):
                     self._export_fbx_dialog()
             elif blay["tree"].collidepoint(mp):
                 _i, fid = self._tree_row_at(mp, blay["tree"])
@@ -2003,8 +2033,39 @@ class Editor:
                 asset = self._tile_at(mp, blay["grid"])
                 if asset is not None:
                     self.selected_asset = asset
-                    if "texture" not in asset.data:  # textures aren't placeable
+                    is_mat = isinstance(asset, self.engine_mod.MaterialAsset)
+                    if is_mat or "texture" not in asset.data:  # textures aren't placeable
                         self.drag_asset = asset
+
+    def _try_drop_material_slot(self, mp, layout) -> bool:
+        """Handle a drag_asset release over the Details panel's material
+        slot. Returns True if it was consumed here (whether or not it
+        resulted in an assignment -- e.g. a non-material asset dropped on
+        the slot is rejected but the drop still counts as "handled", so it
+        doesn't fall through and get placed in the world instead)."""
+        import pygame
+        content = self._panel_content_rect("details", layout)
+        if content is None or not content.collidepoint(mp):
+            return False
+        rows = self._details_rows()
+        i = (mp[1] - (content.y + DETAILS_ROWS_TOP)) // DETAIL_ROW_H
+        if not (0 <= i < len(rows)) or rows[i]["kind"] != "material_slot":
+            return False
+        if not isinstance(self.drag_asset, self.engine_mod.MaterialAsset):
+            self.status = (f"'{self.drag_asset.name}' is not a material asset", 4.0)
+            return True
+        ent = rows[i]["entity"]
+        mat_asset = self.drag_asset
+        ent.material = mat_asset.graph()
+        ent.material_asset = mat_asset.name
+        ent.material.apply(ent)
+        self.mat_icon_cache[id(ent)] = self.mat_icons.get(
+            mat_asset.name) or make_material_icon(self.engine_mod, ent.material)
+        if self.mat_ui is not None and self.mat_ui.entity is ent:
+            self.mat_ui.graph = ent.material
+        self.dirty = True
+        self.status = (f"assigned material '{mat_asset.name}'", 4.0)
+        return True
 
     def _click_details(self, mp, rect) -> None:
         e = self.selected
@@ -2037,7 +2098,7 @@ class Editor:
 
     def _tile_at(self, mp, grid_rect):
         x0 = grid_rect.x + 10 - self.browser_scroll
-        for asset in self.lib.assets_in(self.selected_folder):
+        for asset in self._tiles_in(self.selected_folder):
             if x0 <= mp[0] < x0 + TILE_W and grid_rect.y + 6 <= mp[1] < grid_rect.y + 6 + TILE_H - 8:
                 return asset
             x0 += TILE_W + 8
@@ -2082,6 +2143,10 @@ class Editor:
         self.selected = entity
 
     def _place_asset(self, asset, mp, w, h) -> None:
+        if isinstance(asset, self.engine_mod.MaterialAsset):
+            # materials aren't placeable in the world -- drag them onto a
+            # mesh entity's Details material slot instead.
+            return
         _, point = self._mouse_hit(mp, w, h)
         entity = asset.instantiate()
         entity.transform.position = self.engine_mod.Vec3(
@@ -2161,7 +2226,8 @@ class Editor:
                 pygame.draw.rect(surf, ACCENT, zone, 2)
 
         if self.drag_asset is not None:
-            icon = self.icons.get(self.drag_asset.name)
+            is_mat = isinstance(self.drag_asset, self.engine_mod.MaterialAsset)
+            icon = (self.mat_icons if is_mat else self.icons).get(self.drag_asset.name)
             if icon is not None:
                 ghost = icon.copy()
                 ghost.set_alpha(150)
@@ -2565,6 +2631,26 @@ class Editor:
             elif row["kind"] == "button":
                 value = self.font_small.render(row["text"], True, ACCENT)
                 surf.blit(value, (rr.x + 96, rr.y + 5))
+            elif row["kind"] == "material_slot":
+                ent = row["entity"]
+                swatch = pygame.Rect(rr.x + 96, rr.y + 2, 20, 20)
+                if ent.material is None:
+                    pygame.draw.rect(surf, (26, 27, 32), swatch, border_radius=3)
+                    pygame.draw.rect(surf, PANEL_EDGE, swatch, 1, border_radius=3)
+                    txt = self.font_small.render("empty — drop material here", True, TEXT_DIM)
+                else:
+                    icon = self.mat_icon_cache.get(id(ent))
+                    if icon is None:
+                        icon = make_material_icon(self.engine_mod, ent.material)
+                        self.mat_icon_cache[id(ent)] = icon
+                    if icon is not None:
+                        surf.blit(pygame.transform.smoothscale(icon, (20, 20)), swatch)
+                    else:
+                        pygame.draw.rect(surf, (90, 90, 100), swatch, border_radius=3)
+                    pygame.draw.rect(surf, PANEL_EDGE, swatch, 1, border_radius=3)
+                    name = ent.material_asset or "(unsaved graph)"
+                    txt = self.font_small.render(name[:22], True, TEXT)
+                surf.blit(txt, (swatch.right + 6, rr.y + 5))
 
     def _draw_browser_topbar(self, surf, topbar, mp) -> None:
         import pygame
@@ -2584,6 +2670,7 @@ class Editor:
         surf.blit(label, (btn.x + (btn.width - label.get_width()) // 2, btn.y + 4))
         exp = self._export_btn_rect(topbar)
         exportable = (self.selected_asset is not None
+                     and not isinstance(self.selected_asset, self.engine_mod.MaterialAsset)
                      and self.engine_mod.has_mesh(self.selected_asset))
         exp_color = ACCENT if exportable else TEXT_DIM
         pygame.draw.rect(surf, HOVER_BG if exportable and exp.collidepoint(mp)
@@ -2623,10 +2710,19 @@ class Editor:
         hint = self.font_small.render("F2 rename", True, TEXT_DIM)
         surf.blit(hint, (tree_rect.x + 4, tree_rect.bottom - 16))
 
+    def _tiles_in(self, folder_id):
+        """Regular assets, then material assets (materials only live at
+        the browser root -- they aren't part of the folder tree)."""
+        tiles = list(self.lib.assets_in(folder_id))
+        if folder_id is None:
+            tiles += list(self.lib.materials)
+        return tiles
+
     def _draw_browser_grid(self, surf, grid_rect, mp) -> None:
         import pygame
         x = grid_rect.x + 10 - self.browser_scroll
-        for asset in self.lib.assets_in(self.selected_folder):
+        for asset in self._tiles_in(self.selected_folder):
+            is_mat = isinstance(asset, self.engine_mod.MaterialAsset)
             tile = pygame.Rect(x, grid_rect.y + 6, TILE_W, TILE_H - 12)
             if tile.right > grid_rect.x and tile.left < grid_rect.right:
                 hovered = tile.collidepoint(mp)
@@ -2638,7 +2734,9 @@ class Editor:
                                      border_radius=4)
                 if selected:
                     pygame.draw.rect(surf, ACCENT, tile, 1, border_radius=4)
-                icon = self.icons.get(asset.name)
+                if is_mat:
+                    pygame.draw.rect(surf, (90, 60, 140), tile, 1, border_radius=4)
+                icon = (self.mat_icons if is_mat else self.icons).get(asset.name)
                 if icon is not None:
                     surf.blit(icon, (x + (TILE_W - ICON) // 2, grid_rect.y + 10))
                 label = self.font_small.render(asset.name[:12], True,
@@ -2667,8 +2765,11 @@ class MaterialEditorUI:
     its 18px title bar to move it, click X (or M/Esc) to close.
     """
 
-    PALETTE = ("color", "position", "normal", "checker", "noise", "gradient",
-               "mix", "multiply", "add", "power", "clamp", "one_minus", "lerp", "hdri",
+    PALETTE = ("constant", "constant2vector", "constant3vector", "constant4vector",
+               "position", "normal", "checker", "noise", "gradient",
+               "mix", "lerp", "multiply", "add", "subtract", "divide", "power",
+               "clamp", "one_minus", "abs", "floor", "frac", "sine", "cosine",
+               "dot_product", "vmax", "vmin", "component_mask", "hdri",
                "tex_coord", "tex_sample")
     DEFAULT_SIZE = (900, 560)
 
@@ -2778,6 +2879,28 @@ class MaterialEditorUI:
         for every frame; the final release re-bakes at full resolution."""
         self.graph.apply(self.entity, draft=draft)
         self.editor.dirty = True
+        if not draft and self.entity.mesh is not None:
+            # keep the Details-panel material slot preview in sync with
+            # live node-editor edits (requirement: "slot preview updates
+            # when the assigned material is edited in the node editor")
+            self.editor.mat_icon_cache[id(self.entity)] = make_material_icon(
+                self.editor.engine_mod, self.graph)
+
+    def _save_as_asset(self) -> None:
+        """Save the current graph as a reusable material asset in the
+        content browser (Unreal: right-click a material instance -> Save
+        as Asset). Auto-names from the owning entity, de-duping on clash."""
+        lib = self.editor.lib
+        base = f"{self.entity.name} Material"
+        name = base
+        i = 2
+        while name in lib.material_by_name:
+            name = f"{base} {i}"
+            i += 1
+        mat = lib.save_material(name, self.graph)
+        self.editor.mat_icons[name] = make_material_icon(self.editor.engine_mod, self.graph)
+        self.entity.material_asset = name
+        self.editor.status = (f"saved material asset '{name}'", 4.0)
 
     def update(self, engine, dt: float) -> None:
         import pygame
@@ -2788,6 +2911,7 @@ class MaterialEditorUI:
         title_bar = pygame.Rect(outer.x, outer.y, outer.width, PANEL_TITLE_H)
         close = pygame.Rect(outer.right - 24, outer.y + 2, 16, 16)
         minimize = pygame.Rect(outer.right - 44, outer.y + 2, 16, 16)
+        save_asset = pygame.Rect(outer.right - 140, outer.y + 2, 90, 16)
 
         if inp.pressed(pygame.K_m):
             self.close()
@@ -2798,6 +2922,9 @@ class MaterialEditorUI:
                 return
             if minimize.collidepoint(mp):
                 self.minimized = not self.minimized
+                return
+            if save_asset.collidepoint(mp):
+                self._save_as_asset()
                 return
             if title_bar.collidepoint(mp):
                 self.drag_title = (mp[0] - outer.x, mp[1] - outer.y)
@@ -2932,6 +3059,10 @@ class MaterialEditorUI:
         pygame.draw.rect(surf, (40, 44, 54), minimize, border_radius=3)
         m_lab = self.editor.font_small.render("-", True, TEXT)
         surf.blit(m_lab, (minimize.x + 5, minimize.y - 1))
+        save_asset = pygame.Rect(outer.right - 140, outer.y + 2, 90, 16)
+        pygame.draw.rect(surf, (40, 44, 54), save_asset, border_radius=3)
+        s_lab = self.editor.font_small.render("Save Asset", True, TEXT)
+        surf.blit(s_lab, (save_asset.x + 6, save_asset.y + 1))
         if self.minimized:
             return
 
@@ -3005,7 +3136,7 @@ class MaterialEditorUI:
                 shown = node.get("texture", "") or "<none>"
                 lab = self.editor.font_small.render(f"tex: {shown}", True, TEXT_DIM)
                 surf.blit(lab, (rr.x, rr.y + 2))
-            if node["type"] == "color":
+            if node["type"] in ("color", "constant3vector", "constant4vector"):
                 p = node["params"]
                 sw = (int(p["r"] * 255), int(p["g"] * 255), int(p["b"] * 255))
                 pygame.draw.rect(surf, sw, (r.x + 60, r.y + 4, 40, 12))

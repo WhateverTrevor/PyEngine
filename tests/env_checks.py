@@ -149,7 +149,7 @@ g.nodes[c]["params"].update(r=1.0, g=0.2, b=0.2)
 m = g.add("multiply", (200, 100))
 g.connect(h, m, "a")
 g.connect(c, m, "b")
-g.connect(m, g.output_id(), "color")
+g.connect(m, g.output_id(), "base_color")
 baked = g.evaluate_sky(src)
 assert baked.shape[2] == 3 and baked.dtype == np.float32
 ratio_src = src[..., 0].sum() / max(src[..., 1].sum(), 1e-9)

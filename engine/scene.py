@@ -56,6 +56,7 @@ class Entity:
         self.collidable = True           # blocks the player (see FlyController)
         self.environment = None          # Environment (HDRI sky + ambient) carrier
         self.material = None             # MaterialGraph baked onto this mesh
+        self.material_asset = None       # name of the MaterialAsset this material was assigned from, or None
         self.sun = None                  # SunDisc: sky-disc + shadow tuning (see lighting.py)
         self.fog_volume = None           # FogVolume: local volumetric fog box (see lighting.py)
         self.asset_name: str | None = None  # set when spawned from an asset file
