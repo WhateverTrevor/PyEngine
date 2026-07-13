@@ -33,10 +33,12 @@ a "dx12" renderer and then a "vulkan" one in the same process each get the
 backend they asked for.
 
 Shading mirrors `gl_renderer.py`'s GLSL as closely as WGSL allows: the same
-flat-per-face-normal geometry soup (`_build_geometry`/`_build_color`,
-imported from the shared, GPU-library-free `gpu_geometry.py` so all three
-renderers -- software, GL, wgpu -- build triangle soup and world-space face
-data from one source of truth), the same light-gathering
+flat-per-face-normal geometry soup (`_build_geometry`/`_build_color`/
+`_build_pbr`, imported from the shared, GPU-library-free `gpu_geometry.py`
+so all three renderers -- software, GL, wgpu -- build triangle soup,
+per-face PBR params, and world-space face data from one source of truth),
+metallic-roughness Cook-Torrance/GGX specular identical to the CPU/GL model
+(see `ggx_specular()` in `_MESH_WGSL`), the same light-gathering
 (`_gather_lights`/`_face_light_strength` from `renderer.py`), and the same
 (total_faces, MAX_LIGHTS) float32 shadow-factor layout produced by
 `raytrace.ShadowTracer` -- uploaded here as an r32float texture and sampled
@@ -90,7 +92,8 @@ import math
 
 import numpy as np
 
-from .gpu_geometry import _build_color, _build_geometry, _entity_world_faces, _scene_environment
+from .gpu_geometry import (_build_color, _build_geometry, _build_pbr,
+                           _entity_world_faces, _scene_environment)
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
 from .raytrace import GITracer
@@ -110,6 +113,7 @@ _BACKEND_MODE = {"D3D12": "dx12", "Vulkan": "vulkan"}
 # / `_pack_lights` below exactly -- every field is a vec4 (or array of vec4)
 # specifically to avoid WGSL's vec3-aligns-to-16-bytes trap.
 _MESH_WGSL = f"""
+const PI: f32 = 3.14159265359;
 const MAX_LIGHTS: i32 = {_MAX_LIGHTS};
 const MAX_FOG_VOL: i32 = {_MAX_FOG_VOL};
 
@@ -158,11 +162,15 @@ struct VOut {{
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
     @location(3) @interpolate(flat) face_id: i32,
+    @location(4) roughness: f32,
+    @location(5) metallic: f32,
+    @location(6) emissive: vec3<f32>,
 }};
 
 @vertex
 fn vs_main(@location(0) in_pos: vec3<f32>, @location(1) in_normal: vec3<f32>,
-           @location(2) in_faceid: f32, @location(3) in_color: vec3<f32>) -> VOut {{
+           @location(2) in_faceid: f32, @location(3) in_color: vec3<f32>,
+           @location(4) in_rm: vec2<f32>, @location(5) in_emissive: vec3<f32>) -> VOut {{
     var out: VOut;
     let world = entity.model * vec4<f32>(in_pos, 1.0);
     out.world_pos = world.xyz;
@@ -170,6 +178,9 @@ fn vs_main(@location(0) in_pos: vec3<f32>, @location(1) in_normal: vec3<f32>,
     out.normal = normalize(nmat * in_normal);
     out.color = in_color;
     out.face_id = i32(in_faceid + 0.5);
+    out.roughness = in_rm.x;
+    out.metallic = in_rm.y;
+    out.emissive = in_emissive;
     out.clip_pos = entity.mvp * vec4<f32>(in_pos, 1.0);
     return out;
 }}
@@ -223,6 +234,30 @@ fn apply_fog_volumes(color_in: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>,
     return color;
 }}
 
+// Cook-Torrance/GGX specular BRDF, mirroring renderer.py's `_ggx_specular` /
+// GLRenderer's `ggxSpecular` exactly: Smith-GGX geometry with the
+// direct-lighting k=(a+1)^2/8 remap (Karis/UE4), Schlick Fresnel. Caller
+// multiplies the result by NdotL*radiance.
+fn ggx_specular(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, alpha: f32, f0: vec3<f32>) -> vec3<f32> {{
+    let h = normalize(v + l);
+    let ndoth = clamp(dot(n, h), 0.0, 1.0);
+    let ndotv = clamp(dot(n, v), 1e-4, 1.0);
+    let ndotl = clamp(dot(n, l), 1e-4, 1.0);
+    let vdoth = clamp(dot(v, h), 0.0, 1.0);
+
+    let a2 = alpha * alpha;
+    let denom = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    let d = a2 / max(PI * denom * denom, 1e-8);
+
+    let k = (alpha + 1.0) * (alpha + 1.0) / 8.0;
+    let g1v = ndotv / max(ndotv * (1.0 - k) + k, 1e-8);
+    let g1l = ndotl / max(ndotl * (1.0 - k) + k, 1e-8);
+    let g = g1v * g1l;
+
+    let f = f0 + (1.0 - f0) * pow(1.0 - vdoth, 5.0);
+    return (d * g / max(4.0 * ndotv * ndotl, 1e-4)) * f;
+}}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
@@ -237,6 +272,21 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     }}
     lum = lum + textureLoad(gi_tex, vec2<i32>(0, i32(entity.face_offset.x + 0.5) + in.face_id), 0).rgb;
 
+    // PBR setup -- alpha/f0/specScale mirror renderer.py's/GLRenderer's
+    // per-pixel gather exactly. specScale = 1 - roughness*(1-metallic) is the
+    // backward-compat gate: zero at the default params (roughness=1, metallic=0).
+    var alpha = clamp(in.roughness, 0.02, 1.0);
+    alpha = alpha * alpha;
+    let f0 = mix(vec3<f32>(0.04), in.color, in.metallic);
+    let spec_scale = 1.0 - in.roughness * (1.0 - in.metallic);
+    let view_dir = normalize(frame.camera_pos.xyz - in.world_pos);
+    var spec = vec3<f32>(0.0);
+
+    if (spec_scale > 1e-6 && lambert > 1e-4) {{
+        let brdf = ggx_specular(n, view_dir, to_light, alpha, f0);
+        spec = spec + frame.dl_color_ambient.xyz * brdf * (lambert * spec_scale);
+    }}
+
     let n_lights = i32(frame.flags.w + 0.5);
     let face_offset = i32(entity.face_offset.x + 0.5);
     for (var i: i32 = 0; i < n_lights; i = i + 1) {{
@@ -246,7 +296,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         var atten = clamp(1.0 - dist / li.pos.w, 0.0, 1.0);
         atten = atten * atten;
         let lambert_l = clamp(dot(n, delta) / dist, 0.0, 1.0);
-        var strength = li.color.w * atten * lambert_l;
+        var radiance = li.color.w * atten;
 
         let is_spot = li.cone.x > -1.5;
         let has_ies = li.axis_ies.w >= 0.0;
@@ -255,26 +305,37 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
             let cos_ang = dot(to_frag, li.axis_ies.xyz);
             if (is_spot) {{
                 let cone = clamp((cos_ang - li.cone.y) / max(li.cone.x - li.cone.y, 1e-6), 0.0, 1.0);
-                strength = strength * cone * cone;
+                radiance = radiance * cone * cone;
             }}
             if (has_ies) {{
                 let ang = degrees(acos(clamp(cos_ang, -1.0, 1.0)));
                 let row = i32(li.axis_ies.w + 0.5);
                 let mul = textureLoad(ies_tex, vec2<i32>(i32(ang), row), 0).r;
-                strength = strength * mul;
+                radiance = radiance * mul;
             }}
         }}
 
         let shadow = textureLoad(shadow_tex, vec2<i32>(i, face_offset + in.face_id), 0).r;
-        strength = strength * shadow;
-        lum = lum + li.color.xyz * strength;
+        radiance = radiance * shadow;
+        lum = lum + li.color.xyz * (radiance * lambert_l);
+
+        if (spec_scale > 1e-6 && radiance > 1e-4) {{
+            let l_dir = delta / dist;
+            let brdf = ggx_specular(n, view_dir, l_dir, alpha, f0);
+            spec = spec + li.color.xyz * brdf * (radiance * lambert_l * spec_scale);
+        }}
     }}
 
-    var out_color = in.color * lum;
+    // Metallic diffuse gate applies to the whole accumulated diffuse-ish
+    // term at once (ambient+directional+GI+point/spot lambert) -- a single
+    // scalar multiplier distributes linearly over the sum, matching
+    // renderer.py's/GLRenderer's per-term gating exactly.
+    lum = lum * (1.0 - in.metallic);
+    var out_color = in.color * lum + spec;
 
-    let view_dir = in.world_pos - frame.camera_pos.xyz;
-    let frag_dist = length(view_dir);
-    let ray_dir = view_dir / max(frag_dist, 1e-6);
+    let view_delta = in.world_pos - frame.camera_pos.xyz;
+    let frag_dist = length(view_delta);
+    let ray_dir = view_delta / max(frag_dist, 1e-6);
     if (i32(frame.fog_end.y + 0.5) > 0) {{
         out_color = apply_fog_volumes(out_color, frame.camera_pos.xyz, ray_dir, 0.0, frag_dist);
     }}
@@ -284,6 +345,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
                       0.0, 1.0);
         out_color = mix(out_color, frame.fog_color_start.xyz, f);
     }}
+
+    // Emissive is unconditional -- visible even unlit/in shadow, added
+    // after fog, matching renderer.py's/GLRenderer's ordering.
+    out_color = out_color + in.emissive;
     return vec4<f32>(clamp(out_color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }}
 """
@@ -495,6 +560,13 @@ class WgpuRenderer:
                         "array_stride": 4 * 3, "step_mode": "vertex",
                         "attributes": [{"format": "float32x3", "offset": 0, "shader_location": 3}],
                     },
+                    {  # roughness/metallic(2f) + emissive(3f) -- matches _build_pbr's output
+                        "array_stride": 4 * 5, "step_mode": "vertex",
+                        "attributes": [
+                            {"format": "float32x2", "offset": 0, "shader_location": 4},
+                            {"format": "float32x3", "offset": 8, "shader_location": 5},
+                        ],
+                    },
                 ],
             },
             primitive={"topology": "triangle-list", "front_face": "ccw", "cull_mode": "back"},
@@ -693,19 +765,35 @@ class WgpuRenderer:
             color = _build_color(mesh, face_id_tri)
             color_buf = self.device.create_buffer_with_data(
                 data=np.ascontiguousarray(color).tobytes(), usage=wgpu.BufferUsage.VERTEX)
-            cache = {"geom_buf": geom_buf, "color_buf": color_buf, "count": pos.shape[0],
-                     "face_id_tri": face_id_tri, "color_id": id(mesh.face_colors)}
+            rm, emissive = _build_pbr(mesh, face_id_tri)
+            pbr = np.concatenate([rm, emissive], axis=1)
+            pbr_buf = self.device.create_buffer_with_data(
+                data=np.ascontiguousarray(pbr).tobytes(), usage=wgpu.BufferUsage.VERTEX)
+            cache = {"geom_buf": geom_buf, "color_buf": color_buf, "pbr_buf": pbr_buf,
+                     "count": pos.shape[0], "face_id_tri": face_id_tri,
+                     "color_id": id(mesh.face_colors),
+                     "pbr_id": (id(mesh.face_roughness), id(mesh.face_metallic),
+                                id(mesh.face_emissive))}
             self._geo_cache[key] = cache
-        elif cache["color_id"] != id(mesh.face_colors):
-            # buffers from create_buffer_with_data aren't COPY_DST, so a
-            # recolor (material editor) rebuilds the small color buffer
-            # rather than writing into it -- this is a rare, not per-frame,
-            # path (unlike GL's mutable-in-place vbo.write()).
-            cache["color_buf"].destroy()
-            color = _build_color(mesh, cache["face_id_tri"])
-            cache["color_buf"] = self.device.create_buffer_with_data(
-                data=np.ascontiguousarray(color).tobytes(), usage=wgpu.BufferUsage.VERTEX)
-            cache["color_id"] = id(mesh.face_colors)
+        else:
+            if cache["color_id"] != id(mesh.face_colors):
+                # buffers from create_buffer_with_data aren't COPY_DST, so a
+                # recolor (material editor) rebuilds the small color buffer
+                # rather than writing into it -- this is a rare, not per-frame,
+                # path (unlike GL's mutable-in-place vbo.write()).
+                cache["color_buf"].destroy()
+                color = _build_color(mesh, cache["face_id_tri"])
+                cache["color_buf"] = self.device.create_buffer_with_data(
+                    data=np.ascontiguousarray(color).tobytes(), usage=wgpu.BufferUsage.VERTEX)
+                cache["color_id"] = id(mesh.face_colors)
+            pbr_id = (id(mesh.face_roughness), id(mesh.face_metallic), id(mesh.face_emissive))
+            if cache["pbr_id"] != pbr_id:
+                cache["pbr_buf"].destroy()
+                rm, emissive = _build_pbr(mesh, cache["face_id_tri"])
+                pbr = np.concatenate([rm, emissive], axis=1)
+                cache["pbr_buf"] = self.device.create_buffer_with_data(
+                    data=np.ascontiguousarray(pbr).tobytes(), usage=wgpu.BufferUsage.VERTEX)
+                cache["pbr_id"] = pbr_id
         return cache
 
     def _prune_geo_cache(self, live_entities) -> None:
@@ -714,6 +802,7 @@ class WgpuRenderer:
             c = self._geo_cache.pop(key)
             c["geom_buf"].destroy()
             c["color_buf"].destroy()
+            c["pbr_buf"].destroy()
         live_ent_ids = {id(e) for e in live_entities}
         for key in [k for k in self._entity_uniform_cache if k not in live_ent_ids]:
             self._entity_uniform_cache.pop(key)["ubo"].destroy()
@@ -958,6 +1047,7 @@ class WgpuRenderer:
             pass_enc.set_bind_group(1, ent["bind_group"])
             pass_enc.set_vertex_buffer(0, geo["geom_buf"])
             pass_enc.set_vertex_buffer(1, geo["color_buf"])
+            pass_enc.set_vertex_buffer(2, geo["pbr_buf"])
             pass_enc.draw(geo["count"])
             triangles += geo["count"] // 3
         pass_enc.end()

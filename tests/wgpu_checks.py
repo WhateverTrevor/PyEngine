@@ -197,4 +197,80 @@ assert g_dx > g_dx0 + 20, f"expected green fog volume tint on dx12 ({g_dx:.1f} v
 assert abs(g_dx - g_gl) < 15, f"dx12/gl fog volume parity mismatch ({g_dx:.1f} vs {g_gl:.1f})"
 print(f"dx12 fog volume OK: center green {g_dx0:.1f} -> {g_dx:.1f} (gl {g_gl:.1f})")
 
+# ---------------------------------------------------------------------
+# PBR: metallic/roughness/emissive 3-way parity (cpu/gl/dx12), dx12
+# specular highlight, dx12 emissive-in-the-dark -- mirrors gl_checks.py's
+# PBR cases 6a/6b/6c exactly, same scene geometry/camera so the dx12
+# numbers are directly comparable to the already-judged GL ones.
+# ---------------------------------------------------------------------
+def build_pbr_scene(box_roughness=1.0, box_metallic=0.0, box_emissive=(0.0, 0.0, 0.0),
+                    pt_intensity=0.6):
+    sc = engine.Scene(light=engine.DirectionalLight(engine.Vec3(-0.4, -1.0, -0.3),
+                                                    ambient=0.02, intensity=0.05))
+    box_mesh = engine.cube(size=1.6, color=(200, 60, 60))
+    box_mesh.face_roughness[:] = box_roughness
+    box_mesh.face_metallic[:] = box_metallic
+    box_mesh.face_emissive[:] = box_emissive
+    box_e = engine.Entity("box", mesh=box_mesh, position=engine.Vec3(0, 0, 0))
+    sc.add(box_e)
+    sc.add(engine.Entity("lamp", light=engine.PointLight(
+        intensity=pt_intensity, range=15, cast_shadows=False),
+        position=engine.Vec3(0.3, 0.3, 5.0)))
+    return sc
+
+
+pbr_cam = engine.Camera(position=engine.Vec3(0.0, 0.0, 5.0))
+
+# 7a. CPU-vs-GL-vs-dx12 mean-brightness parity on a metallic+rough-varying
+# PBR scene.
+sc_pbr = build_pbr_scene(box_roughness=0.15, box_metallic=1.0)
+wr.render(sc_pbr, pbr_cam, (W, H))
+img_pbr_dx = np.frombuffer(wr.read_frame(), np.uint8).reshape(H, W, 4)[..., :3].astype(float)
+gl.render(sc_pbr, pbr_cam, (W, H))
+img_pbr_gl = np.frombuffer(gl.target.read(components=3), np.uint8).reshape(H, W, 3)[::-1].astype(float)
+r3 = Renderer()
+r3.render_scale = 1
+surf3 = pygame.Surface((W, H))
+r3.render(surf3, sc_pbr, pbr_cam)
+img_pbr_cpu = pygame.surfarray.array3d(surf3).transpose(1, 0, 2).astype(float)
+d_pbr_gl = abs(img_pbr_dx.mean() - img_pbr_gl.mean())
+d_pbr_cpu = abs(img_pbr_dx.mean() - img_pbr_cpu.mean())
+assert d_pbr_gl < 12.0, f"dx12/gl PBR mean brightness diverges: {d_pbr_gl:.1f}"
+assert d_pbr_cpu < 15.0, f"dx12/cpu PBR mean brightness diverges: {d_pbr_cpu:.1f}"
+print(f"dx12 pbr parity OK: dx12={img_pbr_dx.mean():.1f} gl={img_pbr_gl.mean():.1f} "
+      f"cpu={img_pbr_cpu.mean():.1f} (diffs {d_pbr_gl:.1f}/{d_pbr_cpu:.1f})")
+
+# 7b. dx12 specular highlight: metallic+shiny box shows very-bright pixels
+# that the same scene at default params (spec_scale gated to 0) never reaches.
+sc_default = build_pbr_scene()  # defaults: legacy diffuse-only look
+wr.render(sc_default, pbr_cam, (W, H))
+img_default_dx = np.frombuffer(wr.read_frame(), np.uint8).reshape(H, W, 4)[..., :3].astype(float)
+bright_pbr_dx = int((img_pbr_dx.max(axis=-1) > 240).sum())
+bright_default_dx = int((img_default_dx.max(axis=-1) > 240).sum())
+assert bright_pbr_dx > bright_default_dx, (bright_pbr_dx, bright_default_dx)
+assert bright_default_dx == 0, ("default-param scene unexpectedly saturated on dx12 -- "
+                                "test scene isn't isolating the highlight", bright_default_dx)
+print(f"dx12 highlight OK: bright pixels pbr={bright_pbr_dx} default={bright_default_dx}")
+
+# 7c. dx12 emissive-in-the-dark: emissive face visible with all lights off
+def build_pbr_dark_scene(emissive):
+    sc = engine.Scene(light=engine.DirectionalLight(engine.Vec3(-0.4, -1.0, -0.3),
+                                                    ambient=0.0, color=(0, 0, 0),
+                                                    intensity=0.0),
+                      background=(0, 0, 0))
+    box_mesh = engine.cube(size=1.6, color=(10, 10, 10))
+    box_mesh.face_emissive[:] = emissive
+    sc.add(engine.Entity("box", mesh=box_mesh, position=engine.Vec3(0, 0, 0)))
+    return sc
+
+
+wr.render(build_pbr_dark_scene((0.0, 0.0, 0.0)), pbr_cam, (W, H))
+img_dark_off_dx = np.frombuffer(wr.read_frame(), np.uint8).reshape(H, W, 4)[..., :3].astype(float)
+wr.render(build_pbr_dark_scene((220.0, 40.0, 40.0)), pbr_cam, (W, H))
+img_dark_emis_dx = np.frombuffer(wr.read_frame(), np.uint8).reshape(H, W, 4)[..., :3].astype(float)
+assert img_dark_off_dx.max() <= 2, f"expected near-black with no lights/emissive: {img_dark_off_dx.max()}"
+assert img_dark_emis_dx.max() > 100, f"emissive face not bright in the dark on dx12: {img_dark_emis_dx.max()}"
+print(f"dx12 emissive-in-dark OK: off max={img_dark_off_dx.max():.0f} "
+      f"emissive max={img_dark_emis_dx.max():.0f}")
+
 print("JUDGE DX12 CHECKS PASSED")
