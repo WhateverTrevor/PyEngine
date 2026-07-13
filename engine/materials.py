@@ -40,7 +40,14 @@ from .environment import sample_equirect
 # has ever baked onto it, so a default-param mesh renders identically to the
 # pre-PBR lambert-only pipeline (see renderer.py's deferred pass).
 NODE_DEFS = {
-    "output":   (("base_color", "emissive", "roughness", "metallic"), {}),
+    # "opacity" is always a declared pin (Unreal keeps it in Material
+    # Attributes regardless of blend mode) but `MaterialGraph.connect` only
+    # accepts links into it when `blend_mode == "translucent"` -- see
+    # `blend_mode` below. `opacity` param is the inline/default value used
+    # when the pin is unconnected (also what a translucent material with a
+    # bare Output falls back to).
+    "output":   (("base_color", "emissive", "roughness", "metallic", "opacity"),
+                {"opacity": 1.0}),
     # -- Constants (Unreal: Constant / Constant2Vector / Constant3Vector /
     # Constant4Vector). "color" is the pre-overhaul name for Constant3Vector,
     # kept as a load-time alias (see NODE_TYPE_ALIASES) -- new graphs get
@@ -130,7 +137,22 @@ class MaterialGraph:
         self.nodes: dict[int, dict] = {}   # id -> {"type", "pos": [x, y], "params": {}}
         self.links: list[list] = []        # [src_id, dst_id, input_name]
         self.next_id = 1
+        # Graph-level material type (Unreal Blend Mode). "opaque" (default,
+        # backward-compat: renders byte-identical to pre-transparency graphs)
+        # or "translucent" (enables the Output's Opacity pin -- see `connect`
+        # and `evaluate_pbr`).
+        self.blend_mode = "opaque"
         self.add("output", (560.0, 180.0))
+
+    def set_blend_mode(self, mode: str) -> None:
+        """Switch blend mode. Going translucent->opaque cleanly disconnects
+        any Opacity link (UE-consistent choice: an opaque material has no
+        opacity concept at all, so we don't keep a ghost link around)."""
+        if mode not in ("opaque", "translucent"):
+            return
+        self.blend_mode = mode
+        if mode == "opaque":
+            self.disconnect(self.output_id(), "opacity")
 
     # ---- editing ----
     def add(self, node_type: str, pos) -> int:
@@ -174,6 +196,11 @@ class MaterialGraph:
         # (a judge caught exactly that bug -- see material_checks.py).
         valid_inputs, _ = NODE_DEFS[dst_type]
         if input_name not in valid_inputs:
+            return False
+        # Opacity is only connectable in translucent mode -- opaque materials
+        # have no opacity concept, matching UE greying out the pin (see
+        # `set_blend_mode` for the opaque->translucent disconnect side).
+        if dst_type == "output" and input_name == "opacity" and self.blend_mode != "translucent":
             return False
         self.links = [l for l in self.links
                       if not (l[1] == dst and l[2] == input_name)]
@@ -356,10 +383,12 @@ class MaterialGraph:
                 emissive = inp("emissive", const(0.0))
                 roughness = inp("roughness", const(1.0))
                 metallic = inp("metallic", const(0.0))
+                opacity = inp("opacity", const(p.get("opacity", 1.0)))
                 if pbr_out is not None:
                     pbr_out["roughness"] = roughness
                     pbr_out["metallic"] = metallic
                     pbr_out["emissive"] = emissive
+                    pbr_out["opacity"] = opacity
                     out = base
                 else:
                     out = base + emissive
@@ -394,12 +423,14 @@ class MaterialGraph:
         """Bake the graph's BaseColor/Roughness/Metallic/Emissive pins to
         per-face arrays -- face context, same sample points as `evaluate`.
         Returns (base_color (M,3) 0..255, roughness (M,), metallic (M,),
-        emissive (M,3) 0..255), matching `Mesh.face_colors`/`face_roughness`/
-        `face_metallic`/`face_emissive` shapes and scales exactly, so callers
-        can assign straight onto a mesh. Unconnected Roughness/Metallic/
-        Emissive pins bake to the same defaults `Mesh` uses (1.0 / 0.0 / 0),
-        which is what keeps a default-param bake byte-identical to a mesh
-        that was never baked at all."""
+        emissive (M,3) 0..255, opacity (M,) or None), matching `Mesh.face_colors`/
+        `face_roughness`/`face_metallic`/`face_emissive`/`face_opacity` shapes
+        and scales exactly, so callers can assign straight onto a mesh.
+        Unconnected Roughness/Metallic/Emissive pins bake to the same defaults
+        `Mesh` uses (1.0 / 0.0 / 0), which is what keeps a default-param bake
+        byte-identical to a mesh that was never baked at all. `opacity` is
+        None unless `self.blend_mode == "translucent"` -- an opaque graph
+        never touches `Mesh.face_opacity` (stays at its all-1.0 default)."""
         centroids = mesh.vertices[mesh.faces].mean(axis=1)
         extent = np.maximum(mesh.aabb_max - mesh.aabb_min, 1e-9)
         pos01 = np.clip((centroids - mesh.aabb_min) / extent, 0.0, 1.0)
@@ -418,7 +449,10 @@ class MaterialGraph:
         roughness = np.clip(pbr.get("roughness", np.ones((m, 3))), 0.0, 1.0).mean(axis=1)
         metallic = np.clip(pbr.get("metallic", np.zeros((m, 3))), 0.0, 1.0).mean(axis=1)
         emissive = np.maximum(pbr.get("emissive", np.zeros((m, 3))), 0.0) * 255.0
-        return base_color, roughness, metallic, emissive
+        opacity = None
+        if self.blend_mode == "translucent":
+            opacity = np.clip(pbr.get("opacity", np.ones((m, 3))), 0.0, 1.0).mean(axis=1)
+        return base_color, roughness, metallic, emissive, opacity
 
     def preview_value(self, mesh, nid: int, source_image: np.ndarray | None = None) -> np.ndarray:
         """Bake as if node `nid`'s own output fed Output.BaseColor directly --
@@ -480,11 +514,17 @@ class MaterialGraph:
         release for the full-resolution result."""
         if entity.mesh is not None:
             source = entity.environment.source if entity.environment is not None else None
-            base, rough, metal, emis = self.evaluate_pbr(entity.mesh, source)
+            base, rough, metal, emis, opacity = self.evaluate_pbr(entity.mesh, source)
             entity.mesh.face_colors = base
             entity.mesh.face_roughness = rough
             entity.mesh.face_metallic = metal
             entity.mesh.face_emissive = emis
+            # opaque materials keep face_opacity at its all-1.0 default (never
+            # written) -- byte-identical to a mesh that was never baked.
+            if opacity is not None:
+                entity.mesh.face_opacity = opacity
+            elif len(entity.mesh.face_opacity) == len(base):
+                entity.mesh.face_opacity = np.ones(len(base))
         elif entity.environment is not None:
             max_w, max_h = (256, 128) if draft else (1024, 512)
             image = self.evaluate_sky(entity.environment.source, max_w, max_h)
@@ -494,13 +534,15 @@ class MaterialGraph:
     def to_dict(self) -> dict:
         return {"nodes": [{"id": nid, **{k: v for k, v in n.items()}}
                           for nid, n in self.nodes.items()],
-                "links": [list(l) for l in self.links]}
+                "links": [list(l) for l in self.links],
+                "blend_mode": self.blend_mode}
 
     @classmethod
     def from_dict(cls, data: dict) -> "MaterialGraph":
         g = cls.__new__(cls)
         g.nodes = {}
         g.links = []
+        g.blend_mode = data.get("blend_mode", "opaque")
         for l in data.get("links", []):
             l = list(l)
             if len(l) == 3:      # scenes saved before multi-output-pin nodes existed

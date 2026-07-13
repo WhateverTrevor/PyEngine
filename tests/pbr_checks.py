@@ -164,7 +164,8 @@ emis_n = g.add("constant3vector", (0, 0))
 g.nodes[emis_n]["params"] = {"r": 0.9, "g": 0.0, "b": 0.0}
 g.connect(emis_n, out_id, "emissive")
 
-base, rough, metal, emis = g.evaluate_pbr(board)
+base, rough, metal, emis, opac = g.evaluate_pbr(board)
+assert opac is None, opac  # opaque (default blend_mode) never bakes opacity
 assert np.allclose(base[0], [0.6 * 255, 0.2 * 255, 0.2 * 255], atol=1.0), base[0]
 assert abs(rough[0] - 0.25) < 1e-6, rough[0]
 assert abs(metal[0] - 1.0) < 1e-6, metal[0]
@@ -179,7 +180,7 @@ assert np.allclose(legacy, np.clip(base[0] / 255.0 + emis[0] / 255.0, 0.0, 1.0) 
 # unconnected pins bake the Mesh defaults
 g2 = engine.MaterialGraph()
 g2.connect(g2.add("constant3vector", (0, 0)), g2.output_id(), "base_color")
-_, rough2, metal2, emis2 = g2.evaluate_pbr(board)
+_, rough2, metal2, emis2, _op2 = g2.evaluate_pbr(board)
 assert abs(rough2[0] - 1.0) < 1e-6 and abs(metal2[0]) < 1e-6 and np.allclose(emis2[0], 0.0), (
     rough2[0], metal2[0], emis2[0])
 print("evaluate_pbr bake OK")

@@ -25,6 +25,17 @@ _ORIGIN_OFFSET = 0.02  # push ray origins off the surface to avoid self-hits
 _RECEIVER_INTERVAL = 3  # frames a moving receiver may reuse its cached shadows
 
 
+def _is_translucent(entity) -> bool:
+    """True when `entity`'s material is a translucent-blend-mode graph.
+    Translucent meshes don't occlude shadow rays and don't source GI bounce
+    light (mirrors the `casts_shadow=False` treatment below) -- they still
+    receive lighting/shadows/GI normally, only the occluder/bounce-source
+    role is gated. v1 semantics: a see-through mesh casting a hard shadow or
+    bouncing full-opacity light would look wrong."""
+    mat = getattr(entity, "material", None)
+    return mat is not None and getattr(mat, "blend_mode", "opaque") == "translucent"
+
+
 def sphere_samples(n: int) -> np.ndarray:
     """Deterministic points on the unit sphere (golden spiral)."""
     if n <= 1:
@@ -162,7 +173,8 @@ class ShadowTracer:
         """Rebuild the world-space occluder soup if any shadow caster moved."""
         self.frame += 1
         casters = [e for e in scene.entities
-                   if e.mesh is not None and e.visible and e.casts_shadow]
+                   if e.mesh is not None and e.visible and e.casts_shadow
+                   and not _is_translucent(e)]
         mats = {id(e): e.transform.matrix().tobytes() for e in casters}
         if mats == self._caster_mats and self._occ is not None:
             return
@@ -338,7 +350,8 @@ class GITracer:
         since the direct-lighting/shadow machinery already lives there.
         """
         casters = [e for e in scene.entities
-                  if e.mesh is not None and e.visible and e.casts_shadow]
+                  if e.mesh is not None and e.visible and e.casts_shadow
+                  and not _is_translucent(e)]
         receivers = [e for e in scene.entities
                     if e.mesh is not None and e.visible]
         key = (max(samples, 1), round(float(intensity), 4))

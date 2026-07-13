@@ -18,7 +18,7 @@ import numpy as np
 class Mesh:
     def __init__(self, vertices, faces, base_color=(200, 200, 200), face_colors=None,
                  face_uvs=None, face_roughness=None, face_metallic=None,
-                 face_emissive=None):
+                 face_emissive=None, face_opacity=None):
         self.vertices = np.asarray(vertices, dtype=np.float64)   # (N, 3)
         self._polys = [tuple(int(i) for i in f) for f in faces]
         if face_colors is None:
@@ -36,6 +36,12 @@ class Mesh:
                               if face_metallic is not None else np.zeros(m))
         self.face_emissive = (np.asarray(face_emissive, dtype=np.float64)
                               if face_emissive is not None else np.zeros((m, 3)))
+        # face_opacity (M,) -- 1.0 = fully opaque, the backward-compat default.
+        # Only meaningful when the mesh's material is blend_mode="translucent"
+        # (see MaterialGraph.apply / evaluate_pbr); an opaque material never
+        # writes this array away from its all-1.0 default.
+        self.face_opacity = (np.asarray(face_opacity, dtype=np.float64)
+                             if face_opacity is not None else np.ones(m))
         # explicit per-face UV (e.g. from an FBX LayerElementUV) -- kept
         # separate from the box-projection fallback so re-`_build()`s (winding
         # flips) don't silently discard imported UVs

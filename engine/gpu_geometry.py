@@ -48,6 +48,15 @@ def _build_pbr(mesh, face_id_tri):
     return (np.repeat(rm, 3, axis=0), np.repeat(emissive, 3, axis=0))
 
 
+def _build_opacity(mesh, face_id_tri) -> np.ndarray:
+    """Per-vertex face opacity (0..1), same per-face-vertex repeat flow as
+    `_build_color`/`_build_pbr` -- baked by `Material.apply()` into
+    `mesh.face_opacity` (all-1.0 for opaque materials, see engine/mesh.py).
+    Shape (T*3, 1) so it can bind to a 1-float vertex attribute directly."""
+    op = mesh.face_opacity[face_id_tri].astype(np.float32)
+    return np.repeat(op, 3)[:, None]
+
+
 def _entity_world_faces(entity):
     """World-space per-face centroids + normals, mirroring _entity_geometry."""
     mesh = entity.mesh

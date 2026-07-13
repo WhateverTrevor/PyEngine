@@ -28,6 +28,11 @@ _COORD_LIMIT = 20000.0  # keep projected coords in a range pygame handles safely
 _FOG_SKY_FAR = 260.0  # path-length clip for fog volumes behind the sky (no surface hit)
 
 
+def _is_translucent(entity) -> bool:
+    mat = getattr(entity, "material", None)
+    return mat is not None and getattr(mat, "blend_mode", "opaque") == "translucent"
+
+
 def _clip_near(points: np.ndarray, near: float) -> list[np.ndarray]:
     """Clip a camera-space polygon against the plane z = -near."""
     out: list[np.ndarray] = []
@@ -266,6 +271,7 @@ class Renderer:
         self.stats = {"triangles": 0, "shadow_lights": 0, "mode": ""}
         self._sky_cache = None
         self._defer_cache = None
+        self._translucent_overlay = None
         self._gi = GITracer()
 
     def render(self, surface: pygame.Surface, scene, camera, tracer=None) -> None:
@@ -464,7 +470,7 @@ class Renderer:
         gi_map = self._gi_contrib(scene, tracer)
         polys = []
         for entity in scene.entities:
-            if entity.mesh is None or not entity.visible:
+            if entity.mesh is None or not entity.visible or _is_translucent(entity):
                 continue
             geo = self._entity_geometry(entity, view, k, w * 0.5, h * 0.5,
                                         camera.near, camera.far)
@@ -512,6 +518,38 @@ class Renderer:
         width = 1 if self.wireframe else 0
         for _, color, pts in polys:
             draw(surface, color, pts, width)
+        # Flat mode has no per-pixel alpha compositing path (pre-existing
+        # limitation, not addressed by the v1 transparency feature -- see
+        # HANDOFF); translucent faces still draw here, fully opaque, so F2
+        # debug view doesn't silently drop them.
+        for entity in scene.entities:
+            if entity.mesh is None or not entity.visible or not _is_translucent(entity):
+                continue
+            geo = self._entity_geometry(entity, view, k, w * 0.5, h * 0.5,
+                                        camera.near, camera.far)
+            if geo is None:
+                continue
+            normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
+            lum, _sl = self._directional_base(scene, entity, normals, centroids, env, tracer)
+            for info in lights:
+                strength = _face_light_strength(info, normals, centroids)
+                active = strength > 1e-3
+                if not active.any():
+                    continue
+                if tracer is not None and info.light.cast_shadows:
+                    strength = strength * tracer.shadow_factors(
+                        entity, info.light, info.pos, centroids, normals, active)
+                lum += info.colorf[None, :] * strength[:, None]
+            colors = np.clip(entity.mesh.face_colors * lum, 0.0, 255.0)
+            tpolys = []
+            if geo["fast_pts"] is not None:
+                idx = geo["fast_idx"]
+                tpolys += zip(depth[idx].tolist(), colors[idx].astype(np.uint8).tolist(), geo["fast_pts"])
+            for i, pts in geo["clipped"]:
+                tpolys.append((float(depth[i]), colors[i].astype(np.uint8).tolist(), pts))
+            tpolys.sort(key=lambda p: p[0], reverse=True)
+            for _, color, pts in tpolys:
+                draw(surface, color, pts, width)
 
     # ------------------------------------------------------------------
     # deferred path: per-pixel lighting via a face-ID buffer
@@ -566,7 +604,7 @@ class Renderer:
         polys = []  # (depth, global_face_id, points)
         offset = 0
         for entity in scene.entities:
-            if entity.mesh is None or not entity.visible:
+            if entity.mesh is None or not entity.visible or _is_translucent(entity):
                 continue
             geo = self._entity_geometry(entity, view, k, cx, cy, near, far)
             if geo is None:
@@ -631,6 +669,7 @@ class Renderer:
         if offset == 0:
             pygame.surfarray.blit_array(small, cache["sky"].astype(np.uint8))
             pygame.transform.scale(small, (w, h), surface)
+            self._render_translucent(surface, scene, camera, tracer, env, lights)
             return
 
         normals = np.concatenate(f_normals).astype(np.float32)
@@ -687,6 +726,7 @@ class Renderer:
         if len(vis) == 0:
             pygame.surfarray.blit_array(small, frame)
             pygame.transform.scale(small, (w, h), surface)
+            self._render_translucent(surface, scene, camera, tracer, env, lights)
             return
         fid_a = ids[vis] - 1                   # centroid-nearest candidate
         dirs = cache["dirs"][vis]
@@ -827,6 +867,79 @@ class Renderer:
 
         pygame.surfarray.blit_array(small, frame)
         pygame.transform.scale(small, (w, h), surface)
+        self._render_translucent(surface, scene, camera, tracer, env, lights)
+
+    # ------------------------------------------------------------------
+    # translucent pass: back-to-front painter compositing over the opaque
+    # deferred result, at full window resolution. v1: per-face lighting at
+    # the face centroid (no per-pixel reconstruction for translucent faces,
+    # same approximation flat mode uses for everything) -- see class
+    # docstring / HANDOFF. Translucent faces never enter the face-ID buffer
+    # above, so they never occlude opaque geometry in that buffer; here they
+    # alpha-composite on top of whatever the opaque pass already resolved.
+    # ------------------------------------------------------------------
+    def _render_translucent(self, surface, scene, camera, tracer, env, lights) -> None:
+        w, h = surface.get_size()
+        translucent = [e for e in scene.entities
+                      if e.mesh is not None and e.visible and _is_translucent(e)]
+        if not translucent:
+            return
+        view = camera.view_matrix()
+        k = 0.5 * h / math.tan(math.radians(camera.fov) * 0.5)
+        cx, cy = w * 0.5, h * 0.5
+        polys = []  # (depth, rgba, pts)
+        for entity in translucent:
+            geo = self._entity_geometry(entity, view, k, cx, cy, camera.near, camera.far)
+            if geo is None:
+                continue
+            normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
+            lum, _sl = self._directional_base(scene, entity, normals, centroids, env, tracer)
+            for info in lights:
+                strength = _face_light_strength(info, normals, centroids)
+                active = strength > 1e-3
+                if not active.any():
+                    continue
+                if tracer is not None and info.light.cast_shadows:
+                    strength = strength * tracer.shadow_factors(
+                        entity, info.light, info.pos, centroids, normals, active)
+                lum += info.colorf[None, :] * strength[:, None]
+            colors = np.clip(entity.mesh.face_colors * lum, 0.0, 255.0).astype(np.uint8)
+            alpha = np.clip(entity.mesh.face_opacity, 0.0, 1.0)
+            alpha255 = (alpha * 255.0).astype(np.uint8)
+
+            def _emit(idx_iter, pts_iter):
+                for i, pts in zip(idx_iter, pts_iter):
+                    r, g, b = colors[i].tolist()
+                    polys.append((float(depth[i]), (r, g, b, int(alpha255[i])), pts))
+
+            if geo["fast_pts"] is not None:
+                idx = geo["fast_idx"]
+                _emit(idx.tolist(), geo["fast_pts"])
+            for i, pts in geo["clipped"]:
+                r, g, b = colors[i].tolist()
+                polys.append((float(depth[i]), (r, g, b, int(alpha255[i])), pts))
+
+        if not polys:
+            return
+        # back-to-front: farthest first, so nearer translucent faces
+        # composite on top -- required for correct stacked-transparency order.
+        polys.sort(key=lambda p: p[0], reverse=True)
+        overlay = self._translucent_overlay
+        if overlay is None or overlay.get_size() != (w, h):
+            overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._translucent_overlay = overlay
+        for _, rgba, pts in polys:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            x0, x1 = max(min(xs), 0), min(max(xs), w)
+            y0, y1 = max(min(ys), 0), min(max(ys), h)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            rect = pygame.Rect(x0, y0, x1 - x0, y1 - y0)
+            overlay.fill((0, 0, 0, 0), rect)
+            pygame.draw.polygon(overlay, rgba, pts)
+            surface.blit(overlay, rect.topleft, area=rect)
+            overlay.fill((0, 0, 0, 0), rect)
 
     def _draw_background(self, surface: pygame.Surface, scene) -> None:
         if scene.sky is None:

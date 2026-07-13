@@ -79,6 +79,16 @@ wgpu/WebGPU gotchas handled here (each also called out at its call site):
     one shared buffer with dynamic offsets -- simpler, and correct because
     each entity's buffer only ever receives one write per frame.
 
+Translucent materials (`MaterialGraph.blend_mode == "translucent"`) draw in
+a second render-pass pipeline (`_mesh_translucent_pipeline`) sharing the
+opaque pipeline's shader + explicit pipeline layout (bind groups from one
+work with the other -- see `_build_pipelines`'s comment on why two
+`layout="auto"` pipelines from the same shader are NOT bind-group-
+compatible): depth test on / depth write off, standard alpha blend, drawn
+after all opaque geometry sorted back-to-front by per-entity distance to
+camera. Per-face opacity is a new one-float vertex attribute
+(`_build_opacity`), same vertex-soup pattern as color/PBR.
+
 `wireframe` is a stored, harmless no-op attribute: wgpu's line polygon mode
 needs the non-guaranteed `polygon-mode-line` device feature (it happens to
 be available on this dev machine's adapter, but this renderer does not
@@ -92,13 +102,14 @@ import math
 
 import numpy as np
 
-from .gpu_geometry import (_build_color, _build_geometry, _build_pbr,
-                           _entity_world_faces, _scene_environment)
+from .gpu_geometry import (_build_color, _build_geometry, _build_opacity,
+                           _build_pbr, _entity_world_faces, _scene_environment)
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
 from .raytrace import GITracer
 from .renderer import (_face_light_strength, _fog_volumes, _gather_lights,
-                       _gi_direct_lighting, _gi_receiver_geometry, _sun_sky_info)
+                       _gi_direct_lighting, _gi_receiver_geometry, _is_translucent,
+                       _sun_sky_info)
 
 _MAX_LIGHTS = 16
 _MAX_FOG_VOL = 4
@@ -165,12 +176,14 @@ struct VOut {{
     @location(4) roughness: f32,
     @location(5) metallic: f32,
     @location(6) emissive: vec3<f32>,
+    @location(7) opacity: f32,
 }};
 
 @vertex
 fn vs_main(@location(0) in_pos: vec3<f32>, @location(1) in_normal: vec3<f32>,
            @location(2) in_faceid: f32, @location(3) in_color: vec3<f32>,
-           @location(4) in_rm: vec2<f32>, @location(5) in_emissive: vec3<f32>) -> VOut {{
+           @location(4) in_rm: vec2<f32>, @location(5) in_emissive: vec3<f32>,
+           @location(6) in_opacity: f32) -> VOut {{
     var out: VOut;
     let world = entity.model * vec4<f32>(in_pos, 1.0);
     out.world_pos = world.xyz;
@@ -181,6 +194,7 @@ fn vs_main(@location(0) in_pos: vec3<f32>, @location(1) in_normal: vec3<f32>,
     out.roughness = in_rm.x;
     out.metallic = in_rm.y;
     out.emissive = in_emissive;
+    out.opacity = in_opacity;
     out.clip_pos = entity.mvp * vec4<f32>(in_pos, 1.0);
     return out;
 }}
@@ -349,7 +363,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // Emissive is unconditional -- visible even unlit/in shadow, added
     // after fog, matching renderer.py's/GLRenderer's ordering.
     out_color = out_color + in.emissive;
-    return vec4<f32>(clamp(out_color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return vec4<f32>(clamp(out_color, vec3<f32>(0.0), vec3<f32>(1.0)), in.opacity);
 }}
 """
 
@@ -567,6 +581,10 @@ class WgpuRenderer:
                             {"format": "float32x3", "offset": 8, "shader_location": 5},
                         ],
                     },
+                    {  # opacity(1f) -- matches _build_opacity's output
+                        "array_stride": 4, "step_mode": "vertex",
+                        "attributes": [{"format": "float32", "offset": 0, "shader_location": 6}],
+                    },
                 ],
             },
             primitive={"topology": "triangle-list", "front_face": "ccw", "cull_mode": "back"},
@@ -577,6 +595,54 @@ class WgpuRenderer:
         )
         self._mesh_bgl0 = self._mesh_pipeline.get_bind_group_layout(0)
         self._mesh_bgl1 = self._mesh_pipeline.get_bind_group_layout(1)
+        # Translucent pass: same shader + vertex layout, sharing an explicit
+        # pipeline layout (built from the opaque pipeline's auto-inferred
+        # bind group layouts) so bind groups created once work for either
+        # pipeline -- two independent layout="auto" pipelines from the same
+        # shader are NOT guaranteed bind-group-compatible per the WebGPU
+        # spec, only structurally identical, so this can't be layout="auto"
+        # again. Differs from the opaque pipeline only in depth-write
+        # (off, so back-to-front translucent faces blend instead of
+        # occluding each other -- occlusion by opaque geometry still
+        # happens via depth-test-on) and standard alpha blending.
+        mesh_pipeline_layout = device.create_pipeline_layout(
+            bind_group_layouts=[self._mesh_bgl0, self._mesh_bgl1])
+        self._mesh_translucent_pipeline = device.create_render_pipeline(
+            layout=mesh_pipeline_layout,
+            vertex={
+                "module": mesh_shader, "entry_point": "vs_main",
+                "buffers": [
+                    {"array_stride": 4 * 7, "step_mode": "vertex", "attributes": [
+                        {"format": "float32x3", "offset": 0, "shader_location": 0},
+                        {"format": "float32x3", "offset": 12, "shader_location": 1},
+                        {"format": "float32", "offset": 24, "shader_location": 2},
+                    ]},
+                    {"array_stride": 4 * 3, "step_mode": "vertex", "attributes": [
+                        {"format": "float32x3", "offset": 0, "shader_location": 3}]},
+                    {"array_stride": 4 * 5, "step_mode": "vertex", "attributes": [
+                        {"format": "float32x2", "offset": 0, "shader_location": 4},
+                        {"format": "float32x3", "offset": 8, "shader_location": 5},
+                    ]},
+                    {"array_stride": 4, "step_mode": "vertex", "attributes": [
+                        {"format": "float32", "offset": 0, "shader_location": 6}]},
+                ],
+            },
+            primitive={"topology": "triangle-list", "front_face": "ccw", "cull_mode": "back"},
+            depth_stencil={"format": self._DEPTH_FORMAT, "depth_write_enabled": False,
+                           "depth_compare": "less"},
+            fragment={"module": mesh_shader, "entry_point": "fs_main",
+                      "targets": [{
+                          "format": self._COLOR_FORMAT,
+                          "blend": {
+                              "color": {"src_factor": "src-alpha",
+                                        "dst_factor": "one-minus-src-alpha",
+                                        "operation": "add"},
+                              "alpha": {"src_factor": "one",
+                                        "dst_factor": "one-minus-src-alpha",
+                                        "operation": "add"},
+                          },
+                      }]},
+        )
 
         sky_shader = device.create_shader_module(code=_SKY_WGSL)
         self._sky_pipeline = device.create_render_pipeline(
@@ -769,11 +835,16 @@ class WgpuRenderer:
             pbr = np.concatenate([rm, emissive], axis=1)
             pbr_buf = self.device.create_buffer_with_data(
                 data=np.ascontiguousarray(pbr).tobytes(), usage=wgpu.BufferUsage.VERTEX)
+            opacity = _build_opacity(mesh, face_id_tri)
+            opacity_buf = self.device.create_buffer_with_data(
+                data=np.ascontiguousarray(opacity).tobytes(), usage=wgpu.BufferUsage.VERTEX)
             cache = {"geom_buf": geom_buf, "color_buf": color_buf, "pbr_buf": pbr_buf,
+                     "opacity_buf": opacity_buf,
                      "count": pos.shape[0], "face_id_tri": face_id_tri,
                      "color_id": id(mesh.face_colors),
                      "pbr_id": (id(mesh.face_roughness), id(mesh.face_metallic),
-                                id(mesh.face_emissive))}
+                                id(mesh.face_emissive)),
+                     "opacity_id": id(mesh.face_opacity)}
             self._geo_cache[key] = cache
         else:
             if cache["color_id"] != id(mesh.face_colors):
@@ -794,6 +865,12 @@ class WgpuRenderer:
                 cache["pbr_buf"] = self.device.create_buffer_with_data(
                     data=np.ascontiguousarray(pbr).tobytes(), usage=wgpu.BufferUsage.VERTEX)
                 cache["pbr_id"] = pbr_id
+            if cache["opacity_id"] != id(mesh.face_opacity):
+                cache["opacity_buf"].destroy()
+                opacity = _build_opacity(mesh, cache["face_id_tri"])
+                cache["opacity_buf"] = self.device.create_buffer_with_data(
+                    data=np.ascontiguousarray(opacity).tobytes(), usage=wgpu.BufferUsage.VERTEX)
+                cache["opacity_id"] = id(mesh.face_opacity)
         return cache
 
     def _prune_geo_cache(self, live_entities) -> None:
@@ -803,6 +880,7 @@ class WgpuRenderer:
             c["geom_buf"].destroy()
             c["color_buf"].destroy()
             c["pbr_buf"].destroy()
+            c["opacity_buf"].destroy()
         live_ent_ids = {id(e) for e in live_entities}
         for key in [k for k in self._entity_uniform_cache if k not in live_ent_ids]:
             self._entity_uniform_cache.pop(key)["ubo"].destroy()
@@ -1028,12 +1106,9 @@ class WgpuRenderer:
         pass_enc.set_bind_group(0, self._sky_bind_group)
         pass_enc.draw(3)
 
-        pass_enc.set_pipeline(self._mesh_pipeline)
         pass_enc.set_bind_group(0, self._frame_bind_group)
-        triangles = 0
-        for entity, off in zip(live, offsets):
-            if entity.mesh.faces.shape[0] == 0:
-                continue
+
+        def _draw(entity, off) -> int:
             geo = self._get_geo_cache(entity.mesh)
             ent = self._get_entity_uniforms(entity)
             model = entity.transform.matrix()
@@ -1048,8 +1123,31 @@ class WgpuRenderer:
             pass_enc.set_vertex_buffer(0, geo["geom_buf"])
             pass_enc.set_vertex_buffer(1, geo["color_buf"])
             pass_enc.set_vertex_buffer(2, geo["pbr_buf"])
+            pass_enc.set_vertex_buffer(3, geo["opacity_buf"])
             pass_enc.draw(geo["count"])
-            triangles += geo["count"] // 3
+            return geo["count"] // 3
+
+        triangles = 0
+        opaque_pairs = [(e, off) for e, off in zip(live, offsets)
+                        if e.mesh.faces.shape[0] > 0 and not _is_translucent(e)]
+        translucent_pairs = [(e, off) for e, off in zip(live, offsets)
+                             if e.mesh.faces.shape[0] > 0 and _is_translucent(e)]
+
+        pass_enc.set_pipeline(self._mesh_pipeline)
+        for entity, off in opaque_pairs:
+            triangles += _draw(entity, off)
+
+        if translucent_pairs:
+            # Back-to-front per-entity order, mirroring GLRenderer's
+            # translucent pass (see its render() comment for why per-entity,
+            # not per-triangle, is the practical granularity here).
+            cam_pos = camera.position.to_array()
+            translucent_pairs.sort(
+                key=lambda p: -float(np.linalg.norm(
+                    p[0].transform.matrix()[:3, 3] - cam_pos)))
+            pass_enc.set_pipeline(self._mesh_translucent_pipeline)
+            for entity, off in translucent_pairs:
+                triangles += _draw(entity, off)
         pass_enc.end()
         self.device.queue.submit([encoder.finish()])
 

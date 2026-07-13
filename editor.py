@@ -211,20 +211,40 @@ def make_icon(engine, asset, size=ICON):
     return surf
 
 
+def _draw_checker_bg(surf, size, cell=8):
+    """Fill `surf` with a light/dark checker -- transparency-preview backdrop
+    (UE-style) so a translucent material's alpha is visible against
+    something other than a flat color."""
+    a, b = (60, 60, 66), (40, 40, 46)
+    for y in range(0, size, cell):
+        for x in range(0, size, cell):
+            c = a if ((x // cell) + (y // cell)) % 2 == 0 else b
+            surf.fill(c, (x, y, cell, cell))
+
+
 def make_material_icon(engine, graph, size=ICON):
     """Bake `graph` onto a small preview sphere and render it -- the
-    thumbnail for a material asset tile / Details material slot swatch."""
+    thumbnail for a material asset tile / Details material slot swatch.
+    Translucent materials preview against a checker backdrop (visible
+    through the sphere's alpha) instead of the flat background color."""
     import pygame
 
     surf = pygame.Surface((size, size))
-    surf.fill((29, 31, 37))
+    translucent = graph.blend_mode == "translucent"
+    if translucent:
+        _draw_checker_bg(surf, size)
+    else:
+        surf.fill((29, 31, 37))
     sphere = engine.icosphere(radius=1.0, subdivisions=2)
     (sphere.face_colors, sphere.face_roughness,
-     sphere.face_metallic, sphere.face_emissive) = graph.evaluate_pbr(sphere)
+     sphere.face_metallic, sphere.face_emissive, opacity) = graph.evaluate_pbr(sphere)
+    if opacity is not None:
+        sphere.face_opacity = opacity
     mini = engine.Scene(
         light=engine.DirectionalLight(engine.Vec3(-0.5, -0.9, -0.6), ambient=0.42),
         background=(29, 31, 37))
     entity = engine.Entity("preview", mesh=sphere)
+    entity.material = graph
     mini.add(entity)
     cam = engine.Camera(yaw=0.65, pitch=-0.5)
     fwd = cam.forward()
@@ -2838,6 +2858,8 @@ class MaterialEditorUI:
         self._preview_surf = None
         self._preview_dirty = True
         self._preview_stop_rect = None
+        self._blend_opaque_rect = None
+        self._blend_translucent_rect = None
 
     def close(self) -> None:
         self.editor.mat_ui = None
@@ -3009,6 +3031,16 @@ class MaterialEditorUI:
                 return
             if save_asset.collidepoint(mp):
                 self._save_as_asset()
+                return
+            if not self.minimized and self._blend_opaque_rect is not None \
+                    and self._blend_opaque_rect.collidepoint(mp):
+                self.graph.set_blend_mode("opaque")
+                self.apply(draft=False)
+                return
+            if not self.minimized and self._blend_translucent_rect is not None \
+                    and self._blend_translucent_rect.collidepoint(mp):
+                self.graph.set_blend_mode("translucent")
+                self.apply(draft=False)
                 return
             if title_bar.collidepoint(mp):
                 self.drag_title = (mp[0] - outer.x, mp[1] - outer.y)
@@ -3359,8 +3391,16 @@ class MaterialEditorUI:
             inputs, _ = NODE_DEFS[node["type"]]
             for i, iname in enumerate(inputs):
                 ix, iy = self.input_pos(nid, i, panel)
-                pygame.draw.circle(surf, (140, 170, 210), (ix, iy), 5)
-                lab = self.editor.font_small.render(iname, True, TEXT_DIM)
+                # Output.Opacity is only connectable in translucent mode
+                # (see MaterialGraph.connect) -- grey the pin out here so the
+                # UI reflects that gating instead of just silently refusing
+                # the drag, UE-style.
+                gated = (node["type"] == "output" and iname == "opacity"
+                        and self.graph.blend_mode != "translucent")
+                pin_color = (70, 74, 82) if gated else (140, 170, 210)
+                lab_color = (90, 92, 98) if gated else TEXT_DIM
+                pygame.draw.circle(surf, pin_color, (ix, iy), 5)
+                lab = self.editor.font_small.render(iname, True, lab_color)
                 surf.blit(lab, (ix + 10, iy - 7))
             for j, (pname, value) in enumerate(node["params"].items()):
                 rr = self._param_row(nid, j, panel)
@@ -3401,13 +3441,35 @@ class MaterialEditorUI:
             scaled = pygame.transform.smoothscale(self._preview_surf, (sw, sw))
             surf.blit(scaled, (sx, sy))
             pygame.draw.rect(surf, PANEL_EDGE, (sx, sy, sw, sw), 1)
+        # Blend-mode selector (UE-style opaque/translucent two-button toggle)
+        # -- lives in the preview strip since it's a graph-level property,
+        # not a node. Opacity pin gating (materials.py's `connect()`) is
+        # driven off `self.graph.blend_mode`; this is the UI that flips it.
+        blend_y = sy + sw + 8
+        half = (prev_r.width - 16 - 4) // 2
+        is_translucent = self.graph.blend_mode == "translucent"
+        opaque_btn = pygame.Rect(prev_r.x + 8, blend_y, half, 18)
+        translucent_btn = pygame.Rect(opaque_btn.right + 4, blend_y, half, 18)
+        pygame.draw.rect(surf, ACCENT if not is_translucent else (40, 44, 54),
+                         opaque_btn, border_radius=3)
+        pygame.draw.rect(surf, ACCENT if is_translucent else (40, 44, 54),
+                         translucent_btn, border_radius=3)
+        o_lab = self.editor.font_small.render("Opaque", True, TEXT)
+        t_lab = self.editor.font_small.render("Translucent", True, TEXT)
+        surf.blit(o_lab, (opaque_btn.x + (opaque_btn.width - o_lab.get_width()) // 2,
+                         opaque_btn.y + 2))
+        surf.blit(t_lab, (translucent_btn.x + (translucent_btn.width - t_lab.get_width()) // 2,
+                         translucent_btn.y + 2))
+        self._blend_opaque_rect = opaque_btn
+        self._blend_translucent_rect = translucent_btn
+
         label = ("Output" if self.preview_nid is None
                 else NODE_DISPLAY.get(self.graph.nodes.get(self.preview_nid, {}).get("type", ""),
                                      "?"))
         lab = self.editor.font_small.render(f"Preview: {label}", True, TEXT_DIM)
-        surf.blit(lab, (prev_r.x + 8, sy + sw + 8))
+        surf.blit(lab, (prev_r.x + 8, blend_y + 24))
         if self.preview_nid is not None:
-            stop = pygame.Rect(prev_r.x + 8, sy + sw + 26, prev_r.width - 16, 18)
+            stop = pygame.Rect(prev_r.x + 8, blend_y + 42, prev_r.width - 16, 18)
             pygame.draw.rect(surf, (40, 44, 54), stop, border_radius=3)
             slab = self.editor.font_small.render("Stop Previewing", True, TEXT)
             surf.blit(slab, (stop.x + 6, stop.y + 2))
@@ -3423,18 +3485,26 @@ class MaterialEditorUI:
         eng = self.editor.engine_mod
         size = self.PREVIEW_SIZE
         surf = pygame.Surface((size, size))
-        surf.fill((29, 31, 37))
+        translucent = self.graph.blend_mode == "translucent"
+        if translucent:
+            _draw_checker_bg(surf, size)
+        else:
+            surf.fill((29, 31, 37))
         sphere = eng.icosphere(radius=1.0, subdivisions=2)
+        entity = eng.Entity("preview", mesh=sphere)
         if self.preview_nid is not None and self.preview_nid in self.graph.nodes:
             colors = self.graph.preview_value(sphere, self.preview_nid)
             sphere.face_colors = colors
         else:
-            (sphere.face_colors, sphere.face_roughness,
-             sphere.face_metallic, sphere.face_emissive) = self.graph.evaluate_pbr(sphere)
+            (sphere.face_colors, sphere.face_roughness, sphere.face_metallic,
+             sphere.face_emissive, opacity) = self.graph.evaluate_pbr(sphere)
+            if opacity is not None:
+                sphere.face_opacity = opacity
+            entity.material = self.graph
         mini = eng.Scene(
             light=eng.DirectionalLight(eng.Vec3(-0.5, -0.9, -0.6), ambient=0.42),
             background=(29, 31, 37))
-        mini.add(eng.Entity("preview", mesh=sphere))
+        mini.add(entity)
         cam = eng.Camera(yaw=0.65, pitch=-0.5)
         fwd = cam.forward()
         cam.position = eng.Vec3(-fwd.x, -fwd.y, -fwd.z) * 2.6

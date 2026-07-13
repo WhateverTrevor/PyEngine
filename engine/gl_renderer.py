@@ -16,6 +16,15 @@ swaps `mesh.face_colors` for a new array. Model/normal matrices are per-draw
 uniforms -- one draw call per entity, which is plenty for the entity counts
 this engine deals with.
 
+Translucent materials (`MaterialGraph.blend_mode == "translucent"`, see
+engine/materials.py) draw in a second pass after all opaque geometry: depth
+test stays on (so opaque still occludes correctly) but depth WRITE is off
+and standard alpha blending is enabled, entities sorted back-to-front by
+distance to camera (see `render()`'s translucent block for why per-entity,
+not per-triangle, is the practical GPU granularity here). Per-face opacity
+rides the same vertex-soup pattern as color/PBR (`_build_opacity`, a new
+one-float-per-vertex attribute) so the shader is shared between both passes.
+
 Two ways to get a GLRenderer: attach to the window's context
 (`GLRenderer(ctx)`, targets `ctx.screen`) or `GLRenderer.standalone(w, h)`
 for headless unit tests (its own context + an off-screen FBO).
@@ -27,13 +36,14 @@ import math
 import moderngl
 import numpy as np
 
-from .gpu_geometry import (_build_color, _build_geometry, _build_pbr,
-                           _entity_world_faces, _scene_environment)
+from .gpu_geometry import (_build_color, _build_geometry, _build_opacity,
+                           _build_pbr, _entity_world_faces, _scene_environment)
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
 from .raytrace import GITracer
 from .renderer import (_face_light_strength, _fog_volumes, _gather_lights,
-                       _gi_direct_lighting, _gi_receiver_geometry, _scene_sun)
+                       _gi_direct_lighting, _gi_receiver_geometry, _is_translucent,
+                       _scene_sun)
 
 _MAX_LIGHTS = 16
 _MAX_FOG_VOL = 4
@@ -50,6 +60,7 @@ in vec3 in_color;
 in float in_faceid;
 in vec2 in_rm;
 in vec3 in_emissive;
+in float in_opacity;
 
 uniform mat4 mvp;
 uniform mat4 model;
@@ -62,6 +73,7 @@ flat out int vFaceId;
 out float vRoughness;
 out float vMetallic;
 out vec3 vEmissive;
+out float vOpacity;
 
 void main() {
     vec4 world = model * vec4(in_pos, 1.0);
@@ -72,6 +84,7 @@ void main() {
     vRoughness = in_rm.x;
     vMetallic = in_rm.y;
     vEmissive = in_emissive;
+    vOpacity = in_opacity;
     gl_Position = mvp * vec4(in_pos, 1.0);
 }
 """
@@ -87,6 +100,7 @@ flat in int vFaceId;
 in float vRoughness;
 in float vMetallic;
 in vec3 vEmissive;
+in float vOpacity;
 
 const float PI = 3.14159265359;
 
@@ -293,7 +307,7 @@ void main() {{
     // Emissive is unconditional -- visible even unlit/in shadow, added
     // after fog, matching renderer.py's deferred pass.
     outColor += vEmissive;
-    fragColor = vec4(clamp(outColor, 0.0, 1.0), 1.0);
+    fragColor = vec4(clamp(outColor, 0.0, 1.0), vOpacity);
 }}
 """
 
@@ -572,10 +586,7 @@ class GLRenderer:
         ctx.enable(moderngl.CULL_FACE)
         ctx.cull_face = self._cull_face
 
-        triangles = 0
-        for entity, off in zip(live, offsets):
-            if entity.mesh.faces.shape[0] == 0:
-                continue
+        def _draw(entity, off) -> int:
             cache = self._get_geo_cache(entity.mesh)
             model = entity.transform.matrix()
             mvp = proj @ view @ model
@@ -588,7 +599,40 @@ class GLRenderer:
             _write_mat(prog["normalMat"], nmat)
             prog["faceOffset"].value = int(off)
             cache["vao"].render(moderngl.TRIANGLES, vertices=cache["count"])
-            triangles += cache["count"] // 3
+            return cache["count"] // 3
+
+        triangles = 0
+        opaque_pairs = [(e, off) for e, off in zip(live, offsets)
+                        if e.mesh.faces.shape[0] > 0 and not _is_translucent(e)]
+        translucent_pairs = [(e, off) for e, off in zip(live, offsets)
+                             if e.mesh.faces.shape[0] > 0 and _is_translucent(e)]
+
+        for entity, off in opaque_pairs:
+            triangles += _draw(entity, off)
+
+        if translucent_pairs:
+            # Back-to-front per-entity painter order (approximates the CPU
+            # deferred path's per-face sort -- see renderer._render_translucent;
+            # per-entity is the practical GPU granularity since a full
+            # cross-entity per-triangle sort would mean per-triangle draw
+            # calls). Depth-test stays ON (opaque geometry still occludes
+            # correctly per-pixel regardless of draw order) but depth-WRITE
+            # is off so overlapping translucent faces blend instead of
+            # z-fighting/occluding each other; standard "over" alpha blend
+            # via face_opacity (vOpacity), fed by the same shader used for
+            # opaque draws (opaque meshes always carry face_opacity==1.0,
+            # and blending is disabled for that pass anyway).
+            cam_pos = camera.position.to_array()
+            translucent_pairs.sort(
+                key=lambda p: -float(np.linalg.norm(
+                    p[0].transform.matrix()[:3, 3] - cam_pos)))
+            self.target.depth_mask = False
+            ctx.enable(moderngl.BLEND)
+            ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            for entity, off in translucent_pairs:
+                triangles += _draw(entity, off)
+            ctx.disable(moderngl.BLEND)
+            self.target.depth_mask = True
 
         self._prune_geo_cache(live)
         self.stats["triangles"] = triangles
@@ -725,17 +769,21 @@ class GLRenderer:
             rm, emissive = _build_pbr(mesh, face_id_tri)
             pbr = np.concatenate([rm, emissive], axis=1)
             vbo_pbr = self.ctx.buffer(np.ascontiguousarray(pbr).tobytes())
+            opacity = _build_opacity(mesh, face_id_tri)
+            vbo_opacity = self.ctx.buffer(np.ascontiguousarray(opacity).tobytes())
             vao = self.ctx.vertex_array(self._mesh_prog, [
                 (vbo_geom, "3f 3f 1f", "in_pos", "in_normal", "in_faceid"),
                 (vbo_color, "3f", "in_color"),
                 (vbo_pbr, "2f 3f", "in_rm", "in_emissive"),
+                (vbo_opacity, "1f", "in_opacity"),
             ])
             cache = {"vbo_geom": vbo_geom, "vbo_color": vbo_color,
-                     "vbo_pbr": vbo_pbr, "vao": vao,
+                     "vbo_pbr": vbo_pbr, "vbo_opacity": vbo_opacity, "vao": vao,
                      "count": pos.shape[0], "num_faces": m,
                      "face_id_tri": face_id_tri, "color_id": id(mesh.face_colors),
                      "pbr_id": (id(mesh.face_roughness), id(mesh.face_metallic),
-                                id(mesh.face_emissive))}
+                                id(mesh.face_emissive)),
+                     "opacity_id": id(mesh.face_opacity)}
             self._geo_cache[key] = cache
         else:
             if cache["color_id"] != id(mesh.face_colors):
@@ -749,6 +797,10 @@ class GLRenderer:
                 pbr = np.concatenate([rm, emissive], axis=1)
                 cache["vbo_pbr"].write(np.ascontiguousarray(pbr).tobytes())
                 cache["pbr_id"] = pbr_id
+            if cache["opacity_id"] != id(mesh.face_opacity):
+                opacity = _build_opacity(mesh, cache["face_id_tri"])
+                cache["vbo_opacity"].write(np.ascontiguousarray(opacity).tobytes())
+                cache["opacity_id"] = id(mesh.face_opacity)
         return cache
 
     def _prune_geo_cache(self, live_entities) -> None:
@@ -759,6 +811,7 @@ class GLRenderer:
             c["vbo_geom"].release()
             c["vbo_color"].release()
             c["vbo_pbr"].release()
+            c["vbo_opacity"].release()
 
     def _get_env_tex(self, env) -> "moderngl.Texture":
         key = id(env.image)
