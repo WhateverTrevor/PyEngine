@@ -218,6 +218,10 @@ class FakeInput:
         self._keys = set(keys)
     def pressed(self, k):
         return k in self._keys
+    def take_text(self):
+        text = self.text_typed
+        self.text_typed = ""
+        return text
 
 editor.editing_field = ("Position", "x")
 editor.edit_buffer = ""

@@ -239,4 +239,58 @@ print("no-pollution guard OK: real settings.json untouched by this suite")
 if os.path.exists(USAGE_PATH):
     os.remove(USAGE_PATH)
 
+# ---- 7. text-input consume-once: fixed-timestep can run the update step
+#          multiple times per rendered frame (N steps at low FPS -- see
+#          CLAUDE.md). InputManager.take_text() must give each field
+#          consume-once semantics so typing isn't duplicated Nx. Simulate a
+#          KEYDOWN batch (inp.text_typed accumulated once, as process() does)
+#          then run the consumer's update path 3x in the same frame-span
+#          (no consume_edges between -- exactly the multi-step scenario).
+class _FakeTextInput:
+    def __init__(self, text):
+        self.text_typed = text
+        self._keys = set()
+    def pressed(self, k):
+        return k in self._keys
+    def take_text(self):
+        text = self.text_typed
+        self.text_typed = ""
+        return text
+    def mouse_button_pressed(self, button=1):
+        return False
+
+# 7a. material-editor node-search bar (_update_ctx_menu)
+mui._open_add_menu((panel.x + 60, panel.y + 60), panel)
+mui.ctx_menu["search"] = ""
+fi = _FakeTextInput("vector")
+mui._update_ctx_menu(fi, (panel.x + 60, panel.y + 60))
+mui._update_ctx_menu(fi, (panel.x + 60, panel.y + 60))
+mui._update_ctx_menu(fi, (panel.x + 60, panel.y + 60))
+assert mui.ctx_menu["search"] == "vector", \
+    f"search bar must not duplicate typed text across update steps: {mui.ctx_menu['search']!r}"
+mui.ctx_menu = None
+print("consume-once OK: material-editor search bar 'vector' not duplicated across 3 update steps")
+
+# 7b. Details-panel transform field (_update_edit_field)
+editor.editing_field = ("Position", "x")
+editor.edit_buffer = ""
+fi2 = _FakeTextInput("12.5")
+editor._update_edit_field(fi2)
+editor._update_edit_field(fi2)
+editor._update_edit_field(fi2)
+assert editor.edit_buffer == "12.5", \
+    f"transform field must not duplicate typed text across update steps: {editor.edit_buffer!r}"
+editor.editing_field = None
+print("consume-once OK: transform field '12.5' not duplicated across 3 update steps")
+
+# 7c. content-browser folder rename buffer (_update_rename)
+editor.rename_buffer = ""
+fi3 = _FakeTextInput("newname")
+editor._update_rename(fi3)
+editor._update_rename(fi3)
+editor._update_rename(fi3)
+assert editor.rename_buffer == "newname", \
+    f"rename buffer must not duplicate typed text across update steps: {editor.rename_buffer!r}"
+print("consume-once OK: rename buffer 'newname' not duplicated across 3 update steps")
+
 print("ALL MATERIAL-EDITOR-UI JUDGE CHECKS PASSED")

@@ -55,6 +55,17 @@ class InputManager:
         """True once per press."""
         return key in self._pressed
 
+    def take_text(self) -> str:
+        """Return chars typed since the last take_text/consume_edges call and
+        clear them immediately. Consume-once semantics matching pressed()/
+        consume_edges() -- callers must call this at most once per active
+        text field per frame-span (the fixed-timestep loop can run the
+        update step multiple times per rendered frame), otherwise a second
+        call in the same span would duplicate characters."""
+        text = self.text_typed
+        self.text_typed = ""
+        return text
+
     def mouse_button_pressed(self, button: int = 1) -> bool:
         return button in self._mouse_pressed
 

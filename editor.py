@@ -950,7 +950,7 @@ class Editor:
 
     def _update_edit_field(self, inp) -> None:
         import pygame
-        for ch in inp.text_typed:
+        for ch in inp.take_text():
             if ch.isdigit() or ch in "-.":
                 self.edit_buffer += ch
         if inp.pressed(pygame.K_BACKSPACE):
@@ -1692,7 +1692,7 @@ class Editor:
 
     def _update_rename(self, inp) -> None:
         import pygame
-        self.rename_buffer += inp.text_typed
+        self.rename_buffer += inp.take_text()
         if inp.pressed(pygame.K_BACKSPACE):
             self.rename_buffer = self.rename_buffer[:-1]
         if inp.pressed(pygame.K_RETURN) or inp.pressed(pygame.K_KP_ENTER):
@@ -3126,7 +3126,7 @@ class MaterialEditorUI:
             self.ctx_menu = None
             return
         if menu["kind"] == "add":
-            for ch in inp.text_typed:
+            for ch in inp.take_text():
                 if ch.isprintable():
                     menu["search"] += ch
             if inp.pressed(pygame.K_BACKSPACE):
