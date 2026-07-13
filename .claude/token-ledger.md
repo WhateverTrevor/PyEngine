@@ -36,3 +36,4 @@ death never loses more than one milestone.
 | 2026-07-13 | DX12 default renderer (CPU opt-in) | 82,477 | completed clean under budget; judged + squash-merged 2df73cd. User preference saved to supervisor memory |
 | 2026-07-13 | Material editor UX (UE menus + preview panel) | 164,685 cumulative (incl. send-back) | completed; 1 cosmetic finding (overlapping menu text) fixed on send-back; judged + squash-merged 79dc8a9 |
 | 2026-07-13 | Material types + transparency (2 agents: checkpoint stop at M2 + fresh finisher) | 148,601 + 194,948 | completed; judged + squash-merged a284f06. Checkpoint protocol worked exactly as designed — clean stop, fresh resume from HANDOFF, zero waste |
+| 2026-07-13 | Fix text-input duplication (fixed-timestep consume-once) | 73,659 | completed clean under budget; judged + squash-merged. Supervisor pre-diagnosed root cause in the brief — cheapest run yet with a real engine bug |
