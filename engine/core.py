@@ -47,13 +47,14 @@ void main() { fragColor = texture(tex, v_uv); }
 class Engine:
     def __init__(self, width: int = 1280, height: int = 720, title: str = "PyEngine",
                  max_fps: int = 120, fixed_dt: float = 1.0 / 60.0, splash: bool = True,
-                 api: str = "auto", gpu: "str | bool | None" = None,
+                 api: str = "dx12", gpu: "str | bool | None" = None,
                  fullscreen: bool = False):
-        """`api`: "auto" (try "gl", falling back toward "cpu"; headless/dummy
-        driver always forces "cpu"), "cpu" (software only), "gl" (OpenGL 3.3
-        via moderngl), "dx12" / "vulkan" (WebGPU via wgpu-py, see
-        wgpu_renderer.py). Each GPU choice falls back one step at a time,
-        toward "gl" then "cpu", printing one warning line per step on
+        """`api`: "dx12" (WebGPU via wgpu-py, see wgpu_renderer.py; the
+        default -- CPU rendering is opt-in only), "vulkan" (WebGPU, other
+        adapter), "auto" (alias for "dx12"), "gl" (OpenGL 3.3 via moderngl),
+        "cpu" (software only). Headless/dummy driver always forces "cpu"
+        regardless of `api`. Each GPU choice falls back one step at a time,
+        dx12/vulkan -> "gl" -> "cpu", printing one warning line per step on
         failure -- see `_init_display`.
 
         `gpu` is a DEPRECATED alias for `api`, kept for old call sites:
@@ -153,7 +154,7 @@ class Engine:
         headless = os.environ.get("SDL_VIDEODRIVER") == "dummy"
         want = "cpu" if headless else self._api_mode
         if want == "auto":
-            want = "gl"
+            want = "dx12"
 
         if want in ("dx12", "vulkan"):
             try:

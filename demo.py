@@ -1,10 +1,12 @@
 """PyEngine demo: a lit, fogged scene you can fly through in real time.
 
-    py demo.py                          interactive (GPU if available, else CPU)
+    py demo.py                          interactive (DX12 by default, falling
+                                         back to gl then cpu if unavailable)
     py demo.py --frames 300             benchmark 300 frames, print avg FPS
     py demo.py --frames 60 --headless --screenshot out.png
-    py demo.py --api dx12               force a backend: cpu / gl / dx12 / vulkan
-                                         (--gpu/--cpu still work as gl/cpu aliases)
+    py demo.py --api cpu                force a backend: dx12 / vulkan / gl / cpu
+                                         (default: dx12; CPU is opt-in only;
+                                         --gpu/--cpu still work as gl/cpu aliases)
 """
 from __future__ import annotations
 
@@ -71,7 +73,7 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true",
                         help="render without a window (SDL dummy driver)")
     parser.add_argument("--api", choices=["auto", "cpu", "gl", "dx12", "vulkan"], default=None,
-                        help="force a rendering backend (default: auto)")
+                        help="force a rendering backend (default: dx12; CPU is opt-in only)")
     parser.add_argument("--gpu", action="store_true",
                         help="alias for --api gl (force the OpenGL/moderngl renderer)")
     parser.add_argument("--cpu", action="store_true",
@@ -81,7 +83,7 @@ def main() -> None:
     if args.headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
 
-    api_mode = "auto"
+    api_mode = "dx12"
     if args.api:
         api_mode = args.api
     elif args.gpu:

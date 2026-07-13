@@ -19,7 +19,7 @@ py -m pip install moderngl   # optional: enables the OpenGL renderer
 py -m pip install wgpu       # optional: enables the DirectX 12 / Vulkan renderer
 py editor.py     # world editor with the survival-horror starter scene
 py demo.py       # bright playground demo
-py editor.py --api dx12          # force a backend: cpu / gl / dx12 / vulkan (default: auto)
+py editor.py --api cpu           # force a backend: dx12 / vulkan / gl / cpu (default: dx12; cpu is opt-in)
 py editor.py --gpu   /   --cpu   # aliases for --api gl / --api cpu
 ```
 
@@ -375,24 +375,24 @@ lighting at 1/4 internal resolution; the bright demo scene ~68 FPS at
 
 ### GPU rendering
 
-Three renderer backends exist, chosen by `Engine(api=...)` — `"auto"` (the
-default for both apps), `"cpu"`, `"gl"`, `"dx12"`, or `"vulkan"`. `--api` on
-either app forces one from the command line (`--gpu`/`--cpu` remain as
-aliases for `--api gl` / `--api cpu`); the editor's Settings dialog offers
-the same five choices as a **Graphics API** row (see
-[Settings](#settings-window--settings)), applied on the next launch.
-`--headless` always forces `"cpu"`, since the SDL dummy driver used for
-headless/CI runs has no GL surface or wgpu-presentable window to attach to.
+Three renderer backends exist, chosen by `Engine(api=...)` — `"dx12"` (the
+default for both apps; CPU rendering is opt-in only), `"vulkan"`, `"gl"`,
+`"cpu"`, or `"auto"` (alias for `"dx12"`). `--api` on either app forces one
+from the command line (`--gpu`/`--cpu` remain as aliases for `--api gl` /
+`--api cpu`); the editor's Settings dialog offers the same five choices as a
+**Graphics API** row (see [Settings](#settings-window--settings)), applied
+on the next launch. `--headless` always forces `"cpu"`, since the SDL dummy
+driver used for headless/CI runs has no GL surface or wgpu-presentable
+window to attach to.
 
-**Fallback chain:** `"auto"` tries `"gl"` first (OpenGL/moderngl remains the
-default GPU path when available). Any failure along a GPU path — missing
-dependency, no suitable driver/adapter, context/device creation failure —
-prints one warning line and falls back one step at a time: requested api ->
-`"gl"` -> `"cpu"`. E.g. requesting `"dx12"` on a machine without `wgpu`
-installed prints one warning and tries `"gl"`; if that also fails (no
-`moderngl`, or no GL 3.3 driver), a second warning and the engine ends up on
-`"cpu"`. The rest of the engine behaves exactly as if that were the
-requested api all along.
+**Fallback chain:** `"dx12"`/`"auto"` try `"dx12"` first. Any failure along a
+GPU path — missing dependency, no suitable driver/adapter, context/device
+creation failure — prints one warning line and falls back one step at a
+time: requested api -> `"gl"` -> `"cpu"`. E.g. requesting `"dx12"` on a
+machine without `wgpu` installed prints one warning and tries `"gl"`; if
+that also fails (no `moderngl`, or no GL 3.3 driver), a second warning and
+the engine ends up on `"cpu"`. The rest of the engine behaves exactly as if
+that were the requested api all along.
 
 #### OpenGL (`gl`)
 

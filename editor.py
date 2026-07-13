@@ -2,10 +2,11 @@
 
     py editor.py                     open scenes/scene.json (or a starter scene)
     py editor.py --scene my.json     work on a specific scene file
-    py editor.py --api dx12          force a rendering backend: cpu / gl /
-                                      dx12 / vulkan (default: auto, or
-                                      Settings > Graphics API); --gpu/--cpu
-                                      still work as aliases for gl/cpu
+    py editor.py --api cpu           force a rendering backend: dx12 / vulkan /
+                                      gl / cpu (default: dx12, or
+                                      Settings > Graphics API); CPU is opt-in
+                                      only. --gpu/--cpu still work as aliases
+                                      for gl/cpu
 
 Controls (Help > Controls in the editor shows the full list):
     RMB hold        mouse look + WASD/QE/Space/Ctrl fly (Unreal-style: these
@@ -1355,7 +1356,7 @@ class Editor:
         x, y = rect.x + 12, rect.y + 180
         bw, bh, gap = 62, 22, 6
         out = []
-        for key in ("auto", "cpu", "gl", "dx12", "vulkan"):
+        for key in ("dx12", "vulkan", "gl", "auto", "cpu"):
             out.append((key, pygame.Rect(x, y, bw, bh)))
             x += bw + gap
         return out
@@ -3171,8 +3172,8 @@ def main() -> None:
                              "(lower = sharper, slower; default 4, or from "
                              "settings.json if present)")
     parser.add_argument("--api", choices=["auto", "cpu", "gl", "dx12", "vulkan"], default=None,
-                        help="force a rendering backend (default: auto, or "
-                             "Settings > Graphics API)")
+                        help="force a rendering backend (default: dx12, or "
+                             "Settings > Graphics API); CPU is opt-in only")
     parser.add_argument("--gpu", action="store_true",
                         help="alias for --api gl (force the OpenGL/moderngl renderer)")
     parser.add_argument("--cpu", action="store_true",
@@ -3199,7 +3200,7 @@ def main() -> None:
     max_fps = settings.get("max_fps", 120)
     fullscreen = bool(settings.get("fullscreen", False)) and not args.headless
 
-    api_mode = "auto"
+    api_mode = "dx12"
     settings_api = settings.get("api")
     if settings_api in ("auto", "cpu", "gl", "dx12", "vulkan"):
         api_mode = settings_api
