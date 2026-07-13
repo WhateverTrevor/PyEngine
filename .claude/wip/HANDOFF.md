@@ -1,19 +1,23 @@
 # No task in flight
 
-Nothing is mid-implementation. The settings-isolation + dock-zones task
-was judged and squash-merged to main on 2026-07-12; its wip branch is
-deleted.
+Nothing is mid-implementation. FBX export (run 1 of the texture/material
+slate) was judged and squash-merged to main on 2026-07-12; its wip branch
+is deleted.
 
-When a task IS in flight, this file holds its resume state per the
-checkpoint protocol in `CLAUDE.md` and `.claude/agents/engine-coder.md`.
+Remaining runs in the user's current slate:
+2. Texture assets in the content browser (import png/jpg, grid previews)
+   + TextureCoordinate / TextureSample material nodes (UE semantics) —
+   requires building per-face UV evaluation (FBX import currently strips
+   UVs; box-projection fallback for meshes without them).
+3. Unreal-style node overhaul (Material Attributes, math, noise, scaling;
+   UE input/output pin conventions) + drag-and-drop material assignment
+   from browser onto the Details material slot with a material preview.
 
-IMPORTANT for all future test/benchmark work: test suites now isolate
-settings via PYENGINE_SETTINGS / Editor(settings_path=...) — any NEW test
-that constructs an Editor must do the same (window_checks has a
-no-pollution guard that will catch violations). The user's real
-settings.json must never be written by automation.
+IMPORTANT: test suites isolate settings via PYENGINE_SETTINGS /
+Editor(settings_path=...) — any NEW test constructing an Editor must do
+the same. The user's real settings.json must never be written by
+automation. User should manually verify one exported FBX imports into
+real Blender (unverifiable in this environment).
 
-Backlog pointers live in CLAUDE.md ("Known gaps / natural backlog") — the
-top queued item is directional (sun) shadow attenuation on mesh faces in
-the wgpu backend. Other follow-ups: local-space rotate (quaternion ring
-drag), content-browser folder deletion.
+Backlog: wgpu directional sun-shadow attenuation; local-space rotate;
+folder deletion.

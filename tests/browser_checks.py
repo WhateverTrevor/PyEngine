@@ -258,6 +258,53 @@ try:
     assert editor.lib.folder_of == before
     print("import routing OK: unsupported extension rejected without side effects")
 
+    # 9d. FBX export: selecting a mesh asset tile enables Export, routes to
+    # the chosen path, and round-trips losslessly through our own importer.
+    crate = editor.lib.by_name["Crate"]
+    editor.selected_asset = crate
+    export_path = os.path.join(tempfile.gettempdir(), "judge_browser_export_crate.fbx")
+    if os.path.exists(export_path):
+        os.remove(export_path)
+    editor._export_asset_to_path(crate, export_path)
+    assert "export failed" not in editor.status[0], editor.status
+    assert os.path.exists(export_path), "export must write the file at the chosen path"
+
+    crate_entity = crate.instantiate()
+    exp_verts, exp_faces, exp_colors = engine.fbx.extract_geometry(export_path)
+    assert len(exp_verts) == len(crate_entity.mesh.vertices), \
+        "exported vertex count must match the source mesh"
+    assert len(exp_faces) == len(crate_entity.mesh.faces), \
+        "exported face count must match the source mesh (tri/quad winding preserved)"
+    assert np.allclose(np.sort(exp_verts, axis=0),
+                       np.sort(crate_entity.mesh.vertices, axis=0), atol=1e-3), \
+        "exported vertex positions must round-trip exactly (UpAxis=Y, UnitScaleFactor=1)"
+    # per-face colors: every exported face color must appear in the source
+    # mesh's palette (order may reshuffle since materials are deduped by color)
+    src_colors = {tuple(int(c) for c in row) for row in crate_entity.mesh.face_colors}
+    exp_colors_255 = {tuple(int(round(c)) for c in (row * 255.0)) for row in exp_colors}
+    assert exp_colors_255 <= src_colors, \
+        f"exported face colors must all come from the source palette: {exp_colors_255 - src_colors}"
+    print(f"FBX export OK: '{crate.name}' round-tripped "
+         f"({len(exp_verts)} verts, {len(exp_faces)} faces, {len(exp_colors_255)} colors)")
+    os.remove(export_path)
+
+    # 9e. non-mesh asset (e.g. a light or the Fog Volume) is rejected cleanly,
+    # no exception, no file written -- and has_mesh() gates the Export button.
+    non_mesh_name = next((n for n, a in editor.lib.by_name.items()
+                         if "mesh" not in a.data), None)
+    assert non_mesh_name is not None, "fixture assumption: at least one non-mesh asset exists"
+    non_mesh = editor.lib.by_name[non_mesh_name]
+    assert engine.has_mesh(crate) is True
+    assert engine.has_mesh(non_mesh) is False
+    bogus_export = os.path.join(tempfile.gettempdir(), "judge_browser_export_nomesh.fbx")
+    if os.path.exists(bogus_export):
+        os.remove(bogus_export)
+    editor._export_asset_to_path(non_mesh, bogus_export)
+    assert "export failed" in editor.status[0], \
+        "exporting a mesh-less asset must fail cleanly, not silently succeed"
+    assert not os.path.exists(bogus_export), "a rejected export must not write a file"
+    print(f"FBX export OK: non-mesh asset '{non_mesh.name}' rejected cleanly")
+
     # clean up the imported fixture assets so the repo tree stays clean
     for name in (fbx_name, hdr_name):
         json_path = next((a.path for a in editor.lib.assets if a.name == name), None)

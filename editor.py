@@ -232,6 +232,7 @@ class Editor:
         self.outliner_scroll = 0
         self.browser_scroll = 0
         self.drag_asset = None
+        self.selected_asset = None  # AssetDef of the last-clicked grid tile, for Export
         # ---- content-browser folder tree ----
         self.selected_folder = None   # folder id, or None == root
         self.tree_scroll = 0
@@ -1557,6 +1558,11 @@ class Editor:
         import pygame
         return pygame.Rect(topbar.right - 74, topbar.y + 3, 70, 20)
 
+    def _export_btn_rect(self, topbar):
+        import pygame
+        imp = self._import_btn_rect(topbar)
+        return pygame.Rect(imp.x - 78, topbar.y + 3, 70, 20)
+
     # ---- content browser: folder tree ----
     def _folder_tree_rows(self):
         """Flattened [(folder_id_or_None, depth, name)], root first, then a
@@ -1677,6 +1683,39 @@ class Editor:
             self.status = (f"imported '{name}' — drag it from the browser", 5.0)
         except Exception as ex:
             self.status = (f"import failed: {ex}", 6.0)
+
+    # ---- content browser: export selected tile's mesh to FBX ----
+    def _export_asset_to_path(self, asset, path: str) -> None:
+        """Dialog-free export handler so tests can drive it with a real path,
+        no tkinter dialog involved -- same split as `_import_path_to_folder`.
+        """
+        try:
+            self.engine_mod.export_asset_fbx(asset, path)
+            self.status = (f"exported '{asset.name}' -> {os.path.basename(path)}", 5.0)
+        except Exception as ex:
+            self.status = (f"export failed: {ex}", 6.0)
+
+    def _export_fbx_dialog(self) -> None:
+        asset = self.selected_asset
+        if asset is None or not self.engine_mod.has_mesh(asset):
+            return
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            default_name = asset.name.replace(" ", "_") + ".fbx"
+            path = filedialog.asksaveasfilename(
+                title="Export FBX model", initialfile=default_name,
+                defaultextension=".fbx", filetypes=[("FBX models", "*.fbx")])
+            root.destroy()
+        except Exception as ex:
+            self.status = (f"file dialog unavailable: {ex}", 5.0)
+            return
+        if not path:
+            return
+        self._export_asset_to_path(asset, path)
 
     def _import_fbx_dialog(self) -> None:
         try:
@@ -1936,6 +1975,10 @@ class Editor:
                 self._new_folder()
             elif self._import_btn_rect(blay["topbar"]).collidepoint(mp):
                 self._import_dialog_to_folder()
+            elif self._export_btn_rect(blay["topbar"]).collidepoint(mp):
+                if self.selected_asset is not None and self.engine_mod.has_mesh(
+                        self.selected_asset):
+                    self._export_fbx_dialog()
             elif blay["tree"].collidepoint(mp):
                 _i, fid = self._tree_row_at(mp, blay["tree"])
                 if _i is not None:
@@ -1948,6 +1991,7 @@ class Editor:
                 asset = self._tile_at(mp, blay["grid"])
                 if asset is not None:
                     self.drag_asset = asset
+                    self.selected_asset = asset
 
     def _click_details(self, mp, rect) -> None:
         e = self.selected
@@ -2525,8 +2569,17 @@ class Editor:
         pygame.draw.rect(surf, PANEL_EDGE, btn, 1, border_radius=4)
         label = self.font_small.render("Import", True, ACCENT)
         surf.blit(label, (btn.x + (btn.width - label.get_width()) // 2, btn.y + 4))
+        exp = self._export_btn_rect(topbar)
+        exportable = (self.selected_asset is not None
+                     and self.engine_mod.has_mesh(self.selected_asset))
+        exp_color = ACCENT if exportable else TEXT_DIM
+        pygame.draw.rect(surf, HOVER_BG if exportable and exp.collidepoint(mp)
+                         else (33, 36, 44), exp, border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, exp, 1, border_radius=4)
+        exp_label = self.font_small.render("Export", True, exp_color)
+        surf.blit(exp_label, (exp.x + (exp.width - exp_label.get_width()) // 2, exp.y + 4))
         if self.status[1] > 0:
-            avail = btn.x - (nfb.right + 8)
+            avail = exp.x - (nfb.right + 8)
             msg = self.font_small.render(self.status[0][:60], True, (235, 210, 140))
             if avail > 20:
                 surf.blit(msg, (nfb.right + 8, topbar.y + 6))
@@ -2564,13 +2617,19 @@ class Editor:
             tile = pygame.Rect(x, grid_rect.y + 6, TILE_W, TILE_H - 12)
             if tile.right > grid_rect.x and tile.left < grid_rect.right:
                 hovered = tile.collidepoint(mp)
-                pygame.draw.rect(surf, HOVER_BG if hovered else (30, 32, 39), tile,
-                                 border_radius=4)
+                selected = asset is self.selected_asset
+                if selected:
+                    pygame.draw.rect(surf, SELECT_BG, tile, border_radius=4)
+                else:
+                    pygame.draw.rect(surf, HOVER_BG if hovered else (30, 32, 39), tile,
+                                     border_radius=4)
+                if selected:
+                    pygame.draw.rect(surf, ACCENT, tile, 1, border_radius=4)
                 icon = self.icons.get(asset.name)
                 if icon is not None:
                     surf.blit(icon, (x + (TILE_W - ICON) // 2, grid_rect.y + 10))
                 label = self.font_small.render(asset.name[:12], True,
-                                               TEXT if hovered else TEXT_DIM)
+                                               TEXT if (hovered or selected) else TEXT_DIM)
                 surf.blit(label, (x + (TILE_W - label.get_width()) // 2,
                                   grid_rect.y + 10 + ICON + 3))
             x += TILE_W + 8

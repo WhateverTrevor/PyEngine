@@ -1,7 +1,7 @@
-"""Minimal binary FBX importer (pure Python).
+"""Minimal binary FBX importer/exporter (pure Python).
 
-Parses the documented Kaydara binary node format (FBX 7.x, including the
-64-bit variant used from version 7.5), extracts every Geometry node's
+Import: parses the documented Kaydara binary node format (FBX 7.x, including
+the 64-bit variant used from version 7.5), extracts every Geometry node's
 vertices and polygons, honors the file's up axis and unit scale, and merges
 the result into one mesh. Triangles and quads are kept as-is; larger n-gons
 are fan-split. Materials, transforms, and animation are ignored — this pulls
@@ -10,6 +10,19 @@ geometry only.
 `import_fbx()` turns an .fbx file into a self-contained engine asset: the
 geometry is saved to assets/models/<name>.npz and a matching asset .json is
 written, so the model appears in the content browser like any other asset.
+
+Export: `export_fbx()` writes a spec-correct binary FBX 7.4 file (32-bit node
+headers) mirroring the layout this module's own importer reads back —
+GlobalSettings (UpAxis=1/Y-up, UnitScaleFactor=1 so vertices round-trip
+exactly at *100/‍/100 cm<->m), one Geometry + Model, one Material per unique
+face color with a ByPolygon/IndexToDirect LayerElementMaterial, and the
+Connections graph the importer's `_material_colors`/`_connections` resolve
+through. There is no Blender available in this sandbox to confirm import,
+so compatibility rests on the binary structure being spec-correct (correct
+header/footer magic, node record shape, standard Geometry/Model/Material/
+Connections layout) rather than on an external round-trip; this module's own
+`extract_geometry()` re-importing the written file losslessly is the
+acid test actually exercised here (see tests/fbx_checks.py).
 """
 from __future__ import annotations
 
@@ -309,3 +322,223 @@ def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
     with open(os.path.join(assets_dir, f"{stem}.json"), "w", encoding="utf-8") as fh:
         json.dump(asset, fh, indent=2)
     return name
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+_FBX_VERSION = 7400  # last version with 32-bit node headers (< 7500)
+
+# Community-documented binary-FBX footer constants (Autodesk FBX SDK output).
+# Not independently verifiable here (no Blender in this sandbox) — included
+# so the file's tail matches the spec shape a real FBX writer produces.
+_FOOTER_ID = bytes([0xfa, 0xbc, 0xab, 0x09, 0xd0, 0xc8, 0xd4, 0x66,
+                    0xb1, 0x76, 0xfb, 0x83, 0x1c, 0xf7, 0x26, 0x7e])
+_FOOTER_EXT = bytes([0xf8, 0x5a, 0x8c, 0x6a, 0xde, 0xf5, 0xd9, 0x7e,
+                     0xec, 0xe9, 0x0c, 0xe3, 0x75, 0x8f, 0x29, 0x0b])
+
+
+def _encode_prop(v) -> bytes:
+    if isinstance(v, str):
+        raw = v.encode("utf-8")
+        return b"S" + struct.pack("<I", len(raw)) + raw
+    if isinstance(v, bool):
+        return b"C" + struct.pack("<b", 1 if v else 0)
+    if isinstance(v, int):
+        return b"L" + struct.pack("<q", v)
+    if isinstance(v, float):
+        return b"D" + struct.pack("<d", v)
+    if isinstance(v, np.ndarray):
+        if v.dtype == np.float64:
+            code, dtype = b"d", "<f8"
+        elif v.dtype == np.float32:
+            code, dtype = b"f", "<f4"
+        elif v.dtype == np.int64:
+            code, dtype = b"l", "<i8"
+        else:
+            v = v.astype(np.int32)
+            code, dtype = b"i", "<i4"
+        raw = np.ascontiguousarray(v, dtype=dtype).tobytes()
+        return code + struct.pack("<III", len(v), 0, len(raw)) + raw
+    raise TypeError(f"unsupported FBX property type for export: {type(v)!r}")
+
+
+def _encode_node(node: tuple, start: int) -> bytes:
+    """(name, props, children) -> binary node bytes, 32-bit headers.
+
+    `start` is this node's absolute file offset; end offsets are absolute,
+    per the format, so nested nodes need the running position threaded
+    through — mirrors `_read_node`'s layout in reverse.
+    """
+    name, props, children = node
+    name_b = name.encode("ascii")
+    prop_data = b"".join(_encode_prop(p) for p in props)
+    pos = start + 13 + len(name_b) + len(prop_data)
+    child_data = b""
+    if children:
+        for child in children:
+            cb = _encode_node(child, pos)
+            child_data += cb
+            pos += len(cb)
+        child_data += b"\x00" * 13  # null sentinel terminates the child list
+        pos += 13
+    header = struct.pack("<IIIB", pos, len(props), len(prop_data), len(name_b))
+    return header + name_b + prop_data + child_data
+
+
+def _unique_palette(face_colors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(palette (P,3) 0..255, per-face index into palette)."""
+    rounded = np.round(face_colors).astype(np.int64)
+    palette_list: list[tuple[int, int, int]] = []
+    lookup: dict[tuple[int, int, int], int] = {}
+    indices = np.empty(len(rounded), dtype=np.int32)
+    for i, row in enumerate(rounded):
+        key = (int(row[0]), int(row[1]), int(row[2]))
+        idx = lookup.get(key)
+        if idx is None:
+            idx = len(palette_list)
+            lookup[key] = idx
+            palette_list.append(key)
+        indices[i] = idx
+    return np.asarray(palette_list, dtype=np.float64), indices
+
+
+def export_fbx(mesh, path: str, name: str = "Mesh") -> None:
+    """Write `mesh` (an `engine.mesh.Mesh`) to `path` as binary FBX 7.4.
+
+    Geometry is stored in centimeters with UpAxis=Y (matching the engine),
+    so `extract_geometry()` re-imports it with vertices unchanged (see the
+    UnitScaleFactor/UpAxis round-trip note in this module's docstring).
+    """
+    verts_cm = (mesh.vertices * 100.0).reshape(-1)
+    palette, face_idx = _unique_palette(mesh.face_colors)
+
+    pvi: list[int] = []
+    normals_flat: list[float] = []
+    for face_row, normal in zip(mesh.faces, mesh.normals):
+        poly = (face_row[:3] if face_row[3] == face_row[2] else face_row)
+        poly = [int(i) for i in poly]
+        for i in poly[:-1]:
+            pvi.append(i)
+        pvi.append(~poly[-1])
+        normals_flat.extend(float(c) for c in normal)
+
+    GID, MODEL_ID = 1000, 2000
+    mat_ids = [3000 + i for i in range(len(palette))]
+
+    header_ext = ("FBXHeaderExtension", [], [
+        ("FBXHeaderVersion", [1003], []),
+        ("FBXVersion", [_FBX_VERSION], []),
+        ("Creator", ["PyEngine FBX Exporter"], []),
+    ])
+    global_settings = ("GlobalSettings", [], [
+        ("Version", [1000], []),
+        ("Properties70", [], [
+            ("P", ["UpAxis", "int", "Integer", "", 1], []),
+            ("P", ["UnitScaleFactor", "double", "Number", "", 1.0], []),
+        ]),
+    ])
+    definitions = ("Definitions", [], [
+        ("Version", [100], []),
+        ("Count", [2 + len(palette)], []),
+    ])
+
+    material_layer = None
+    if len(palette):
+        material_layer = ("LayerElementMaterial", [0], [
+            ("Version", [101], []),
+            ("Name", [""], []),
+            ("MappingInformationType", ["ByPolygon"], []),
+            ("ReferenceInformationType", ["IndexToDirect"], []),
+            ("Materials", [face_idx.astype(np.int32)], []),
+        ])
+    normal_layer = ("LayerElementNormal", [0], [
+        ("Version", [101], []),
+        ("Name", [""], []),
+        ("MappingInformationType", ["ByPolygon"], []),
+        ("ReferenceInformationType", ["Direct"], []),
+        ("Normals", [np.asarray(normals_flat, dtype=np.float64)], []),
+    ])
+    layer_elements = [("LayerElement", [], [
+        ("Type", ["LayerElementNormal"], []),
+        ("TypedIndex", [0], []),
+    ])]
+    if material_layer is not None:
+        layer_elements.append(("LayerElement", [], [
+            ("Type", ["LayerElementMaterial"], []),
+            ("TypedIndex", [0], []),
+        ]))
+    layer = ("Layer", [0], [("Version", [100], [])] + layer_elements)
+
+    geometry_children = [
+        ("GeometryVersion", [124], []),
+        ("Vertices", [verts_cm], []),
+        ("PolygonVertexIndex", [np.asarray(pvi, dtype=np.int32)], []),
+        normal_layer,
+    ]
+    if material_layer is not None:
+        geometry_children.append(material_layer)
+    geometry_children.append(layer)
+    geometry = ("Geometry", [GID, f"Geometry::{name}", "Mesh"], geometry_children)
+
+    model = ("Model", [MODEL_ID, f"Model::{name}", "Mesh"], [
+        ("Version", [232], []),
+        ("Shading", [True], []),
+        ("Culling", ["CullingOff"], []),
+    ])
+
+    materials = []
+    for mat_id, color in zip(mat_ids, palette):
+        r, g, b = (color / 255.0).tolist()
+        materials.append(("Material", [mat_id, f"Material::{name}_{mat_id}", ""], [
+            ("Version", [102], []),
+            ("ShadingModel", ["Lambert"], []),
+            ("MultiLayer", [0], []),
+            ("Properties70", [], [
+                ("P", ["DiffuseColor", "Color", "", "A", r, g, b], []),
+            ]),
+        ]))
+
+    objects = ("Objects", [], [geometry, model] + materials)
+    connections = ("Connections", [], [
+        ("C", ["OO", GID, MODEL_ID], []),
+    ] + [("C", ["OO", mat_id, MODEL_ID], []) for mat_id in mat_ids])
+
+    header = b"Kaydara FBX Binary  \x00\x1a\x00" + struct.pack("<I", _FBX_VERSION)
+    pos = len(header)
+    body = b""
+    for node in (header_ext, global_settings, definitions, objects, connections):
+        chunk = _encode_node(node, pos)
+        body += chunk
+        pos += len(chunk)
+    body += b"\x00" * 13  # top-level null sentinel; our parser stops here
+
+    footer = _FOOTER_ID
+    pad = (-(len(footer)) - 4) % 16  # pad so [footer_id|pad|version] lands on 16
+    footer += b"\x00" * pad
+    footer += struct.pack("<I", _FBX_VERSION)
+    footer += b"\x00" * 120
+    footer += _FOOTER_EXT
+    footer += b"\x00" * 4
+
+    with open(path, "wb") as fh:
+        fh.write(header + body + footer)
+
+
+def export_asset_fbx(asset_def, path: str) -> None:
+    """Export a content-browser asset's mesh to `path` as binary FBX.
+
+    Raises ValueError if the asset has no mesh (lights-only, fog volumes).
+    Procedural primitives (cube, cylinder, ...) are instantiated first so
+    their actual vertices/faces are written, same as imported .npz models.
+    """
+    if not has_mesh(asset_def):
+        raise ValueError(f"asset '{asset_def.name}' has no mesh to export")
+    entity = asset_def.instantiate()
+    export_fbx(entity.mesh, path, name=asset_def.name.replace(" ", "_"))
+
+
+def has_mesh(asset_def) -> bool:
+    """Whether an AssetDef's definition contains mesh geometry to export."""
+    return "mesh" in asset_def.data
