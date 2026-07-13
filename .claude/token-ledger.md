@@ -34,3 +34,5 @@ death never loses more than one milestone.
 | 2026-07-12 | PBR OpenGL parity (PBR 2/3) | 135,531 | completed clean under budget; judged + squash-merged 53db243. Naming all ten suites in the brief worked â€” full battery run |
 | 2026-07-12 | PBR wgpu parity (PBR 3/3) | 140,209 | completed clean under budget; judged + squash-merged c314422. 3-way parity diffs exactly 0.0; also fixed latent missing-PI WGSL bug and flagged stale line in engine-coder.md (supervisor corrected it) |
 | 2026-07-13 | DX12 default renderer (CPU opt-in) | 82,477 | completed clean under budget; judged + squash-merged 2df73cd. User preference saved to supervisor memory |
+| 2026-07-13 | Material editor UX (UE menus + preview panel) | 164,685 cumulative (incl. send-back) | completed; 1 cosmetic finding (overlapping menu text) fixed on send-back; judged + squash-merged 79dc8a9 |
+| 2026-07-13 | Material types + transparency (2 agents: checkpoint stop at M2 + fresh finisher) | 148,601 + 194,948 | completed; judged + squash-merged a284f06. Checkpoint protocol worked exactly as designed — clean stop, fresh resume from HANDOFF, zero waste |
