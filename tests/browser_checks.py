@@ -26,13 +26,22 @@ eng = engine.Engine(1440, 810, title="judge", splash=False, api="cpu")
 lib = fresh_lib()
 camera = engine.Camera(position=engine.Vec3(6.0, 2.6, 9.0), yaw=0.45, pitch=-0.08)
 scene = build_starter_scene(engine, lib)
-editor = Editor(engine, eng, scene, camera, lib, "scenes/scene.json")
+TEST_SETTINGS = os.path.join(tempfile.gettempdir(), "judge_browser_settings.json")
+editor = Editor(engine, eng, scene, camera, lib, "scenes/scene.json",
+               settings_path=TEST_SETTINGS)
 W, H = eng.screen.get_size()
 
-# make sure a stray manifest from a previous failed run doesn't poison this one
+# Preserve any real folders.json this suite finds -- a prior version of this
+# script deleted it unconditionally at start and only removed the test-built
+# one at the end, silently discarding a real user manifest if one existed.
+# Now: back it up and restore it verbatim in `finally`, whether or not the
+# suite passes.
 folders_manifest = os.path.join(ASSETS_DIR, "folders.json")
 had_manifest = os.path.exists(folders_manifest)
+_manifest_backup = None
 if had_manifest:
+    with open(folders_manifest, "rb") as f:
+        _manifest_backup = f.read()
     os.remove(folders_manifest)
     lib.reload()
 
@@ -321,6 +330,11 @@ try:
     print("screenshot saved")
 
 finally:
-    # always leave the assets dir clean, even on assertion failure
+    # always leave the assets dir clean, even on assertion failure -- and
+    # restore any real manifest that was here before this suite ran instead
+    # of just deleting it.
     if os.path.exists(folders_manifest):
         os.remove(folders_manifest)
+    if _manifest_backup is not None:
+        with open(folders_manifest, "wb") as f:
+            f.write(_manifest_backup)

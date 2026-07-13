@@ -28,6 +28,18 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 
+
+def default_settings_path() -> str:
+    """Repo-root settings.json, unless PYENGINE_SETTINGS points elsewhere.
+
+    Headless test suites set PYENGINE_SETTINGS to a temp-dir file so they
+    never read/write the user's real settings.json — every UI action that
+    tweaks layout calls _save_settings(), and a test run driving hundreds
+    of those would otherwise clobber the user's saved window layout with
+    mid-test fixture state.
+    """
+    return os.environ.get("PYENGINE_SETTINGS", SETTINGS_PATH)
+
 MENU_H = 26
 PANEL_TITLE_H = 18
 EDGE_SNAP = 48
@@ -75,19 +87,21 @@ RESOLUTIONS = ((1280, 720), (1440, 810), (1600, 900), (1920, 1080))
 SETTINGS_SIZE = (380, 246)
 
 
-def load_settings() -> dict:
-    if not os.path.exists(SETTINGS_PATH):
+def load_settings(path: str | None = None) -> dict:
+    path = path or default_settings_path()
+    if not os.path.exists(path):
         return {}
     try:
-        with open(SETTINGS_PATH, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def save_settings(data: dict) -> None:
+def save_settings(data: dict, path: str | None = None) -> None:
+    path = path or default_settings_path()
     try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except OSError:
         pass
@@ -198,7 +212,8 @@ class Editor:
         "Window": {"Fullscreen": "F11"},
     }
 
-    def __init__(self, engine_mod, eng, scene, camera, lib, scene_path):
+    def __init__(self, engine_mod, eng, scene, camera, lib, scene_path,
+                settings_path=None):
         import pygame
         self.engine_mod = engine_mod
         self.eng = eng
@@ -206,6 +221,10 @@ class Editor:
         self.camera = camera
         self.lib = lib
         self.scene_path = scene_path
+        # settings_path is injectable (else PYENGINE_SETTINGS env var, else
+        # repo-root settings.json) so tests can point it at a temp file and
+        # never touch the user's real one -- see default_settings_path().
+        self.settings_path = settings_path or default_settings_path()
         self.selected = None
         self.flashlight = None      # set by main(); hidden from glyphs
         self.fly = None             # the viewport FlyController, for C toggle
@@ -1102,17 +1121,52 @@ class Editor:
         self.panel_drag = {"id": pid, "dx": mp[0] - rect.x, "dy": mp[1] - rect.y,
                            "w": fw, "h": fh}
 
+    def _dock_zone_rect(self, side, w, h, layout):
+        """Rect used for BOTH drop-zone hit-testing (`_finish_panel_drag`) and
+        the hover-highlight drawn while dragging (`_draw_panel_drag_zone`) --
+        one source of truth, per the house rule against hit-test/draw drift.
+
+        If `side` already has a dock, the zone is that dock's full band --
+        drop anywhere over an existing side/bottom dock and it re-docks there,
+        not just within a thin edge strip. If the side has no dock yet, the
+        zone is an edge strip sized to whichever is larger: EDGE_SNAP or 4% of
+        the window's relevant dimension, so a big/fullscreen window doesn't
+        make docking feel broken (a real user complaint -- EDGE_SNAP=48px is
+        a sliver on a 2560px-wide window)."""
+        import pygame
+        if side == "left":
+            width = layout["left_w"] or max(EDGE_SNAP, int(w * 0.04))
+            return pygame.Rect(0, MENU_H, width, max(0, h - MENU_H))
+        if side == "right":
+            width = layout["right_w"] or max(EDGE_SNAP, int(w * 0.04))
+            return pygame.Rect(w - width, MENU_H, width, max(0, h - MENU_H))
+        if side == "bottom":
+            height = layout["bottom_h"] or max(EDGE_SNAP, int(h * 0.04))
+            return pygame.Rect(0, h - height, w, height)
+        raise ValueError(side)
+
+    def _panel_drag_target_side(self, pid, mp, w, h, layout):
+        """Which dock zone (if any) a drag of `pid` is currently over -- used
+        both to decide where a drop docks and to draw the hover highlight."""
+        if pid in ("outliner", "details"):
+            if self._dock_zone_rect("left", w, h, layout).collidepoint(mp):
+                return "left"
+            if self._dock_zone_rect("right", w, h, layout).collidepoint(mp):
+                return "right"
+        elif pid == "browser":
+            if self._dock_zone_rect("bottom", w, h, layout).collidepoint(mp):
+                return "bottom"
+        return None
+
     def _finish_panel_drag(self, mp, w, h) -> None:
         import pygame
         g = self.panel_drag
         pid = g["id"]
         gx, gy = mp[0] - g["dx"], mp[1] - g["dy"]
-        if pid in ("outliner", "details") and mp[0] <= EDGE_SNAP:
-            self._dock_panel(pid, "left")
-        elif pid in ("outliner", "details") and mp[0] >= w - EDGE_SNAP:
-            self._dock_panel(pid, "right")
-        elif pid == "browser" and mp[1] >= h - EDGE_SNAP:
-            self._dock_panel(pid, "bottom")
+        layout = self._layout(w, h)
+        side = self._panel_drag_target_side(pid, mp, w, h, layout)
+        if side is not None:
+            self._dock_panel(pid, side)
         else:
             self.float_rect[pid] = pygame.Rect(gx, gy, g["w"], g["h"])
             self._dock_panel(pid, "float")
@@ -1337,7 +1391,7 @@ class Editor:
         }
 
     def _save_settings(self) -> None:
-        save_settings(self._settings_dict())
+        save_settings(self._settings_dict(), self.settings_path)
 
     def _apply_layout_settings(self, data: dict) -> None:
         import pygame
@@ -2036,6 +2090,18 @@ class Editor:
                 self._draw_panel(surf, pid, panels[pid])
         if drag_pid is not None and drag_pid in panels:
             self._draw_panel(surf, drag_pid, panels[drag_pid])
+            # highlight the dock zone (if any) the drag is hovering, on top
+            # of every panel (including docked ones already occupying that
+            # zone) so it stays visible while dragging over an existing
+            # dock -- same rect `_finish_panel_drag` uses to decide the
+            # actual drop, so the highlight never lies about where it lands
+            side = self._panel_drag_target_side(drag_pid, mp, w, h, layout)
+            if side is not None:
+                zone = self._dock_zone_rect(side, w, h, layout)
+                hl = pygame.Surface((zone.width, zone.height), pygame.SRCALPHA)
+                hl.fill((*ACCENT, 60))
+                surf.blit(hl, zone.topleft)
+                pygame.draw.rect(surf, ACCENT, zone, 2)
 
         if self.drag_asset is not None:
             icon = self.icons.get(self.drag_asset.name)
@@ -2849,6 +2915,11 @@ def main() -> None:
                         help="alias for --api gl (force the OpenGL/moderngl renderer)")
     parser.add_argument("--cpu", action="store_true",
                         help="alias for --api cpu (force the software renderer)")
+    parser.add_argument("--settings-path", default=None,
+                        help="override settings.json location (else "
+                             "PYENGINE_SETTINGS env var, else repo-root "
+                             "settings.json); use for tests/headless runs so "
+                             "they don't touch the user's real settings")
     args = parser.parse_args()
 
     if args.headless:
@@ -2857,7 +2928,8 @@ def main() -> None:
     import engine
     import pygame
 
-    settings = load_settings()
+    settings_path = args.settings_path or default_settings_path()
+    settings = load_settings(settings_path)
     width = args.width if args.width is not None else settings.get("width", 1440)
     height = args.height if args.height is not None else settings.get("height", 810)
     pixel_scale = (args.pixel_scale if args.pixel_scale is not None
@@ -2892,7 +2964,8 @@ def main() -> None:
     else:
         scene = build_starter_scene(engine, lib)
 
-    editor = Editor(engine, eng, scene, camera, lib, args.scene)
+    editor = Editor(engine, eng, scene, camera, lib, args.scene,
+                   settings_path=settings_path)
     editor._apply_layout_settings(settings)
     if settings_api in ("auto", "cpu", "gl", "dx12", "vulkan"):
         # show the saved preference even if it didn't match what actually ran

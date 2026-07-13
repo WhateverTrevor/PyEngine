@@ -19,7 +19,9 @@ eng = engine.Engine(1440, 810, title="judge", splash=False, api="cpu")
 lib = engine.AssetLibrary(os.path.join(WT, "assets"))
 camera = engine.Camera(position=engine.Vec3(6.0, 2.6, 9.0), yaw=0.45, pitch=-0.08)
 scene = build_starter_scene(engine, lib)
-editor = Editor(engine, eng, scene, camera, lib, "scenes/scene.json")
+TEST_SETTINGS = os.path.join(tempfile.gettempdir(), "judge_toolbar_settings.json")
+editor = Editor(engine, eng, scene, camera, lib, "scenes/scene.json",
+               settings_path=TEST_SETTINGS)
 W, H = eng.screen.get_size()
 
 crate = next(e for e in scene.entities if e.asset_name == "Crate")

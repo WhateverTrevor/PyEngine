@@ -15,11 +15,23 @@ from editor import (DOCK_FRAC_DEFAULT, Editor, EditorBehavior, MaterialEditorUI,
 
 OUT = os.path.join(tempfile.gettempdir(), "judge_winmgmt.png")
 
+# Guard against the real settings.json: several actions below (_dock_panel,
+# fullscreen toggle, etc.) call editor._save_settings(). Every Editor built
+# in this suite gets an isolated temp-dir settings file so the user's real
+# settings.json is never touched -- verified byte-identical at the end.
+REAL_SETTINGS = os.path.join(WT, "settings.json")
+_real_before = (open(REAL_SETTINGS, "rb").read()
+               if os.path.exists(REAL_SETTINGS) else None)
+TEST_SETTINGS = os.path.join(tempfile.gettempdir(), "judge_winmgmt_settings.json")
+if os.path.exists(TEST_SETTINGS):
+    os.remove(TEST_SETTINGS)
+
 eng = engine.Engine(1440, 810, title="judge", splash=False, api="cpu")
 lib = engine.AssetLibrary(os.path.join(WT, "assets"))
 camera = engine.Camera(position=engine.Vec3(6.0, 2.6, 9.0), yaw=0.45, pitch=-0.08)
 scene = build_starter_scene(engine, lib)
-editor = Editor(engine, eng, scene, camera, lib, "scenes/scene.json")
+editor = Editor(engine, eng, scene, camera, lib, "scenes/scene.json",
+               settings_path=TEST_SETTINGS)
 W, H = eng.screen.get_size()
 
 # 1. minimize a docked panel: it collapses to its title bar, sibling grows
@@ -58,7 +70,8 @@ print("reset layout OK: visibility, minimize, floating all restored")
 # 5. settings round-trip includes minimized state
 editor.panel_minimized["outliner"] = True
 data = editor._settings_dict()
-editor2 = Editor(engine, eng, scene, camera, lib, "scenes/scene.json")
+editor2 = Editor(engine, eng, scene, camera, lib, "scenes/scene.json",
+                 settings_path=TEST_SETTINGS)
 editor2._apply_layout_settings(data)
 assert editor2.panel_minimized["outliner"] is True
 print("settings round-trip OK: minimized state persists")
@@ -136,10 +149,38 @@ editor.dock_frac["left"] = 0.33
 data2 = editor._settings_dict()
 assert data2["fullscreen"] is False
 assert abs(data2["dock_frac"]["left"] - 0.33) < 1e-9
-editor3 = Editor(engine, eng, scene, camera, lib, "scenes/scene.json")
+editor3 = Editor(engine, eng, scene, camera, lib, "scenes/scene.json",
+                 settings_path=TEST_SETTINGS)
 editor3._apply_layout_settings(data2)
 assert abs(editor3.dock_frac["left"] - 0.33) < 1e-9
 print("settings round-trip OK: dock_frac + fullscreen persist")
+
+# 12. dock-zone drop math: drop over the right dock's band docks there even
+# far from the literal edge (the old EDGE_SNAP=48px-from-edge rule read as
+# "docking is broken" on large windows); drop mid-viewport floats instead
+editor._dock_panel("details", "float")
+lay9 = editor._layout(W, H)
+drect2 = lay9["panels"]["details"]
+editor._begin_panel_drag("details", (drect2.x, drect2.y), drect2)
+right_zone = editor._dock_zone_rect("right", W, H, lay9)
+mid_right = (right_zone.centerx, right_zone.centery)
+side = editor._panel_drag_target_side("details", mid_right, W, H, lay9)
+assert side == "right", side
+editor._finish_panel_drag(mid_right, W, H)
+assert "details" in editor.dock_order["right"], editor.dock_order
+print("dock-zone drop OK: dropping over the right dock's band docks there")
+
+editor._dock_panel("details", "float")
+lay10 = editor._layout(W, H)
+drect3 = lay10["panels"]["details"]
+editor._begin_panel_drag("details", (drect3.x, drect3.y), drect3)
+viewport_mid = (lay10["viewport"].centerx, lay10["viewport"].centery)
+side2 = editor._panel_drag_target_side("details", viewport_mid, W, H, lay10)
+assert side2 is None, side2
+editor._finish_panel_drag(viewport_mid, W, H)
+assert "details" in editor.floating, editor.floating
+print("dock-zone drop OK: dropping mid-viewport floats instead of docking")
+editor._dock_panel("details", "right")  # restore for the screenshot below
 
 # screenshot: details minimized (docked), Window menu open showing registry
 editor.panel_minimized["details"] = True
@@ -156,3 +197,11 @@ scene.add(engine.Entity("__editor").add_behavior(EditorBehavior(editor)))
 eng.esc_handler = editor.handle_escape
 eng.run(scene, camera, max_frames=30, screenshot_path=OUT, overlay=editor.draw)
 print("screenshot saved")
+
+# no-pollution guard: the real settings.json must be untouched by this suite
+_real_after = (open(REAL_SETTINGS, "rb").read()
+              if os.path.exists(REAL_SETTINGS) else None)
+assert _real_after == _real_before, (
+    "window_checks touched the real settings.json -- an Editor() in this "
+    "suite is missing settings_path=TEST_SETTINGS")
+print("no-pollution guard OK: real settings.json untouched by this suite")
