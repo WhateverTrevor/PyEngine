@@ -34,7 +34,8 @@ assert toolbar_rect.x == layout["viewport"].x and toolbar_rect.y == layout["view
 assert toolbar_rect.width == layout["viewport"].width
 rects = editor._toolbar_button_rects(toolbar_rect)
 labels = [b["id"] for b, _ in rects]
-assert labels == ["translate", "rotate", "scale", "space", "snap_toggle", "snap_inc"]
+assert labels == ["translate", "rotate", "scale", "space", "pivot_mode",
+                  "snap_toggle", "snap_inc"]
 # rects are strictly left-to-right, non-overlapping
 for (b0, r0), (b1, r1) in zip(rects, rects[1:]):
     assert r1.x >= r0.right, (b0["id"], b1["id"], r0, r1)

@@ -305,6 +305,9 @@ class Editor:
         self.gizmo_drag = None      # active gizmo drag state dict
         self.gizmo_mode = "translate"  # W/E/R select translate / rotate / scale
         self.gizmo_space = "world"  # translate axes: "world" or "local" (viewport toolbar)
+        self.pivot_mode = "median"  # rotate/scale pivot for multi-selections (viewport
+                                     # toolbar): "median" / "bbox" / "active" / "individual"
+                                     # -- see _pivot_point. Translate is pivot-independent.
         self.snap_enabled = False   # viewport toolbar snap toggle (grid/interval snapping)
         self.snap_index = {"translate": 0, "rotate": 0, "scale": 0}  # cycled per mode
         self.snap_feedback = None   # (other_entity, axis_idx, plane, lo2, hi2) while a
@@ -416,6 +419,66 @@ class Editor:
         y = sum(e.transform.position.y for e in self.selection) / n
         z = sum(e.transform.position.z for e in self.selection) / n
         return Vec3(x, y, z)
+
+    def _selection_bbox_center(self):
+        """Center of the combined world AABB across every selected entity
+        that has a mesh -- (min+max)/2 of the union of each entity's
+        _world_aabb (Blender's "Bounding Box Center" pivot mode). None if
+        no selected entity has a mesh, in which case _pivot_point falls
+        back to Median Point.
+        """
+        import numpy as np
+        mins, maxs = [], []
+        for e in self.selection:
+            aabb = self._world_aabb(e)
+            if aabb is None:
+                continue
+            lo, hi = aabb
+            mins.append(lo)
+            maxs.append(hi)
+        if not mins:
+            return None
+        lo = np.min(np.array(mins), axis=0)
+        hi = np.max(np.array(maxs), axis=0)
+        c = (lo + hi) / 2.0
+        return self.engine_mod.Vec3(float(c[0]), float(c[1]), float(c[2]))
+
+    def _pivot_point(self):
+        """World-space anchor for the gizmo widget AND the rigid-group
+        orbit/scale center used by rotate/scale drags (translate is pivot-
+        independent), chosen by self.pivot_mode:
+          median     -- mean of selected origins (_selection_pivot; v1's
+                         only mode, still the default)
+          bbox       -- center of the selection's combined world AABB
+                         (_selection_bbox_center)
+          active     -- the active (last-selected) entity's own origin
+          individual -- no single group pivot; each entity rotates/scales
+                         about ITSELF (see _update_gizmo_drag /
+                         _apply_group_scale) -- the widget itself is still
+                         drawn at the median, matching Blender
+
+        A single-entity selection always reduces to that entity's own
+        origin for every mode -- median/individual/active trivially do
+        (the lone entity IS the mean AND the active element), but bbox
+        needs an explicit special case: a mesh's local AABB is not
+        generally centered on the entity's origin (e.g. base_height meshes
+        sit with their BOTTOM, not their center, at local y=0), so without
+        this a single selected entity's gizmo would jump off its origin
+        under Bounding Box Center, breaking "single-select is unchanged".
+        """
+        if not self.selection:
+            return None
+        if len(self.selection) == 1:
+            p = self.selection[0].transform.position
+            return self.engine_mod.Vec3(p.x, p.y, p.z)
+        if self.pivot_mode == "active" and self.selected is not None:
+            p = self.selected.transform.position
+            return self.engine_mod.Vec3(p.x, p.y, p.z)
+        if self.pivot_mode == "bbox":
+            c = self._selection_bbox_center()
+            if c is not None:
+                return c
+        return self._selection_pivot()
 
     # ---- layout: the single source of truth for panel/viewport rects ----
     def _float_rect_for(self, pid, w, h):
@@ -715,6 +778,22 @@ class Editor:
     def _toggle_gizmo_space(self) -> None:
         self.gizmo_space = "local" if self.gizmo_space == "world" else "world"
 
+    # pivot mode: Blender's Median Point / Bounding Box Center / Active
+    # Element / Individual Origins, cycled by one toolbar button (see
+    # _toolbar_buttons) and applied by _pivot_point / _update_gizmo_drag /
+    # _apply_group_scale.
+    _PIVOT_MODES = ("median", "bbox", "active", "individual")
+    _PIVOT_LABELS = {"median": "Median Point", "bbox": "Bounding Box",
+                     "active": "Active Element", "individual": "Individual Origins"}
+
+    def _cycle_pivot_mode(self) -> None:
+        i = self._PIVOT_MODES.index(self.pivot_mode)
+        self.pivot_mode = self._PIVOT_MODES[(i + 1) % len(self._PIVOT_MODES)]
+        self._save_settings()
+
+    def _pivot_label(self) -> str:
+        return self._PIVOT_LABELS[self.pivot_mode]
+
     # increments cyclable per gizmo mode: translate/scale are linear units,
     # rotate is degrees (converted to radians where applied to Transform.rotation)
     _SNAP_INCREMENTS = {
@@ -771,6 +850,9 @@ class Editor:
                                      else "Local", "group_gap": True,
              "active": lambda: self.gizmo_space == "local",
              "action": self._toggle_gizmo_space},
+            {"id": "pivot_mode", "label": self._pivot_label, "group_gap": True,
+             "active": lambda: False,
+             "action": self._cycle_pivot_mode},
             {"id": "snap_toggle", "label": "Snap", "group_gap": True,
              "active": lambda: self.snap_enabled,
              "action": self._toggle_snap},
@@ -850,6 +932,24 @@ class Editor:
         return [((float(rot[0, i]), float(rot[1, i]), float(rot[2, i])),
                  self._GIZMO_AXES[i][1]) for i in range(3)]
 
+    @staticmethod
+    def _axis_rotation_matrix(axis_i, angle):
+        """3x3 rotation matrix for `angle` radians about world axis `axis_i`
+        (0=X / 1=Y / 2=Z) -- the same per-axis forms as _local_axis_defs's
+        rx/ry/rz. Used to orbit a rigid-group multi-selection's positions
+        about the gizmo pivot in lockstep with the identical Euler-component
+        delta each entity's own rotation gets (see _update_gizmo_drag);
+        rotate rings are always world-axis (_gizmo_rings uses _GIZMO_AXES
+        directly, never _axis_defs), so this never needs a local variant.
+        """
+        import numpy as np
+        c, s = math.cos(angle), math.sin(angle)
+        if axis_i == 0:
+            return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+        if axis_i == 1:
+            return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
     def _axis_defs(self, e):
         """Axis set to use for the current mode/space. Local space only makes
         sense for translate: scale already operates on transform.scale, which
@@ -863,7 +963,7 @@ class Editor:
     def _gizmo_center(self, w, h):
         if not self.selection:
             return None, None, None
-        p = self._selection_pivot()
+        p = self._pivot_point()
         dist = (p - self.camera.position).length()
         length = max(0.6, dist * 0.14)
         s0 = self.camera.project(p, w, h)
@@ -941,7 +1041,7 @@ class Editor:
         mode = self.gizmo_mode
         t, s = e.transform, e.transform.scale
         if mode == "rotate":
-            _p, s0, _len = self._gizmo_center(w, h)
+            p, s0, _len = self._gizmo_center(w, h)
             best = None
             for i, axis, pts, _c in self._gizmo_rings(w, h):
                 for a, b in zip(pts, pts[1:]):
@@ -954,7 +1054,10 @@ class Editor:
                 return False
             # duplicate now that a ring hit is confirmed -- the dup starts at
             # the exact same transform, so the already-computed center/rings
-            # (projected off the original) stay valid for it unchanged
+            # (projected off the original) stay valid for it unchanged. Alt
+            # on a multi-selection duplicates the WHOLE selection (see
+            # _duplicate_selected), so self.selection below is already the
+            # dup list -- the group rotates together in _update_gizmo_drag.
             e = self._alt_duplicate_for_drag(inp)
             t = e.transform
             _d, i, axis = best
@@ -965,15 +1068,32 @@ class Editor:
                 "mode": "rotate", "axis_i": i, "center": (s0[0], s0[1]),
                 "a0": math.atan2(mp[1] - s0[1], mp[0] - s0[0]),
                 "sign": -1.0 if toward else 1.0,
-                "start": (t.rotation.x, t.rotation.y, t.rotation.z)}
+                "start": (t.rotation.x, t.rotation.y, t.rotation.z),
+                "pivot": (p.x, p.y, p.z),
+                # per-entity (position, rotation) at grab time -- lets a
+                # multi-selection rotate as a rigid group about the pivot
+                # (see _update_gizmo_drag); absent on hand-built gizmo_drag
+                # dicts in older direct-call tests, which fall back to
+                # active-only, matching pre-pivot-mode behavior exactly
+                "starts": {id(ent): (
+                    (ent.transform.position.x, ent.transform.position.y,
+                     ent.transform.position.z),
+                    (ent.transform.rotation.x, ent.transform.rotation.y,
+                     ent.transform.rotation.z)) for ent in self.selection}}
             return True
 
         handles = self._gizmo_handles(w, h)
         if mode == "scale":
-            _p, s0, _len = self._gizmo_center(w, h)
+            p, s0, _len = self._gizmo_center(w, h)
             if s0 is not None and math.hypot(mp[0] - s0[0], mp[1] - s0[1]) < 10:
-                self.gizmo_drag = {"mode": "scale", "axis_i": -1, "press": mp,
-                                   "start": (s.x, s.y, s.z)}
+                self.gizmo_drag = {
+                    "mode": "scale", "axis_i": -1, "press": mp,
+                    "start": (s.x, s.y, s.z), "pivot": (p.x, p.y, p.z),
+                    "starts": {id(ent): (
+                        (ent.transform.position.x, ent.transform.position.y,
+                         ent.transform.position.z),
+                        (ent.transform.scale.x, ent.transform.scale.y,
+                         ent.transform.scale.z)) for ent in self.selection}}
                 return True
         best = None
         for i, axis, s0, s1, _color, length in handles:
@@ -1001,10 +1121,71 @@ class Editor:
             self.gizmo_drag["starts"] = {
                 id(ent): (ent.transform.position.x, ent.transform.position.y,
                           ent.transform.position.z) for ent in self.selection}
+        elif mode == "scale":
+            # per-entity (position, scale) at grab time, plus the pivot `p`
+            # already computed above for the center-hit-test -- lets a
+            # multi-selection scale as a rigid group (see
+            # _apply_group_scale). Scale never Alt-duplicates (out of spec
+            # scope, unlike translate/rotate), so no post-dup recapture
+            # needed here.
+            self.gizmo_drag["pivot"] = (p.x, p.y, p.z)
+            self.gizmo_drag["starts"] = {id(ent): (
+                (ent.transform.position.x, ent.transform.position.y,
+                 ent.transform.position.z),
+                (ent.transform.scale.x, ent.transform.scale.y,
+                 ent.transform.scale.z)) for ent in self.selection}
         return True
+
+    def _apply_group_scale(self, g, factor, uniform) -> None:
+        """Apply a scale `factor` (uniform: all 3 axes; per-axis: only
+        g['axis_i']) to every entity captured in g['starts'] at grab time,
+        honoring the active pivot mode: Individual Origins scales each
+        entity about its OWN origin (positions untouched); every other
+        mode (or a single-entity selection, which always reduces to
+        "about your own origin" regardless of mode -- see _pivot_point)
+        scales the whole selection as a rigid group about g['pivot']
+        (p' = pivot + factor*(p - pivot); for a per-axis drag only the
+        scaled coordinate moves, since scale's world-space handles are
+        always axis-aligned -- see _axis_defs). Falls back to the
+        pre-pivot-mode active-only behavior when 'starts'/'pivot' are
+        absent (hand-built gizmo_drag dicts in older direct-call tests).
+        """
+        Vec3 = self.engine_mod.Vec3
+        starts = g.get("starts")
+        pivot = g.get("pivot")
+        axis_i = g.get("axis_i", -1)
+        if not starts or pivot is None:
+            e = self.selected
+            s = list(g["start"])
+            if uniform:
+                e.transform.scale = Vec3(s[0] * factor, s[1] * factor, s[2] * factor)
+            else:
+                s[axis_i] = s[axis_i] * factor
+                e.transform.scale = Vec3(*s)
+            return
+        rigid = len(self.selection) > 1 and self.pivot_mode != "individual"
+        for ent in self.selection:
+            st = starts.get(id(ent))
+            if st is None:
+                continue  # joined the selection after the drag began
+            pos, sc = st
+            if uniform:
+                new_scale = [sc[0] * factor, sc[1] * factor, sc[2] * factor]
+            else:
+                new_scale = list(sc)
+                new_scale[axis_i] = sc[axis_i] * factor
+            ent.transform.scale = Vec3(*new_scale)
+            if rigid:
+                new_pos = list(pos)
+                if uniform:
+                    new_pos = [pivot[i] + factor * (pos[i] - pivot[i]) for i in range(3)]
+                else:
+                    new_pos[axis_i] = pivot[axis_i] + factor * (pos[axis_i] - pivot[axis_i])
+                ent.transform.position = Vec3(*new_pos)
 
     def _update_gizmo_drag(self, mp, inp) -> None:
         import pygame
+        import numpy as np
         g = self.gizmo_drag
         Vec3 = self.engine_mod.Vec3
         e = self.selected
@@ -1013,20 +1194,51 @@ class Editor:
             cx, cy = g["center"]
             ang = math.atan2(mp[1] - cy, mp[0] - cx)
             delta = (ang - g["a0"]) * g["sign"]
-            r = list(g["start"])
-            new_val = r[g["axis_i"]] + delta
+            axis_i = g["axis_i"]
+            start = g["start"]
+            new_val = start[axis_i] + delta
             if snap:
                 new_val = self._quantize(new_val, math.radians(self._snap_increment("rotate")))
-            r[g["axis_i"]] = new_val
-            e.transform.rotation = Vec3(*r)
+                # re-derive delta from the snapped value BEFORE the group loop
+                # below so every entity's orbit + own-rotation increment uses
+                # the exact same final (snapped) delta as the active entity
+                delta = new_val - start[axis_i]
+            starts = g.get("starts")
+            if not starts:
+                # hand-built gizmo_drag dict (older direct-call test): active
+                # entity only, matching pre-pivot-mode behavior exactly
+                r = list(start)
+                r[axis_i] = new_val
+                e.transform.rotation = Vec3(*r)
+                self.dirty = True
+                return
+            pivot = g["pivot"]
+            # rigid-group orbit applies for every mode except Individual
+            # Origins, and only when there's more than one entity to begin
+            # with -- a single-entity selection always reduces to "rotate
+            # about your own origin", i.e. no position change at all, for
+            # every pivot mode (see _pivot_point's single-select shortcut)
+            rigid = len(self.selection) > 1 and self.pivot_mode != "individual"
+            R = self._axis_rotation_matrix(axis_i, delta) if rigid else None
+            for ent in self.selection:
+                st = starts.get(id(ent))
+                if st is None:
+                    continue  # joined the selection after the drag began
+                pos, rot = st
+                nr = list(rot)
+                nr[axis_i] = rot[axis_i] + delta
+                ent.transform.rotation = Vec3(*nr)
+                if rigid:
+                    off = np.array(pos) - np.array(pivot)
+                    new_off = R @ off
+                    ent.transform.position = Vec3(*(np.array(pivot) + new_off))
             self.dirty = True
             return
         if g["mode"] == "scale" and g["axis_i"] == -1:
             factor = max(0.05, 1.0 + (mp[0] - g["press"][0]) * 0.004)
             if snap:
                 factor = max(0.05, self._quantize(factor, self._snap_increment("scale")))
-            s = g["start"]
-            e.transform.scale = Vec3(s[0] * factor, s[1] * factor, s[2] * factor)
+            self._apply_group_scale(g, factor, uniform=True)
             self.dirty = True
             return
         dx, dy = g["dpx"]
@@ -1084,12 +1296,10 @@ class Editor:
                 ent.transform.position = Vec3(es[0] + delta[0], es[1] + delta[1],
                                               es[2] + delta[2])
         else:  # per-axis scale
-            s = list(g["start"])
             factor = max(0.05, 1.0 + t)
             if snap:
                 factor = max(0.05, self._quantize(factor, self._snap_increment("scale")))
-            s[g["axis_i"]] = s[g["axis_i"]] * factor
-            e.transform.scale = Vec3(*s)
+            self._apply_group_scale(g, factor, uniform=False)
         self.dirty = True
 
     # ---- details panel rows for the selected light / sun / fog volume ----
@@ -1743,6 +1953,7 @@ class Editor:
             "dock_frac": dict(self.dock_frac),
             "snap_enabled": self.snap_enabled,
             "snap_index": dict(self.snap_index),
+            "pivot_mode": self.pivot_mode,
         }
 
     def _save_settings(self) -> None:
@@ -1757,9 +1968,15 @@ class Editor:
                 if isinstance(v, int) and 0 <= v < len(incs):
                     self.snap_index[mode] = v
 
+    def _apply_pivot_settings(self, data: dict) -> None:
+        mode = data.get("pivot_mode")
+        if mode in self._PIVOT_MODES:
+            self.pivot_mode = mode
+
     def _apply_layout_settings(self, data: dict) -> None:
         import pygame
         self._apply_snap_settings(data)
+        self._apply_pivot_settings(data)
         valid = {"outliner", "details", "browser"}
         dock_order = data.get("dock_order", {})
         left = [p for p in dock_order.get("left", []) if p in ("outliner", "details")]
