@@ -11,8 +11,9 @@
 Controls (Help > Controls in the editor shows the full list):
     RMB hold        mouse look + WASD/QE/Space/Ctrl fly (Unreal-style: these
                     movement keys only act while RMB is held), Shift = fast
-    LMB             select in viewport/outliner; drag assets; drag the gizmo;
-                    drag panel title bars to move/dock/float them
+    LMB             select in viewport/outliner (Shift+click extends/toggles
+                    a multi-selection, last-clicked = active); drag assets;
+                    drag the gizmo; drag panel title bars to move/dock/float
     W/E/R           gizmo translate/rotate/scale (only while not looking)
     F               focus camera on selection (only while not looking)
     Ctrl+D          duplicate selection        Del  delete selection
@@ -75,9 +76,11 @@ PANEL_BG = (22, 24, 29)
 PANEL_EDGE = (58, 62, 72)
 TEXT = (210, 212, 218)
 TEXT_DIM = (140, 143, 152)
-SELECT_BG = (47, 66, 102)
+SELECT_BG = (47, 66, 102)        # ACTIVE element -- unchanged from pre-multiselect
+SELECT_BG_MULTI = (33, 45, 66)   # additional (non-active) members of a multi-selection
 HOVER_BG = (36, 39, 47)
 ACCENT = (255, 170, 60)
+ACCENT_DIM = (150, 108, 45)      # viewport selection bracket for non-active members
 SNAP_FACE_COLOR = (90, 220, 230)  # highlighted face during Shift-drag snap-to-mesh
 
 PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
@@ -279,7 +282,11 @@ class Editor:
         # repo-root settings.json) so tests can point it at a temp file and
         # never touch the user's real one -- see default_settings_path().
         self.settings_path = settings_path or default_settings_path()
-        self.selected = None
+        self._selected = None
+        self.selection = []         # ordered selection; self.selected (a property,
+                                     # defined below) is always its last entry --
+                                     # the ACTIVE element, Blender's term -- or None
+                                     # when the selection is empty
         self.flashlight = None      # set by main(); hidden from glyphs
         self.fly = None             # the viewport FlyController, for C toggle
         self.dirty = False
@@ -344,6 +351,71 @@ class Editor:
         for m in lib.materials:
             self.mat_icons[m.name] = make_material_icon(engine_mod, m.graph())
         self.mat_icon_cache = {}     # id(entity) -> live Details-slot preview Surface
+
+    # ---- selection model ----
+    # self.selection is the ordered, authoritative set. self.selected (below)
+    # is a property exposing its ACTIVE element -- Blender's term for the
+    # last-clicked object, the one typed transform edits / rotate / scale /
+    # the material editor operate on for this run (run 2b adds real
+    # per-entity pivot-mode support on top of this foundation). Plain
+    # assignment (`editor.selected = e`) always collapses to a single-
+    # element selection -- this matches every pre-existing call site (both
+    # in this file and in tests that poke `editor.selected` directly to set
+    # up a single-select fixture) so nothing single-select breaks. Multi-
+    # entity selections are only ever produced by _set_selection /
+    # _toggle_selection, which write the backing fields directly and
+    # bypass the setter's collapse-to-one behavior. Invariant maintained
+    # everywhere: self.selected is None iff self.selection == [].
+    @property
+    def selected(self):
+        return self._selected
+
+    @selected.setter
+    def selected(self, value) -> None:
+        self._selected = value
+        self.selection = [] if value is None else [value]
+
+    def _set_selection(self, entities, active=None) -> None:
+        """Replace the selection with an explicit ordered list (shift-click
+        toggle, batch duplicate, ...). `active` becomes the ACTIVE element
+        if it's a member of `entities`; otherwise (or if omitted) the active
+        element falls back to the list's last entry, or None when `entities`
+        is empty.
+        """
+        self.selection = list(entities)
+        self._selected = (active if active is not None and active in self.selection
+                          else (self.selection[-1] if self.selection else None))
+
+    def _toggle_selection(self, entity) -> None:
+        """Shift+click semantics (viewport or outliner): an entity already
+        in the selection is removed (active falls back to the new last
+        member, or None); otherwise it's appended and becomes active."""
+        if entity is None:
+            return
+        sel = list(self.selection)
+        if entity in sel:
+            sel.remove(entity)
+            self._set_selection(sel)
+        else:
+            sel.append(entity)
+            self._set_selection(sel, active=entity)
+
+    def _selection_pivot(self):
+        """World-space gizmo anchor for the current selection: the
+        arithmetic mean of each selected entity's world position -- v1's
+        only pivot mode. This is what Blender itself calls "Median Point"
+        (despite the name it's a mean, not a per-axis statistical median);
+        run 2b adds Active Element / Individual Origins pivot modes
+        alongside it. Single-selection callers get exactly that entity's
+        position, unchanged from pre-multiselect behavior. Caller must
+        ensure self.selection is non-empty.
+        """
+        Vec3 = self.engine_mod.Vec3
+        n = len(self.selection)
+        x = sum(e.transform.position.x for e in self.selection) / n
+        y = sum(e.transform.position.y for e in self.selection) / n
+        z = sum(e.transform.position.z for e in self.selection) / n
+        return Vec3(x, y, z)
 
     # ---- layout: the single source of truth for panel/viewport rects ----
     def _float_rect_for(self, pid, w, h):
@@ -572,11 +644,17 @@ class Editor:
         return world.min(axis=0), world.max(axis=0)
 
     def _snap_to_floor(self) -> None:
-        """Drop the selected entity straight down onto the highest other-
-        entity world-AABB surface below its footprint (XZ overlap of the
-        world AABBs); rests on y=0 if nothing is underneath it.
+        """End key: drop every selected entity independently (see
+        _snap_entity_to_floor). Single-selection callers get exactly the
+        old one-entity behavior since self.selection has one member."""
+        for e in self.selection:
+            self._snap_entity_to_floor(e)
+
+    def _snap_entity_to_floor(self, e) -> None:
+        """Drop `e` straight down onto the highest other-entity world-AABB
+        surface below its footprint (XZ overlap of the world AABBs); rests
+        on y=0 if nothing is underneath it.
         """
-        e = self.selected
         if e is None or e.mesh is None:
             return
         my_min, my_max = self._world_aabb(e)
@@ -783,10 +861,9 @@ class Editor:
         return self._GIZMO_AXES
 
     def _gizmo_center(self, w, h):
-        e = self.selected
-        if e is None:
+        if not self.selection:
             return None, None, None
-        p = e.transform.position
+        p = self._selection_pivot()
         dist = (p - self.camera.position).length()
         length = max(0.6, dist * 0.14)
         s0 = self.camera.project(p, w, h)
@@ -914,6 +991,16 @@ class Editor:
             "dpx": (s1[0] - s0[0], s1[1] - s0[1]), "length": length,
             "start": ((t.position.x, t.position.y, t.position.z)
                       if mode == "translate" else (s.x, s.y, s.z))}
+        if mode == "translate":
+            # every selected entity's own start position, so the drag can
+            # move the whole selection by one shared world delta (see
+            # _update_gizmo_drag) -- captured post-duplicate, so an Alt-copy
+            # of the whole selection gets its own starts, not the originals'.
+            # Absent on hand-built gizmo_drag dicts (older direct-call
+            # tests) -- _update_gizmo_drag falls back to active-only there.
+            self.gizmo_drag["starts"] = {
+                id(ent): (ent.transform.position.x, ent.transform.position.y,
+                          ent.transform.position.z) for ent in self.selection}
         return True
 
     def _update_gizmo_drag(self, mp, inp) -> None:
@@ -983,7 +1070,19 @@ class Editor:
                     proj = new_pos[0] * ax[0] + new_pos[1] * ax[1] + new_pos[2] * ax[2]
                     shift = self._quantize(proj, inc) - proj
                     new_pos = [new_pos[i] + ax[i] * shift for i in range(3)]
-            e.transform.position = Vec3(*new_pos)
+            # apply the SAME world delta (raw move + whatever snap adjusted)
+            # to every selected entity's own start position, so the whole
+            # selection moves together. "starts" is set by _try_grab_gizmo;
+            # hand-built gizmo_drag dicts (older direct-call tests) fall
+            # back to moving just the active entity, matching old behavior.
+            delta = (new_pos[0] - s[0], new_pos[1] - s[1], new_pos[2] - s[2])
+            starts = g.get("starts") or {id(e): s}
+            for ent in self.selection:
+                es = starts.get(id(ent))
+                if es is None:
+                    continue  # joined the selection after the drag began
+                ent.transform.position = Vec3(es[0] + delta[0], es[1] + delta[1],
+                                              es[2] + delta[2])
         else:  # per-axis scale
             s = list(g["start"])
             factor = max(0.05, 1.0 + t)
@@ -1691,36 +1790,51 @@ class Editor:
 
     # ---- File / Edit menu actions (shared with hotkeys) ----
     def _duplicate_selected(self, offset: bool = True) -> None:
-        """Ctrl+D duplicates in place with a visible +0.8/+0.8 nudge so the
-        copy doesn't sit exactly under the original. Alt-drag (see
-        _try_grab_gizmo) passes offset=False: the drag itself is what moves
-        the copy, so it must start exactly where the original was.
+        """Ctrl+D (and Alt-drag, via _alt_duplicate_for_drag) duplicates
+        every entity in the selection in place, each with a visible
+        +0.8/+0.8 nudge so the copies don't sit exactly under their
+        originals. Alt-drag passes offset=False: the drag itself is what
+        moves the copies, so they must start exactly where the originals
+        were. The duplicates become the new selection; the duplicate of the
+        previous ACTIVE element becomes the new active element (falls back
+        to the last duplicate if the previous active had no asset_name and
+        was skipped). Single-selection callers get exactly the old
+        one-entity behavior.
         """
-        src = self.selected
-        if src is None or src.asset_name is None:
-            return
         Vec3 = self.engine_mod.Vec3
-        dup = self.lib.instantiate(src.asset_name)
-        t, s = dup.transform, src.transform
         nudge = 0.8 if offset else 0.0
-        t.position = Vec3(s.position.x + nudge, s.position.y, s.position.z + nudge)
-        t.rotation = Vec3(s.rotation.x, s.rotation.y, s.rotation.z)
-        t.scale = Vec3(s.scale.x, s.scale.y, s.scale.z)
-        self._copy_entity_state(src, dup)
-        self.scene.add(dup)
-        self.selected = dup
+        srcs = [e for e in self.selection if e.asset_name is not None]
+        if not srcs:
+            return
+        prev_active = self.selected
+        dups, active_dup = [], None
+        for src in srcs:
+            dup = self.lib.instantiate(src.asset_name)
+            t, s = dup.transform, src.transform
+            t.position = Vec3(s.position.x + nudge, s.position.y, s.position.z + nudge)
+            t.rotation = Vec3(s.rotation.x, s.rotation.y, s.rotation.z)
+            t.scale = Vec3(s.scale.x, s.scale.y, s.scale.z)
+            self._copy_entity_state(src, dup)
+            self.scene.add(dup)
+            dups.append(dup)
+            if src is prev_active:
+                active_dup = dup
+        self._set_selection(dups, active=active_dup)
         self.dirty = True
 
     def _delete_selected(self) -> None:
-        if self.selected is None or self.selected.asset_name is None:
+        targets = [e for e in self.selection if e.asset_name is not None]
+        if not targets:
             return
-        self.scene.remove(self.selected)
-        self.selected = None
+        remaining = [e for e in self.selection if e not in targets]
+        for e in targets:
+            self.scene.remove(e)
+        self._set_selection(remaining)
         self.dirty = True
 
     def _focus_selection(self) -> None:
-        if self.selected is not None:
-            self._focus(self.selected)
+        if self.selection:
+            self._focus(self.selection)
 
     def _save_scene(self) -> None:
         os.makedirs(os.path.dirname(self.scene_path) or ".", exist_ok=True)
@@ -2119,14 +2233,14 @@ class Editor:
                             self._begin_panel_resize(target, mp, rect)
                         else:
                             content = self._panel_content_rect(target, layout)
-                            self._route_panel_click(target, mp, content)
+                            self._route_panel_click(target, mp, content, inp)
                 elif layout["viewport"].collidepoint(mp):
                     toolbar_rect = self._viewport_toolbar_rect(layout["viewport"])
                     if not (toolbar_rect.collidepoint(mp)
                             and self._click_viewport_toolbar(mp, toolbar_rect)):
                         self.active_slider = None
                         if not self._try_grab_gizmo(mp, w, h, inp):
-                            self._click_viewport(mp, w, h)
+                            self._click_viewport(mp, w, h, inp)
 
         if self.panel_drag is not None and not inp.mouse_held(1):
             self._finish_panel_drag(mp, w, h)
@@ -2245,10 +2359,10 @@ class Editor:
             return True
         return False
 
-    def _route_panel_click(self, pid, mp, content) -> None:
+    def _route_panel_click(self, pid, mp, content, inp=None) -> None:
         if pid == "outliner":
             self.active_slider = None
-            self._click_outliner(mp, content)
+            self._click_outliner(mp, content, inp)
         elif pid == "details":
             self._click_details(mp, content)
         elif pid == "browser":
@@ -2331,11 +2445,15 @@ class Editor:
         elif row["kind"] == "button":
             row["action"]()
 
-    def _click_outliner(self, mp, rect) -> None:
+    def _click_outliner(self, mp, rect, inp=None) -> None:
+        import pygame
         rows = self._outliner_rows()
         i = (mp[1] - rect.y - 6) // ROW_H + self.outliner_scroll
         if 0 <= mp[1] - rect.y - 6 and 0 <= i < len(rows):
-            self.selected = rows[i]
+            if inp is not None and (inp.held(pygame.K_LSHIFT) or inp.held(pygame.K_RSHIFT)):
+                self._toggle_selection(rows[i])
+            else:
+                self.selected = rows[i]
 
     def _tile_at(self, mp, grid_rect):
         x0 = grid_rect.x + 10 - self.browser_scroll
@@ -2375,13 +2493,24 @@ class Editor:
                 best, best_d = e, d
         return best
 
-    def _click_viewport(self, mp, w, h) -> None:
+    def _click_viewport(self, mp, w, h, inp=None) -> None:
+        """Plain click replaces the selection with the hit entity (or clears
+        it, on empty space). Shift+click toggles the hit entity in/out of
+        the selection and makes it active; Shift+click on empty space is a
+        no-op (Blender doesn't deselect-all on that either) -- it neither
+        clears nor extends the existing selection."""
+        import pygame
         marker = self._pick_marker(mp, w, h)
-        if marker is not None:
-            self.selected = marker
+        hit = marker if marker is not None else self._mouse_hit(mp, w, h)[0]
+        shift = inp is not None and (inp.held(pygame.K_LSHIFT) or inp.held(pygame.K_RSHIFT))
+        if hit is None:
+            if not shift:
+                self.selected = None
             return
-        entity, _ = self._mouse_hit(mp, w, h)
-        self.selected = entity
+        if shift:
+            self._toggle_selection(hit)
+        else:
+            self.selected = hit
 
     def _place_asset(self, asset, mp, w, h) -> None:
         if isinstance(asset, self.engine_mod.MaterialAsset):
@@ -2396,16 +2525,33 @@ class Editor:
         self.selected = entity
         self.dirty = True
 
-    def _focus(self, entity) -> None:
+    def _focus(self, entities) -> None:
+        """Pull the camera back along its current forward direction to
+        frame `entities` (F key): a single-entity list reproduces the old
+        one-entity framing exactly (bound from that entity's local mesh
+        extent, centered on its position). Multiple entities frame their
+        combined bound around the mean of their positions, with `spread`
+        (how far apart they are) widening the distance so a wide
+        multi-selection doesn't clip.
+        """
         import numpy as np
-        bound = 1.0
-        if entity.mesh is not None:
-            bound = max(float(np.max(np.linalg.norm(entity.mesh.vertices, axis=1))), 0.5)
-        dist = max(3.0, bound * 3.0)
+        Vec3 = self.engine_mod.Vec3
+        positions = np.array([[e.transform.position.x, e.transform.position.y,
+                               e.transform.position.z] for e in entities])
+        center = positions.mean(axis=0)
+        spread = float(np.max(np.linalg.norm(positions - center, axis=1))) \
+            if len(entities) > 1 else 0.0
+        bound = 0.5
+        for e in entities:
+            if e.mesh is not None:
+                s = e.transform.scale
+                max_scale = max(abs(s.x), abs(s.y), abs(s.z))
+                b = float(np.max(np.linalg.norm(e.mesh.vertices, axis=1))) * max_scale
+                bound = max(bound, b)
+        dist = max(3.0, (bound + spread) * 3.0)
         fwd = self.camera.forward()
-        p = entity.transform.position
-        self.camera.position = self.engine_mod.Vec3(
-            p.x - fwd.x * dist, p.y - fwd.y * dist, p.z - fwd.z * dist)
+        self.camera.position = Vec3(center[0] - fwd.x * dist, center[1] - fwd.y * dist,
+                                    center[2] - fwd.z * dist)
 
     # ---- drawing (engine overlay callback) ----
     def draw(self, eng) -> None:
@@ -2577,6 +2723,7 @@ class Editor:
         "RMB (hold) - mouse look + fly: WASD move, Q/E or Space/Ctrl down/up, "
         "wheel = fly speed, Shift = fast",
         "LMB - select / drag assets & gizmo / drag panel title bars to move them",
+        "Shift+LMB - extend/toggle selection (viewport or outliner); last click = active",
         "W / E / R - gizmo mode: translate / rotate / scale  (only while not looking)",
         ", / . - rotate selection 15 deg        - / = - scale selection",
         "F - focus camera on selection  (only while not looking)",
@@ -2741,9 +2888,9 @@ class Editor:
                 pygame.draw.polygon(surf, SNAP_FACE_COLOR, poly, 3)
 
         # selection brackets + transform gizmo
-        e = self.selected
-        if e is None:
+        if not self.selection:
             return
+        e = self.selected
         drag = self.gizmo_drag
         if self.gizmo_mode == "rotate":
             for i, _axis, pts, color in self._gizmo_rings(w, h):
@@ -2778,6 +2925,16 @@ class Editor:
                 label_text += f" ({self.gizmo_space})"
             mode_label = self.font_small.render(label_text, True, TEXT_DIM)
             surf.blit(mode_label, (int(s0[0]) + 12, int(s0[1]) + 10))
+        # corner brackets around every selected entity -- ACCENT for the
+        # ACTIVE element (identical to the pre-multiselect single-select
+        # look), a dimmer shade for the rest (Blender distinguishes the
+        # active object the same way)
+        for ent in self.selection:
+            self._draw_selection_bracket(surf, w, h, ent, ACCENT if ent is e else ACCENT_DIM)
+
+    def _draw_selection_bracket(self, surf, w, h, e, color) -> None:
+        import numpy as np
+        import pygame
         pt = self.camera.project(e.transform.position, w, h)
         if pt is None:
             return
@@ -2790,9 +2947,9 @@ class Editor:
         s = max(6, r // 3)
         for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
             cx, cy = x + dx * r, y + dy * r
-            pygame.draw.line(surf, ACCENT, (cx, cy), (cx - dx * s, cy), 2)
-            pygame.draw.line(surf, ACCENT, (cx, cy), (cx, cy - dy * s), 2)
-        label = self.font_small.render(e.name, True, ACCENT)
+            pygame.draw.line(surf, color, (cx, cy), (cx - dx * s, cy), 2)
+            pygame.draw.line(surf, color, (cx, cy), (cx, cy - dy * s), 2)
+        label = self.font_small.render(e.name, True, color)
         surf.blit(label, (x - label.get_width() // 2, y - r - 16))
 
     def _draw_outliner(self, surf, rect) -> None:
@@ -2807,6 +2964,8 @@ class Editor:
             row = pygame.Rect(rect.x + 1, y, rect.width - 2, ROW_H)
             if e is self.selected:
                 pygame.draw.rect(surf, SELECT_BG, row)
+            elif e in self.selection:
+                pygame.draw.rect(surf, SELECT_BG_MULTI, row)
             elif row.collidepoint(mp):
                 pygame.draw.rect(surf, HOVER_BG, row)
             x = rect.x + 10
@@ -2856,7 +3015,20 @@ class Editor:
                       (rect.x + 10, rect.y + 8))
             return
         head = f"{e.name}" + (f"  ({e.asset_name})" if e.asset_name else "")
-        surf.blit(self.font_small.render(head[:34], True, TEXT), (rect.x + 10, rect.y + 6))
+        avail = rect.width - 20
+        tag = None
+        if len(self.selection) > 1:
+            # active element's transform/rows are shown below (typed edits,
+            # rotate/scale hotkeys, and the material editor all stay
+            # active-only for this run -- see _duplicate_selected docstring
+            # and CLAUDE.md for the run 2b pivot-mode followup)
+            tag = self.font_small.render(f"{len(self.selection)} selected", True, TEXT_DIM)
+            avail -= tag.get_width() + 8
+        while head and self.font_small.size(head)[0] > avail:
+            head = head[:-1]  # pixel-precise truncation -- never overlaps the tag
+        surf.blit(self.font_small.render(head, True, TEXT), (rect.x + 10, rect.y + 6))
+        if tag is not None:
+            surf.blit(tag, (rect.right - tag.get_width() - 10, rect.y + 6))
         self._draw_transform_fields(surf, rect, e)
 
         rows = self._details_rows()
