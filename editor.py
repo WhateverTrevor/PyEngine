@@ -18,6 +18,8 @@ Controls (Help > Controls in the editor shows the full list):
     F               focus camera on selection (only while not looking)
     Ctrl+D          duplicate selection        Del  delete selection
     Ctrl+S          save scene                 L    toggle flashlight
+    K               place 3D Cursor at surface under mouse (not RMB -- that's fly-look)
+    Shift+C         reset 3D Cursor to origin
     F1 wireframe    H toggle HUD               Esc  close UI / deselect / quit
 """
 from __future__ import annotations
@@ -267,7 +269,7 @@ class Editor:
     _MENU_HOTKEYS = {
         "File": {"Save": "Ctrl+S"},
         "Edit": {"Duplicate": "Ctrl+D", "Delete": "Del", "Focus Selection": "F",
-                 "Snap to Floor": "End"},
+                 "Snap to Floor": "End", "Reset 3D Cursor": "Shift+C"},
         "Window": {"Fullscreen": "F11"},
     }
 
@@ -312,8 +314,13 @@ class Editor:
         self.gizmo_mode = "translate"  # W/E/R select translate / rotate / scale
         self.gizmo_space = "world"  # translate axes: "world" or "local" (viewport toolbar)
         self.pivot_mode = "median"  # rotate/scale pivot for multi-selections (viewport
-                                     # toolbar): "median" / "bbox" / "active" / "individual"
-                                     # -- see _pivot_point. Translate is pivot-independent.
+                                     # toolbar): "median" / "bbox" / "active" / "individual" /
+                                     # "cursor" -- see _pivot_point. Translate is pivot-independent.
+        self.cursor3d = engine_mod.Vec3(0.0, 0.0, 0.0)  # Blender-style 3D cursor: a
+                                     # placeable world-space point (K places it on the
+                                     # surface under the mouse, Shift+C resets it to the
+                                     # origin), persisted in settings.json. Doubles as the
+                                     # "cursor" pivot_mode's rotate/scale anchor.
         self.snap_enabled = False   # viewport toolbar snap toggle (grid/interval snapping)
         self.snap_index = {"translate": 0, "rotate": 0, "scale": 0}  # cycled per mode
         self.snap_feedback = None   # (other_entity, axis_idx, plane, lo2, hi2) while a
@@ -462,18 +469,29 @@ class Editor:
                          about ITSELF (see _update_gizmo_drag /
                          _apply_group_scale) -- the widget itself is still
                          drawn at the median, matching Blender
+          cursor     -- the placeable 3D cursor (self.cursor3d), regardless
+                         of selection size -- see below
 
         A single-entity selection always reduces to that entity's own
-        origin for every mode -- median/individual/active trivially do
-        (the lone entity IS the mean AND the active element), but bbox
+        origin for every OTHER mode -- median/individual/active trivially
+        do (the lone entity IS the mean AND the active element), but bbox
         needs an explicit special case: a mesh's local AABB is not
         generally centered on the entity's origin (e.g. base_height meshes
         sit with their BOTTOM, not their center, at local y=0), so without
         this a single selected entity's gizmo would jump off its origin
         under Bounding Box Center, breaking "single-select is unchanged".
+
+        "cursor" mode is deliberately exempt from that single-select
+        collapse: the whole point of the 3D cursor pivot is that even a
+        lone selected object orbits/scales about an external point instead
+        of spinning in place, so this checks pivot_mode BEFORE the
+        single-selection shortcut below.
         """
         if not self.selection:
             return None
+        if self.pivot_mode == "cursor":
+            c = self.cursor3d
+            return self.engine_mod.Vec3(c.x, c.y, c.z)
         if len(self.selection) == 1:
             p = self.selection[0].transform.position
             return self.engine_mod.Vec3(p.x, p.y, p.z)
@@ -788,9 +806,10 @@ class Editor:
     # Element / Individual Origins, cycled by one toolbar button (see
     # _toolbar_buttons) and applied by _pivot_point / _update_gizmo_drag /
     # _apply_group_scale.
-    _PIVOT_MODES = ("median", "bbox", "active", "individual")
+    _PIVOT_MODES = ("median", "bbox", "active", "individual", "cursor")
     _PIVOT_LABELS = {"median": "Median Point", "bbox": "Bounding Box",
-                     "active": "Active Element", "individual": "Individual Origins"}
+                     "active": "Active Element", "individual": "Individual Origins",
+                     "cursor": "3D Cursor"}
 
     def _cycle_pivot_mode(self) -> None:
         i = self._PIVOT_MODES.index(self.pivot_mode)
@@ -1155,6 +1174,11 @@ class Editor:
         always axis-aligned -- see _axis_defs). Falls back to the
         pre-pivot-mode active-only behavior when 'starts'/'pivot' are
         absent (hand-built gizmo_drag dicts in older direct-call tests).
+
+        "cursor" pivot mode is rigid even for a single-entity selection --
+        the whole point of the 3D cursor pivot is that a lone object still
+        scales relative to an external point instead of about itself (see
+        _pivot_point's matching exemption).
         """
         Vec3 = self.engine_mod.Vec3
         starts = g.get("starts")
@@ -1169,7 +1193,8 @@ class Editor:
                 s[axis_i] = s[axis_i] * factor
                 e.transform.scale = Vec3(*s)
             return
-        rigid = len(self.selection) > 1 and self.pivot_mode != "individual"
+        rigid = self.pivot_mode == "cursor" or (
+            len(self.selection) > 1 and self.pivot_mode != "individual")
         for ent in self.selection:
             st = starts.get(id(ent))
             if st is None:
@@ -1224,7 +1249,12 @@ class Editor:
             # with -- a single-entity selection always reduces to "rotate
             # about your own origin", i.e. no position change at all, for
             # every pivot mode (see _pivot_point's single-select shortcut)
-            rigid = len(self.selection) > 1 and self.pivot_mode != "individual"
+            # EXCEPT "cursor": that mode is exempt from the single-select
+            # collapse (_pivot_point returns cursor3d regardless of
+            # selection size), so a lone selected object must still orbit
+            # the cursor instead of spinning in place.
+            rigid = self.pivot_mode == "cursor" or (
+                len(self.selection) > 1 and self.pivot_mode != "individual")
             R = self._axis_rotation_matrix(axis_i, delta) if rigid else None
             for ent in self.selection:
                 st = starts.get(id(ent))
@@ -1599,6 +1629,7 @@ class Editor:
                 ("Delete", self._delete_selected, True),
                 ("Focus Selection", self._focus_selection, True),
                 ("Snap to Floor", self._snap_to_floor, True),
+                ("Reset 3D Cursor", self._reset_cursor3d, True),
             ],
             "Window": [
                 ("Outliner", lambda: self._toggle_panel("outliner"), True),
@@ -1960,6 +1991,7 @@ class Editor:
             "snap_enabled": self.snap_enabled,
             "snap_index": dict(self.snap_index),
             "pivot_mode": self.pivot_mode,
+            "cursor3d": [self.cursor3d.x, self.cursor3d.y, self.cursor3d.z],
         }
 
     def _save_settings(self) -> None:
@@ -1979,10 +2011,17 @@ class Editor:
         if mode in self._PIVOT_MODES:
             self.pivot_mode = mode
 
+    def _apply_cursor_settings(self, data: dict) -> None:
+        c = data.get("cursor3d")
+        if (isinstance(c, list) and len(c) == 3
+                and all(isinstance(v, (int, float)) for v in c)):
+            self.cursor3d = self.engine_mod.Vec3(float(c[0]), float(c[1]), float(c[2]))
+
     def _apply_layout_settings(self, data: dict) -> None:
         import pygame
         self._apply_snap_settings(data)
         self._apply_pivot_settings(data)
+        self._apply_cursor_settings(data)
         valid = {"outliner", "details", "browser"}
         dock_order = data.get("dock_order", {})
         left = [p for p in dock_order.get("left", []) if p in ("outliner", "details")]
@@ -2525,9 +2564,10 @@ class Editor:
             self._begin_rename(self.selected_folder)
 
         # a details-panel transform field being typed into owns the keyboard:
-        # letters like w/e/r/f/c must not also fire viewport hotkeys below
+        # letters like w/e/r/f/c/k must not also fire viewport hotkeys below
         editing_text = self.editing_field is not None
         ctrl = inp.held(pygame.K_LCTRL) or inp.held(pygame.K_RCTRL)
+        shift_held = inp.held(pygame.K_LSHIFT) or inp.held(pygame.K_RSHIFT)
         if not editing_text:
             if inp.pressed(pygame.K_DELETE):
                 self._delete_selected()
@@ -2539,8 +2579,17 @@ class Editor:
                 self._save_scene()
             if inp.pressed(pygame.K_f) and not looking:
                 self._focus_selection()
-            if inp.pressed(pygame.K_c) and self.fly is not None:
-                self.fly.collide = not self.fly.collide
+            if inp.pressed(pygame.K_c):
+                # Shift+C (Blender: reset 3D cursor) takes priority over the
+                # plain-C fly-collision toggle so the two never both fire
+                if shift_held:
+                    self._reset_cursor3d()
+                elif self.fly is not None:
+                    self.fly.collide = not self.fly.collide
+            if inp.pressed(pygame.K_k) and not looking \
+                    and layout["viewport"].collidepoint(mp) \
+                    and not self._viewport_toolbar_rect(layout["viewport"]).collidepoint(mp):
+                self._place_cursor3d(mp, w, h)
             if not looking:
                 if inp.pressed(pygame.K_w):
                     self._set_gizmo_mode("translate")
@@ -2711,6 +2760,24 @@ class Editor:
             if 0 < t < 400:
                 return None, origin + direction * t
         return None, origin + direction * 8.0
+
+    def _place_cursor3d(self, mp, w, h) -> None:
+        """K key: place the 3D cursor at the surface under the mouse --
+        reuses _mouse_hit's exact raycast (pick_entity against scene
+        geometry; y=0 ground-plane fallback if nothing is hit; a fixed
+        distance along the ray as the last resort) so cursor placement
+        always agrees with what a translate drag's Shift-snap / End-key
+        floor-snap would read as "the surface here". RMB is already the
+        fly-look toggle in this editor, so a dedicated key avoids any
+        conflict (see the Controls overlay / _CONTROLS_LINES)."""
+        _entity, pt = self._mouse_hit(mp, w, h)
+        self.cursor3d = self.engine_mod.Vec3(float(pt[0]), float(pt[1]), float(pt[2]))
+        self._save_settings()
+
+    def _reset_cursor3d(self) -> None:
+        """Shift+C / Edit > Reset 3D Cursor: Blender's cursor-to-origin reset."""
+        self.cursor3d = self.engine_mod.Vec3(0.0, 0.0, 0.0)
+        self._save_settings()
 
     def _pick_marker(self, mp, w, h):
         """Screen-space proximity pick for mesh-less entities (Sun, Fog
@@ -3057,6 +3124,9 @@ class Editor:
         "Alt+drag gizmo (translate/rotate) - duplicate and move/rotate the copy",
         "Ctrl+S - save scene",
         "L - toggle flashlight                  C - toggle player collision",
+        "K - place 3D Cursor at surface under mouse (not RMB, which is fly-look)",
+        "Shift+C - reset 3D Cursor to origin    Pivot toolbar - \"3D Cursor\" mode "
+        "orbits/scales about it",
         "M - open material editor for the selected mesh",
         "F1 - wireframe   F2 - per-pixel/flat shading   H - toggle HUD",
         "Esc - close menu/dialog, else deselect, else quit",
@@ -3193,6 +3263,24 @@ class Editor:
                 pygame.draw.circle(surf, color, (cx, cy), 5, 1)
                 pygame.draw.line(surf, color, (cx - 7, cy), (cx + 7, cy))
                 pygame.draw.line(surf, color, (cx, cy - 7), (cx, cy + 7))
+        # 3D cursor: Blender-style red/white dashed ring + crosshair ticks at
+        # self.cursor3d, drawn only when projectable (e.g. not behind camera)
+        pt = self.camera.project(self.cursor3d, w, h)
+        if pt is not None:
+            x, y = int(pt[0]), int(pt[1])
+            r, segs = 9, 16
+            for k in range(segs):
+                a0 = 2 * math.pi * k / segs
+                a1 = 2 * math.pi * (k + 0.6) / segs
+                color = (222, 40, 40) if k % 2 == 0 else (240, 240, 240)
+                p0 = (x + math.cos(a0) * r, y + math.sin(a0) * r)
+                p1 = (x + math.cos(a1) * r, y + math.sin(a1) * r)
+                pygame.draw.line(surf, color, p0, p1, 2)
+            tick = 4
+            pygame.draw.line(surf, (240, 240, 240), (x - r - tick, y), (x - r + 2, y))
+            pygame.draw.line(surf, (240, 240, 240), (x + r - 2, y), (x + r + tick, y))
+            pygame.draw.line(surf, (240, 240, 240), (x, y - r - tick), (x, y - r + 2))
+            pygame.draw.line(surf, (240, 240, 240), (x, y + r - 2), (x, y + r + tick))
         # snap-to-mesh feedback: highlight the AABB face the drag is
         # currently flush against (see _find_mesh_snap / _update_gizmo_drag)
         if self.snap_feedback is not None:

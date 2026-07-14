@@ -103,8 +103,9 @@ def fresh_trio():
     return a, b, c
 
 
-# ==== 1. pivot-mode selector: toolbar button cycles + labels the 4 modes,
-#          driven via a REAL click event ====
+# ==== 1. pivot-mode selector: toolbar button cycles + labels the 5 modes
+#          (run 3 added "3D Cursor" -- see tests/cursor_checks.py for its
+#          dedicated coverage), driven via a REAL click event ====
 assert editor.pivot_mode == "median", "Median Point must be the default"
 layout = editor._layout(W, H)
 toolbar_rect = editor._viewport_toolbar_rect(layout["viewport"])
@@ -112,12 +113,12 @@ rects = editor._toolbar_button_rects(toolbar_rect)
 pivot_rect = next(r for b, r in rects if b["id"] == "pivot_mode")
 mp = (pivot_rect.centerx, pivot_rect.centery)
 seen = [editor.pivot_mode]
-for _ in range(4):
+for _ in range(5):
     with um.patch.object(pygame.mouse, "get_pos", return_value=mp), \
          um.patch.object(pygame.key, "get_pressed", return_value=FakeKeys()):
         step([pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=mp)])
     seen.append(editor.pivot_mode)
-assert seen == ["median", "bbox", "active", "individual", "median"], seen
+assert seen == ["median", "bbox", "active", "individual", "cursor", "median"], seen
 assert editor._pivot_label() == "Median Point"
 print(f"pivot-mode toolbar button OK (real click path): cycled {seen}")
 
