@@ -34,7 +34,7 @@ assert toolbar_rect.x == layout["viewport"].x and toolbar_rect.y == layout["view
 assert toolbar_rect.width == layout["viewport"].width
 rects = editor._toolbar_button_rects(toolbar_rect)
 labels = [b["id"] for b, _ in rects]
-assert labels == ["translate", "rotate", "scale", "space"]
+assert labels == ["translate", "rotate", "scale", "space", "snap_toggle", "snap_inc"]
 # rects are strictly left-to-right, non-overlapping
 for (b0, r0), (b1, r1) in zip(rects, rects[1:]):
     assert r1.x >= r0.right, (b0["id"], b1["id"], r0, r1)
@@ -114,7 +114,7 @@ start_pos = (crate.transform.position.x, crate.transform.position.y, crate.trans
 # drag the mouse further along the same screen-space handle direction
 dx, dy = s1[0] - s0[0], s1[1] - s0[1]
 mp2 = (s1[0] + dx, s1[1] + dy)
-editor._update_gizmo_drag(mp2)
+editor._update_gizmo_drag(mp2, eng.input)
 delta = (crate.transform.position.x - start_pos[0],
         crate.transform.position.y - start_pos[1],
         crate.transform.position.z - start_pos[2])
@@ -132,7 +132,7 @@ assert editor._try_grab_gizmo(s1, W, H)
 dx, dy = s1[0] - s0[0], s1[1] - s0[1]
 mp2 = (s1[0] + dx, s1[1] + dy)
 start_pos = (crate.transform.position.x, crate.transform.position.y, crate.transform.position.z)
-editor._update_gizmo_drag(mp2)
+editor._update_gizmo_drag(mp2, eng.input)
 delta = (crate.transform.position.x - start_pos[0],
         crate.transform.position.y - start_pos[1],
         crate.transform.position.z - start_pos[2])

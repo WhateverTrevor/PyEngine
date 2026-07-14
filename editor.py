@@ -78,6 +78,7 @@ TEXT_DIM = (140, 143, 152)
 SELECT_BG = (47, 66, 102)
 HOVER_BG = (36, 39, 47)
 ACCENT = (255, 170, 60)
+SNAP_FACE_COLOR = (90, 220, 230)  # highlighted face during Shift-drag snap-to-mesh
 
 PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
     "outliner": (OUTLINER_W, 360),
@@ -260,7 +261,8 @@ class Editor:
                             "Content Browser": "browser"}
     _MENU_HOTKEYS = {
         "File": {"Save": "Ctrl+S"},
-        "Edit": {"Duplicate": "Ctrl+D", "Delete": "Del", "Focus Selection": "F"},
+        "Edit": {"Duplicate": "Ctrl+D", "Delete": "Del", "Focus Selection": "F",
+                 "Snap to Floor": "End"},
         "Window": {"Fullscreen": "F11"},
     }
 
@@ -296,6 +298,10 @@ class Editor:
         self.gizmo_drag = None      # active gizmo drag state dict
         self.gizmo_mode = "translate"  # W/E/R select translate / rotate / scale
         self.gizmo_space = "world"  # translate axes: "world" or "local" (viewport toolbar)
+        self.snap_enabled = False   # viewport toolbar snap toggle (grid/interval snapping)
+        self.snap_index = {"translate": 0, "rotate": 0, "scale": 0}  # cycled per mode
+        self.snap_feedback = None   # (other_entity, axis_idx, plane, lo2, hi2) while a
+                                     # Shift-held translate drag is flush against a face
         self.editing_field = None   # (row_label, axis) of the transform field being
                                      # typed into, e.g. ("Position", "x"), or None
         self.edit_buffer = ""       # editable text while editing_field is set
@@ -546,6 +552,83 @@ class Editor:
             for key in self.engine_mod.assets._FOG_VOLUME_PROPS:
                 setattr(dst.fog_volume, key, getattr(src.fog_volume, key))
 
+    # ---- world-space AABB + floor/mesh snapping ----
+    @staticmethod
+    def _world_aabb(entity):
+        """World-space (min, max) numpy arrays for entity.mesh's local AABB,
+        transformed by transform.matrix() -- 8 corners then min/max, same
+        local-AABB-via-matrix approach as engine/behaviors.py
+        resolve_collisions (which does the inverse: world point -> local).
+        None if the entity has no mesh.
+        """
+        import numpy as np
+        if entity is None or entity.mesh is None:
+            return None
+        m = entity.transform.matrix()
+        lo, hi = entity.mesh.aabb_min, entity.mesh.aabb_max
+        corners = np.array([[x, y, z] for x in (lo[0], hi[0])
+                            for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+        world = corners @ m[:3, :3].T + m[:3, 3]
+        return world.min(axis=0), world.max(axis=0)
+
+    def _snap_to_floor(self) -> None:
+        """Drop the selected entity straight down onto the highest other-
+        entity world-AABB surface below its footprint (XZ overlap of the
+        world AABBs); rests on y=0 if nothing is underneath it.
+        """
+        e = self.selected
+        if e is None or e.mesh is None:
+            return
+        my_min, my_max = self._world_aabb(e)
+        x0, x1, z0, z1 = my_min[0], my_max[0], my_min[2], my_max[2]
+        cur_bottom = float(my_min[1])
+        best_y = 0.0  # y=0 fallback
+        eps = 1e-4
+        for other in self.scene.entities:
+            if other is e or other.mesh is None or not other.visible:
+                continue
+            o_min, o_max = self._world_aabb(other)
+            if o_max[0] < x0 or o_min[0] > x1 or o_max[2] < z0 or o_min[2] > z1:
+                continue  # no XZ footprint overlap -- not underneath
+            top = float(o_max[1])
+            if top <= cur_bottom + eps and top > best_y:
+                best_y = top
+        delta = best_y - cur_bottom
+        if abs(delta) > 1e-9:
+            p = e.transform.position
+            e.transform.position = self.engine_mod.Vec3(p.x, p.y + delta, p.z)
+            self.dirty = True
+
+    def _find_mesh_snap(self, entity, axis_idx, proposed_min, proposed_max):
+        """Nearest other entity whose world-AABB face is flush (within a
+        threshold) against the dragged entity's leading/trailing face along
+        axis_idx, given the entity's PROPOSED (not yet applied) world AABB.
+        v1: axis-aligned face-to-face only, no rotation matching (per spec).
+        Returns (delta_along_axis, other_entity, plane_value, lo2, hi2) where
+        lo2/hi2 are the overlap rectangle bounds on the two other axes (used
+        to draw the highlighted face), or None if nothing is within threshold.
+        """
+        threshold = 0.5  # world units
+        other_axes = [k for k in range(3) if k != axis_idx]
+        best = None
+        for other in self.scene.entities:
+            if other is entity or other.mesh is None or not other.visible:
+                continue
+            o_min, o_max = self._world_aabb(other)
+            for delta, plane in ((o_min[axis_idx] - proposed_max[axis_idx], o_min[axis_idx]),
+                                 (o_max[axis_idx] - proposed_min[axis_idx], o_max[axis_idx])):
+                if abs(delta) > threshold:
+                    continue
+                # the other two axes don't move with this axis-aligned shift,
+                # so the overlap rectangle is just the two boxes' intersection
+                lo2 = [max(proposed_min[k], o_min[k]) for k in other_axes]
+                hi2 = [min(proposed_max[k], o_max[k]) for k in other_axes]
+                if any(lo2[i] > hi2[i] for i in range(2)):
+                    continue  # no overlap on the other two axes -- not a face contact
+                if best is None or abs(delta) < abs(best[0]):
+                    best = (delta, other, plane, lo2, hi2)
+        return best
+
     # ---- viewport toolbar: mode buttons + world/local toggle, declarative so
     # future controls (snapping, more modes, ...) just append to the list ----
     def _set_gizmo_mode(self, mode) -> None:
@@ -553,6 +636,47 @@ class Editor:
 
     def _toggle_gizmo_space(self) -> None:
         self.gizmo_space = "local" if self.gizmo_space == "world" else "world"
+
+    # increments cyclable per gizmo mode: translate/scale are linear units,
+    # rotate is degrees (converted to radians where applied to Transform.rotation)
+    _SNAP_INCREMENTS = {
+        "translate": (0.1, 0.25, 0.5, 1.0),
+        "rotate": (5.0, 15.0, 45.0, 90.0),
+        "scale": (0.1, 0.25),
+    }
+
+    def _snap_increment(self, mode=None) -> float:
+        mode = mode or self.gizmo_mode
+        incs = self._SNAP_INCREMENTS.get(mode, self._SNAP_INCREMENTS["translate"])
+        return incs[self.snap_index.get(mode, 0) % len(incs)]
+
+    def _cycle_snap_increment(self) -> None:
+        mode = self.gizmo_mode
+        incs = self._SNAP_INCREMENTS.get(mode, self._SNAP_INCREMENTS["translate"])
+        self.snap_index[mode] = (self.snap_index.get(mode, 0) + 1) % len(incs)
+        self._save_settings()
+
+    def _toggle_snap(self) -> None:
+        self.snap_enabled = not self.snap_enabled
+        self._save_settings()
+
+    @staticmethod
+    def _quantize(value: float, increment: float) -> float:
+        if increment <= 0:
+            return value
+        return round(value / increment) * increment
+
+    def _snap_active(self, inp) -> bool:
+        """Effective snap state for the in-progress drag: the toolbar toggle,
+        with Ctrl held during the drag temporarily inverting it (UE/Blender
+        convention -- Ctrl toggles snap the opposite of whatever it's set to)."""
+        import pygame
+        ctrl = inp.held(pygame.K_LCTRL) or inp.held(pygame.K_RCTRL)
+        return self.snap_enabled != ctrl
+
+    def _snap_label(self) -> str:
+        inc = self._snap_increment()
+        return f"{inc:g}°" if self.gizmo_mode == "rotate" else f"{inc:g}"
 
     def _toolbar_buttons(self):
         return [
@@ -569,6 +693,12 @@ class Editor:
                                      else "Local", "group_gap": True,
              "active": lambda: self.gizmo_space == "local",
              "action": self._toggle_gizmo_space},
+            {"id": "snap_toggle", "label": "Snap", "group_gap": True,
+             "active": lambda: self.snap_enabled,
+             "action": self._toggle_snap},
+            {"id": "snap_inc", "label": self._snap_label,
+             "active": lambda: False,
+             "action": self._cycle_snap_increment},
         ]
 
     def _viewport_toolbar_rect(self, viewport_rect):
@@ -713,7 +843,21 @@ class Editor:
         t = max(0.0, min(1.0, ((p[0] - a[0]) * ax + (p[1] - a[1]) * ay) / seg2))
         return math.hypot(p[0] - (a[0] + ax * t), p[1] - (a[1] + ay * t))
 
-    def _try_grab_gizmo(self, mp, w, h) -> bool:
+    def _alt_duplicate_for_drag(self, inp):
+        """Alt held while grabbing a translate/rotate gizmo handle duplicates
+        the selection IN PLACE (offset=False -- the drag itself is what
+        moves/rotates the copy) and returns the new entity to drag; the
+        original is left completely untouched. No-op (returns self.selected
+        unchanged) if Alt isn't held or inp wasn't supplied (existing test
+        call sites that don't care about Alt pass inp=None).
+        """
+        import pygame
+        if inp is None or not (inp.held(pygame.K_LALT) or inp.held(pygame.K_RALT)):
+            return self.selected
+        self._duplicate_selected(offset=False)
+        return self.selected
+
+    def _try_grab_gizmo(self, mp, w, h, inp=None) -> bool:
         e = self.selected
         if e is None:
             return False
@@ -731,6 +875,11 @@ class Editor:
                         best = (d, i, axis)
             if best is None:
                 return False
+            # duplicate now that a ring hit is confirmed -- the dup starts at
+            # the exact same transform, so the already-computed center/rings
+            # (projected off the original) stay valid for it unchanged
+            e = self._alt_duplicate_for_drag(inp)
+            t = e.transform
             _d, i, axis = best
             to_cam = self.camera.position - t.position
             toward = (axis[0] * to_cam.x + axis[1] * to_cam.y
@@ -756,6 +905,9 @@ class Editor:
                 best = (d, i, axis, s0, s1, length)
         if best is None:
             return False
+        if mode == "translate":  # Alt-duplicate is out of scope for scale (spec)
+            e = self._alt_duplicate_for_drag(inp)
+            t, s = e.transform, e.transform.scale
         _d, i, axis, s0, s1, length = best
         self.gizmo_drag = {
             "mode": mode, "axis_i": i, "axis": axis, "press": mp,
@@ -764,21 +916,28 @@ class Editor:
                       if mode == "translate" else (s.x, s.y, s.z))}
         return True
 
-    def _update_gizmo_drag(self, mp) -> None:
+    def _update_gizmo_drag(self, mp, inp) -> None:
+        import pygame
         g = self.gizmo_drag
         Vec3 = self.engine_mod.Vec3
         e = self.selected
+        snap = self._snap_active(inp)
         if g["mode"] == "rotate":
             cx, cy = g["center"]
             ang = math.atan2(mp[1] - cy, mp[0] - cx)
             delta = (ang - g["a0"]) * g["sign"]
             r = list(g["start"])
-            r[g["axis_i"]] += delta
+            new_val = r[g["axis_i"]] + delta
+            if snap:
+                new_val = self._quantize(new_val, math.radians(self._snap_increment("rotate")))
+            r[g["axis_i"]] = new_val
             e.transform.rotation = Vec3(*r)
             self.dirty = True
             return
         if g["mode"] == "scale" and g["axis_i"] == -1:
             factor = max(0.05, 1.0 + (mp[0] - g["press"][0]) * 0.004)
+            if snap:
+                factor = max(0.05, self._quantize(factor, self._snap_increment("scale")))
             s = g["start"]
             e.transform.scale = Vec3(s[0] * factor, s[1] * factor, s[2] * factor)
             self.dirty = True
@@ -791,11 +950,46 @@ class Editor:
         if g["mode"] == "translate":
             move = t * g["length"]
             ax, s = g["axis"], g["start"]
-            e.transform.position = Vec3(s[0] + ax[0] * move, s[1] + ax[1] * move,
-                                        s[2] + ax[2] * move)
+            new_pos = [s[0] + ax[0] * move, s[1] + ax[1] * move, s[2] + ax[2] * move]
+            # Shift-held snap-to-mesh takes precedence over grid snap (a
+            # separate mechanic, independent of the toolbar toggle -- see the
+            # HUD hint). Only fires when the drag axis is (numerically) world-
+            # axis-aligned: local-space drags on a rotated entity fall through
+            # to grid snap only, per spec ("no rotation matching" in v1).
+            import numpy as np
+            snapped_to_mesh = False
+            shift_held = inp.held(pygame.K_LSHIFT) or inp.held(pygame.K_RSHIFT)
+            if shift_held:
+                axis_idx = int(np.argmax(np.abs(ax)))
+                if abs(ax[axis_idx]) > 0.999:
+                    cur_min, cur_max = self._world_aabb(e)
+                    p = e.transform.position
+                    d = np.array(new_pos) - np.array([p.x, p.y, p.z])
+                    found = self._find_mesh_snap(e, axis_idx, cur_min + d, cur_max + d)
+                    if found is not None:
+                        fdelta, other, plane, lo2, hi2 = found
+                        new_pos[axis_idx] += fdelta
+                        self.snap_feedback = (other, axis_idx, plane, lo2, hi2)
+                        snapped_to_mesh = True
+            if not snapped_to_mesh:
+                self.snap_feedback = None
+                if snap:
+                    # quantize the position's coordinate along the drag axis
+                    # (world or local, whichever _axis_defs handed us) to grid
+                    # increments measured from the world origin -- not the
+                    # delta, so the result lands on absolute grid lines
+                    # regardless of start position
+                    inc = self._snap_increment("translate")
+                    proj = new_pos[0] * ax[0] + new_pos[1] * ax[1] + new_pos[2] * ax[2]
+                    shift = self._quantize(proj, inc) - proj
+                    new_pos = [new_pos[i] + ax[i] * shift for i in range(3)]
+            e.transform.position = Vec3(*new_pos)
         else:  # per-axis scale
             s = list(g["start"])
-            s[g["axis_i"]] = s[g["axis_i"]] * max(0.05, 1.0 + t)
+            factor = max(0.05, 1.0 + t)
+            if snap:
+                factor = max(0.05, self._quantize(factor, self._snap_increment("scale")))
+            s[g["axis_i"]] = s[g["axis_i"]] * factor
             e.transform.scale = Vec3(*s)
         self.dirty = True
 
@@ -1089,6 +1283,7 @@ class Editor:
                 ("Duplicate", self._duplicate_selected, True),
                 ("Delete", self._delete_selected, True),
                 ("Focus Selection", self._focus_selection, True),
+                ("Snap to Floor", self._snap_to_floor, True),
             ],
             "Window": [
                 ("Outliner", lambda: self._toggle_panel("outliner"), True),
@@ -1447,13 +1642,25 @@ class Editor:
             "float_rect": {pid: [r.x, r.y, r.width, r.height]
                           for pid, r in self.float_rect.items()},
             "dock_frac": dict(self.dock_frac),
+            "snap_enabled": self.snap_enabled,
+            "snap_index": dict(self.snap_index),
         }
 
     def _save_settings(self) -> None:
         save_settings(self._settings_dict(), self.settings_path)
 
+    def _apply_snap_settings(self, data: dict) -> None:
+        self.snap_enabled = bool(data.get("snap_enabled", self.snap_enabled))
+        idx = data.get("snap_index", {})
+        if isinstance(idx, dict):
+            for mode, incs in self._SNAP_INCREMENTS.items():
+                v = idx.get(mode)
+                if isinstance(v, int) and 0 <= v < len(incs):
+                    self.snap_index[mode] = v
+
     def _apply_layout_settings(self, data: dict) -> None:
         import pygame
+        self._apply_snap_settings(data)
         valid = {"outliner", "details", "browser"}
         dock_order = data.get("dock_order", {})
         left = [p for p in dock_order.get("left", []) if p in ("outliner", "details")]
@@ -1483,14 +1690,20 @@ class Editor:
                 self.dock_frac[side] = float(v)
 
     # ---- File / Edit menu actions (shared with hotkeys) ----
-    def _duplicate_selected(self) -> None:
+    def _duplicate_selected(self, offset: bool = True) -> None:
+        """Ctrl+D duplicates in place with a visible +0.8/+0.8 nudge so the
+        copy doesn't sit exactly under the original. Alt-drag (see
+        _try_grab_gizmo) passes offset=False: the drag itself is what moves
+        the copy, so it must start exactly where the original was.
+        """
         src = self.selected
         if src is None or src.asset_name is None:
             return
         Vec3 = self.engine_mod.Vec3
         dup = self.lib.instantiate(src.asset_name)
         t, s = dup.transform, src.transform
-        t.position = Vec3(s.position.x + 0.8, s.position.y, s.position.z + 0.8)
+        nudge = 0.8 if offset else 0.0
+        t.position = Vec3(s.position.x + nudge, s.position.y, s.position.z + nudge)
         t.rotation = Vec3(s.rotation.x, s.rotation.y, s.rotation.z)
         t.scale = Vec3(s.scale.x, s.scale.y, s.scale.z)
         self._copy_entity_state(src, dup)
@@ -1912,7 +2125,7 @@ class Editor:
                     if not (toolbar_rect.collidepoint(mp)
                             and self._click_viewport_toolbar(mp, toolbar_rect)):
                         self.active_slider = None
-                        if not self._try_grab_gizmo(mp, w, h):
+                        if not self._try_grab_gizmo(mp, w, h, inp):
                             self._click_viewport(mp, w, h)
 
         if self.panel_drag is not None and not inp.mouse_held(1):
@@ -1935,9 +2148,10 @@ class Editor:
         # gizmo drag
         if self.gizmo_drag is not None:
             if inp.mouse_held(1) and self.selected is not None:
-                self._update_gizmo_drag(mp)
+                self._update_gizmo_drag(mp, inp)
             else:
                 self.gizmo_drag = None
+                self.snap_feedback = None
 
         # live slider drag (details panel)
         if self.active_slider is not None:
@@ -1968,6 +2182,8 @@ class Editor:
         if not editing_text:
             if inp.pressed(pygame.K_DELETE):
                 self._delete_selected()
+            if inp.pressed(pygame.K_END):
+                self._snap_to_floor()
             if ctrl and inp.pressed(pygame.K_d):
                 self._duplicate_selected()
             if ctrl and inp.pressed(pygame.K_s):
@@ -2365,6 +2581,8 @@ class Editor:
         ", / . - rotate selection 15 deg        - / = - scale selection",
         "F - focus camera on selection  (only while not looking)",
         "Ctrl+D - duplicate selection           Del - delete selection",
+        "End - snap selection to floor          Shift+drag - snap to nearby mesh face",
+        "Alt+drag gizmo (translate/rotate) - duplicate and move/rotate the copy",
         "Ctrl+S - save scene",
         "L - toggle flashlight                  C - toggle player collision",
         "M - open material editor for the selected mesh",
@@ -2503,6 +2721,25 @@ class Editor:
                 pygame.draw.circle(surf, color, (cx, cy), 5, 1)
                 pygame.draw.line(surf, color, (cx - 7, cy), (cx + 7, cy))
                 pygame.draw.line(surf, color, (cx, cy - 7), (cx, cy + 7))
+        # snap-to-mesh feedback: highlight the AABB face the drag is
+        # currently flush against (see _find_mesh_snap / _update_gizmo_drag)
+        if self.snap_feedback is not None:
+            other, axis_idx, plane, lo2, hi2 = self.snap_feedback
+            other_axes = [k for k in range(3) if k != axis_idx]
+            corners = []
+            for a in (lo2[0], hi2[0]):
+                for b in (lo2[1], hi2[1]):
+                    c = [0.0, 0.0, 0.0]
+                    c[axis_idx] = plane
+                    c[other_axes[0]] = a
+                    c[other_axes[1]] = b
+                    corners.append(c)
+            loop = (0, 1, 3, 2)  # corners are (lo,lo)(lo,hi)(hi,lo)(hi,hi) -> quad order
+            pts = [self.camera.project(self.engine_mod.Vec3(*corners[i]), w, h) for i in loop]
+            if all(p is not None for p in pts):
+                poly = [(int(p[0]), int(p[1])) for p in pts]
+                pygame.draw.polygon(surf, SNAP_FACE_COLOR, poly, 3)
+
         # selection brackets + transform gizmo
         e = self.selected
         if e is None:
@@ -2587,8 +2824,9 @@ class Editor:
             text = self.font.render(e.name[:24], True, TEXT)
             surf.blit(text, (x, y + 3))
             y += ROW_H
-        hint = self.font_small.render("Del delete · Ctrl+D dup · F focus · Ctrl+S save",
-                                      True, TEXT_DIM)
+        hint = self.font_small.render(
+            "Del delete · Ctrl+D dup · F focus · End floor · Ctrl+S save",
+            True, TEXT_DIM)
         surf.blit(hint, (rect.x + 10, rect.bottom - 18))
 
     def _draw_transform_fields(self, surf, rect, e) -> None:
@@ -3681,7 +3919,8 @@ def main() -> None:
     eng.esc_handler = editor.handle_escape
     eng.hud_text = ("RMB: look/fly (WASD/QE/Space/Ctrl, wheel=speed) | LMB: select/gizmo/panels | "
                     "W/E/R gizmo mode | M material | L flashlight | C collision | F focus | "
-                    "Ctrl+D dup | Del delete | Ctrl+S save | F1/F2 shading | H hud | Esc back/quit")
+                    "Ctrl+D dup | Alt+drag dup | Del delete | End floor snap | Shift+drag mesh snap | "
+                    "Ctrl+S save | F1/F2 shading | H hud | Esc back/quit")
     eng.run(scene, camera, max_frames=args.frames, screenshot_path=args.screenshot,
             overlay=editor.draw)
 
