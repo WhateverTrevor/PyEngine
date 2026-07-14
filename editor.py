@@ -82,6 +82,8 @@ HOVER_BG = (36, 39, 47)
 ACCENT = (255, 170, 60)
 ACCENT_DIM = (150, 108, 45)      # viewport selection bracket for non-active members
 SNAP_FACE_COLOR = (90, 220, 230)  # highlighted face during Shift-drag snap-to-mesh
+MARQUEE_COLOR = (140, 180, 255)  # box/marquee-select drag rectangle
+MARQUEE_THRESHOLD = 4            # px: shorter press-release drags stay a plain click
 
 PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
     "outliner": (OUTLINER_W, 360),
@@ -303,6 +305,10 @@ class Editor:
         self.rename_buffer = ""       # editable text while renaming_folder is set
         self.active_slider = None   # index into _details_rows while dragging
         self.gizmo_drag = None      # active gizmo drag state dict
+        self.marquee = None         # {"start","cur","shift"} while an LMB press-drag
+                                     # that started on empty viewport space is in
+                                     # progress (see _begin_viewport_press /
+                                     # _finish_marquee) -- box/marquee select
         self.gizmo_mode = "translate"  # W/E/R select translate / rotate / scale
         self.gizmo_space = "world"  # translate axes: "world" or "local" (viewport toolbar)
         self.pivot_mode = "median"  # rotate/scale pivot for multi-selections (viewport
@@ -2457,7 +2463,7 @@ class Editor:
                             and self._click_viewport_toolbar(mp, toolbar_rect)):
                         self.active_slider = None
                         if not self._try_grab_gizmo(mp, w, h, inp):
-                            self._click_viewport(mp, w, h, inp)
+                            self._begin_viewport_press(mp, w, h, inp)
 
         if self.panel_drag is not None and not inp.mouse_held(1):
             self._finish_panel_drag(mp, w, h)
@@ -2483,6 +2489,18 @@ class Editor:
             else:
                 self.gizmo_drag = None
                 self.snap_feedback = None
+
+        # marquee (box) select drag -- started by _begin_viewport_press on an
+        # empty-space press; the rect is redrawn live from marquee["cur"]
+        # (_draw_marquee), the selection change itself is deferred to
+        # release (_finish_marquee) so a tiny in-place press-release still
+        # collapses to the old plain-click behavior
+        if self.marquee is not None:
+            if inp.mouse_held(1):
+                self.marquee["cur"] = mp
+            else:
+                self._finish_marquee(mp, w, h)
+                self.marquee = None
 
         # live slider drag (details panel)
         if self.active_slider is not None:
@@ -2710,6 +2728,15 @@ class Editor:
                 best, best_d = e, d
         return best
 
+    def _viewport_hit(self, mp, w, h):
+        """Whatever the mouse would pick in the viewport right now -- a
+        marker entity (Sun/Fog Volume, proximity-picked since a raycast
+        can't hit them) takes priority, else a mesh raycast; None on empty
+        space. Shared by _click_viewport and _begin_viewport_press so both
+        agree on what counts as 'empty' (i.e. eligible to start a marquee)."""
+        marker = self._pick_marker(mp, w, h)
+        return marker if marker is not None else self._mouse_hit(mp, w, h)[0]
+
     def _click_viewport(self, mp, w, h, inp=None) -> None:
         """Plain click replaces the selection with the hit entity (or clears
         it, on empty space). Shift+click toggles the hit entity in/out of
@@ -2717,8 +2744,7 @@ class Editor:
         no-op (Blender doesn't deselect-all on that either) -- it neither
         clears nor extends the existing selection."""
         import pygame
-        marker = self._pick_marker(mp, w, h)
-        hit = marker if marker is not None else self._mouse_hit(mp, w, h)[0]
+        hit = self._viewport_hit(mp, w, h)
         shift = inp is not None and (inp.held(pygame.K_LSHIFT) or inp.held(pygame.K_RSHIFT))
         if hit is None:
             if not shift:
@@ -2728,6 +2754,87 @@ class Editor:
             self._toggle_selection(hit)
         else:
             self.selected = hit
+
+    def _begin_viewport_press(self, mp, w, h, inp=None) -> None:
+        """LMB press in the viewport that didn't grab a gizmo handle (see
+        the update() call site). A press landing on an entity keeps the
+        exact pre-marquee behavior -- click-select fires immediately, same
+        as _click_viewport always has. A press on empty space is NOT
+        resolved yet: it becomes a pending marquee: _finish_marquee decides
+        on release whether the drag distance was big enough to be a box-
+        select, or should collapse back to the old click-empty behavior
+        (clear the selection, or no-op under Shift) -- see
+        MARQUEE_THRESHOLD."""
+        import pygame
+        if self._viewport_hit(mp, w, h) is not None:
+            self._click_viewport(mp, w, h, inp)
+            return
+        shift = inp is not None and (inp.held(pygame.K_LSHIFT) or inp.held(pygame.K_RSHIFT))
+        self.marquee = {"start": mp, "cur": mp, "shift": shift}
+
+    def _entities_in_rect(self, rect, w, h):
+        """Entities for marquee/box select: v1 scope is mesh-bearing,
+        visible entities (see _world_aabb) -- projects each one's 8 world-
+        AABB corners and keeps whichever ones actually project (some may
+        fall behind the camera); an entity is included if the screen-space
+        bounding box of its projectable corners intersects `rect`. An
+        entity with NO projectable corner (fully behind the camera) is
+        excluded entirely."""
+        import pygame
+        hits = []
+        for e in self.scene.entities:
+            if e.mesh is None or not e.visible:
+                continue
+            aabb = self._world_aabb(e)
+            if aabb is None:
+                continue
+            lo, hi = aabb
+            corners = [(x, y, z) for x in (lo[0], hi[0])
+                      for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]
+            pts = [self.camera.project(self.engine_mod.Vec3(*c), w, h) for c in corners]
+            xs = [p[0] for p in pts if p is not None]
+            ys = [p[1] for p in pts if p is not None]
+            if not xs:
+                continue
+            x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+            bbox = pygame.Rect(int(x0), int(y0), max(1, int(x1 - x0)), max(1, int(y1 - y0)))
+            if bbox.colliderect(rect):
+                hits.append(e)
+        return hits
+
+    def _finish_marquee(self, mp, w, h) -> None:
+        """LMB release ending a press that started on empty viewport space
+        (see _begin_viewport_press). A drag distance under
+        MARQUEE_THRESHOLD is treated as the original plain click-on-empty
+        behavior: clear the selection, or (Shift) do nothing -- exactly
+        _click_viewport's empty-space case. Past the threshold, every
+        entity from _entities_in_rect is selected: a plain marquee
+        REPLACES the selection; Shift+marquee ADDS the rect's entities to
+        the current one, keeping any already-selected entities that fall
+        outside the rect. The active element becomes the last NEWLY added
+        entity; if nothing new qualified (e.g. Shift+marquee over empty
+        space, or every hit was already selected) the previous active
+        element is left unchanged."""
+        import pygame
+        sx, sy = self.marquee["start"]
+        shift = self.marquee["shift"]
+        if math.hypot(mp[0] - sx, mp[1] - sy) < MARQUEE_THRESHOLD:
+            if not shift:
+                self.selected = None
+            return
+        rect = pygame.Rect(min(sx, mp[0]), min(sy, mp[1]),
+                           abs(mp[0] - sx), abs(mp[1] - sy))
+        hits = self._entities_in_rect(rect, w, h)
+        if shift:
+            sel = list(self.selection)
+            active = self.selected
+            for e in hits:
+                if e not in sel:
+                    sel.append(e)
+                    active = e
+            self._set_selection(sel, active=active)
+        else:
+            self._set_selection(hits, active=(hits[-1] if hits else None))
 
     def _place_asset(self, asset, mp, w, h) -> None:
         if isinstance(asset, self.engine_mod.MaterialAsset):
@@ -2777,6 +2884,7 @@ class Editor:
         w, h = surf.get_size()
         layout = self._layout(w, h)
         self._draw_markers(surf, w, h)
+        self._draw_marquee(surf, layout)
 
         # backdrop so gaps between a side dock and the bottom dock (if both
         # are present) read as UI, not a hole showing the 3D scene through
@@ -3168,6 +3276,29 @@ class Editor:
             pygame.draw.line(surf, color, (cx, cy), (cx, cy - dy * s), 2)
         label = self.font_small.render(e.name, True, color)
         surf.blit(label, (x - label.get_width() // 2, y - r - 16))
+
+    def _draw_marquee(self, surf, layout) -> None:
+        """Live drag rectangle for box/marquee select (see
+        _begin_viewport_press / _finish_marquee): thin outline + faint
+        fill, clipped to the viewport rect so a drag that wanders over a
+        docked/floating panel never paints on top of it. Drawn only past
+        MARQUEE_THRESHOLD -- a still-pending tiny press shows nothing,
+        matching it staying a plain click on release."""
+        if self.marquee is None:
+            return
+        import pygame
+        sx, sy = self.marquee["start"]
+        cx, cy = self.marquee["cur"]
+        if math.hypot(cx - sx, cy - sy) < MARQUEE_THRESHOLD:
+            return
+        rect = pygame.Rect(min(sx, cx), min(sy, cy), abs(cx - sx), abs(cy - sy))
+        prev_clip = surf.get_clip()
+        surf.set_clip(layout["viewport"])
+        fill = pygame.Surface((max(1, rect.width), max(1, rect.height)), pygame.SRCALPHA)
+        fill.fill((*MARQUEE_COLOR, 40))
+        surf.blit(fill, rect.topleft)
+        pygame.draw.rect(surf, MARQUEE_COLOR, rect, 1)
+        surf.set_clip(prev_clip)
 
     def _draw_outliner(self, surf, rect) -> None:
         import pygame
