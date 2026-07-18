@@ -92,6 +92,7 @@ PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
     "details": (OUTLINER_W, DETAILS_H),
     "browser": (760, BROWSER_H),
 }
+TAB_LABELS = {"outliner": "Outliner", "details": "Details", "browser": "Browser"}
 RESOLUTIONS = ((1280, 720), (1440, 810), (1600, 900), (1920, 1080))
 SETTINGS_SIZE = (380, 246)
 
@@ -337,8 +338,14 @@ class Editor:
         self.api_pref = self._active_api()
 
         # ---- dockable panel state ----
-        self.dock_order = {"left": [], "right": ["outliner", "details"],
-                           "bottom": ["browser"]}
+        # dock_order[side] is an ordered list of GROUPS -- {"ids": [pid, ...],
+        # "active": pid} -- so panels dropped onto each other tab together
+        # (see "---- panel docking / floating ----" below). A lone panel is
+        # a group of one; that degenerate case renders/behaves exactly like
+        # the old flat {side: [pid, ...]} model this replaced.
+        self.dock_order = {"left": [], "right": [self._solo_group("outliner"),
+                                                 self._solo_group("details")],
+                           "bottom": [self._solo_group("browser")]}
         self.floating = []          # panel ids currently floating, z-order (front=last)
         self.panel_visible = {"outliner": True, "details": True, "browser": True}
         self.panel_minimized = {"outliner": False, "details": False, "browser": False}
@@ -521,6 +528,44 @@ class Editor:
     def _all_minimized(self, ids) -> bool:
         return len(ids) > 0 and all(self.panel_minimized.get(p, False) for p in ids)
 
+    # ---- dock groups: a group is {"ids": [pid, ...], "active": pid} --
+    # see "---- panel docking / floating ----" for the drag/drop mutations.
+    # These tiny helpers are used by both _layout (rendering) and the drop
+    # logic, so the notion of "which tab is showing" never drifts.
+    @staticmethod
+    def _solo_group(pid) -> dict:
+        return {"ids": [pid], "active": pid}
+
+    def _group_active(self, group):
+        """Effective active id for `group`: its stored active if that
+        member is still visible, else the first visible member, else
+        whatever's stored (nothing visible -- callers won't render it
+        anyway). Deliberately never WRITES back to group["active"] when a
+        hidden tab is skipped over -- closing/reopening a tab is then
+        self-healing (see _apply_layout_settings/_toggle_panel) without
+        every visibility flip needing to hunt down and patch its group."""
+        ids = group["ids"]
+        vis = [p for p in ids if self.panel_visible.get(p, True)]
+        if group["active"] in vis:
+            return group["active"]
+        if vis:
+            return vis[0]
+        return group["active"] if group["active"] in ids else (ids[0] if ids else None)
+
+    def _group_for_pid(self, pid, dock_order=None):
+        """(side, group) containing pid, or None if pid is floating/absent
+        from `dock_order` (defaults to self.dock_order)."""
+        dock_order = self.dock_order if dock_order is None else dock_order
+        for side in ("left", "right", "bottom"):
+            for group in dock_order[side]:
+                if pid in group["ids"]:
+                    return side, group
+        return None
+
+    def _panel_side(self, pid):
+        g = self._group_for_pid(pid)
+        return g[0] if g else None
+
     def _dock_side_w(self, side, w):
         """Docked left/right width from the stored fraction -- proportional
         to the window, clamped to a sane range so it can't be dragged (or
@@ -532,12 +577,25 @@ class Editor:
         px = self.dock_frac.get("bottom", DOCK_FRAC_DEFAULT["bottom"]) * h
         return int(max(MIN_PANEL_H, min(px, h * 0.6)))
 
-    def _layout(self, w, h):
+    def _layout(self, w, h, dock_order=None):
         import pygame
+        dock_order = self.dock_order if dock_order is None else dock_order
         menu = pygame.Rect(0, 0, w, MENU_H)
-        left_ids = [p for p in self.dock_order["left"] if self.panel_visible.get(p, True)]
-        right_ids = [p for p in self.dock_order["right"] if self.panel_visible.get(p, True)]
-        bottom_ids = [p for p in self.dock_order["bottom"] if self.panel_visible.get(p, True)]
+
+        def side_ids(side):
+            """Active id per visible group on `side`, in group order -- a
+            lone-panel group's active IS that panel, so this list is
+            byte-identical to the old flat per-side pid list whenever every
+            group on this side is still degenerate (the pre-tabs case)."""
+            out = []
+            for group in dock_order[side]:
+                if any(self.panel_visible.get(p, True) for p in group["ids"]):
+                    out.append(self._group_active(group))
+            return out
+
+        left_ids = side_ids("left")
+        right_ids = side_ids("right")
+        bottom_ids = side_ids("bottom")
         left_w = 0
         if left_ids:
             left_w = MIN_DOCK_W if self._all_minimized(left_ids) else self._dock_side_w("left", w)
@@ -587,8 +645,14 @@ class Editor:
                 panels[pid] = pygame.Rect(x, stack_bottom, max(0, ww), hh)
                 x += ww
 
+        grouped = {p for side in ("left", "right", "bottom")
+                  for group in dock_order[side] for p in group["ids"]}
         for pid in ("outliner", "details", "browser"):
-            if not self.panel_visible.get(pid, True) or pid in panels:
+            # `pid in panels` skips anything a stack() call already placed;
+            # `pid in grouped` additionally skips an INACTIVE tab of a real
+            # group (visible, but not the one currently showing -- it must
+            # NOT be auto-floated just because it has no entry in `panels`)
+            if not self.panel_visible.get(pid, True) or pid in panels or pid in grouped:
                 continue
             r = self._float_rect_for(pid, w, h)
             if self.panel_minimized.get(pid, False):
@@ -1694,16 +1758,78 @@ class Editor:
         return False
 
     # ---- panel docking / floating ----
+    # A panel dropped onto another docked panel's title/tab-strip joins its
+    # GROUP as an extra tab (only one docked side, left/right/bottom -- a
+    # floating panel is never a tab-join target, out of scope for this
+    # feature); dropped over a plain edge/band zone it still side-by-side
+    # stacks as a fresh solo group, exactly like the pre-tabs flat-list
+    # model. `_PANEL_ALLOWED_SIDES` is unchanged from the pre-tabs
+    # restriction (outliner/details are side-dock-only, browser is
+    # bottom-dock-only) and now gates BOTH kinds of drop.
+    _PANEL_ALLOWED_SIDES = {"outliner": ("left", "right"), "details": ("left", "right"),
+                            "browser": ("bottom",)}
+
+    @staticmethod
+    def _remove_pid_from(dock_order, floating, pid) -> None:
+        """Strip `pid` out of wherever it currently lives in `dock_order`/
+        `floating` -- a group loses just that id (reassigning "active" if it
+        was the one removed; dropped entirely once empty) or the floating
+        list loses the id. Takes explicit dock_order/floating arguments (not
+        self.*) so `_simulate_drop` can replay the exact same mutation
+        against a scratch clone for the drag-preview -- the no-drift
+        requirement."""
+        for side in ("left", "right", "bottom"):
+            for group in list(dock_order[side]):
+                if pid in group["ids"]:
+                    group["ids"].remove(pid)
+                    if group["active"] == pid:
+                        group["active"] = group["ids"][0] if group["ids"] else pid
+                    if not group["ids"]:
+                        dock_order[side].remove(group)
+        if pid in floating:
+            floating.remove(pid)
+
+    def _clone_dock_state(self):
+        """Deep-enough copy of dock_order/floating for `_simulate_drop` to
+        mutate freely without touching live state."""
+        order = {side: [{"ids": list(g["ids"]), "active": g["active"]} for g in groups]
+                for side, groups in self.dock_order.items()}
+        return order, list(self.floating)
+
+    def _apply_panel_drop(self, dock_order, floating, pid, target) -> None:
+        """The one mutation both a real drop (`_finish_panel_drag`) and the
+        preview simulation (`_simulate_drop`) perform against whichever
+        dock_order/floating they're given -- live state or a scratch clone
+        -- so the preview can never show a result the real drop wouldn't
+        produce. `target` is whatever `_panel_drag_target` returned."""
+        if target["kind"] == "tab":
+            side, anchor = target["side"], target["anchor"]
+            group = next((g for g in dock_order[side] if anchor in g["ids"]), None)
+            if group is not None and pid in group["ids"]:
+                group["active"] = pid  # already a tab here -- just switch focus
+                return
+            self._remove_pid_from(dock_order, floating, pid)
+            if group is None:  # anchor WAS `pid` and vanished when its
+                                # (degenerate) group emptied out above
+                group = next((g for g in dock_order[side] if anchor in g["ids"]), None)
+            if group is None:  # nothing left to join -- land as a fresh solo slot
+                dock_order[side].append(self._solo_group(pid))
+            else:
+                group["ids"].append(pid)
+                group["active"] = pid
+            return
+        self._remove_pid_from(dock_order, floating, pid)
+        if target["kind"] == "band":
+            dock_order[target["side"]].append(self._solo_group(pid))
+        else:
+            floating.append(pid)
+
     def _dock_panel(self, pid, side) -> None:
-        for s in ("left", "right", "bottom"):
-            if pid in self.dock_order[s]:
-                self.dock_order[s].remove(pid)
-        if pid in self.floating:
-            self.floating.remove(pid)
+        self._remove_pid_from(self.dock_order, self.floating, pid)
         if side == "float":
             self.floating.append(pid)
         else:
-            self.dock_order[side].append(pid)
+            self.dock_order[side].append(self._solo_group(pid))
         self._save_settings()
 
     def _full_panel_size(self, pid, rect):
@@ -1720,6 +1846,41 @@ class Editor:
         fw, fh = self._full_panel_size(pid, rect)
         self.panel_drag = {"id": pid, "dx": mp[0] - rect.x, "dy": mp[1] - rect.y,
                            "w": fw, "h": fh}
+
+    def _tab_header_rects(self, ids, rect):
+        """[left-packed header rect per visible tab id] within `rect`'s top
+        PANEL_TITLE_H band, leaving room for the minimize/close buttons at
+        the right end -- shared by `_draw_tab_strip` (drawing) and the
+        mousedown router (hit-testing), per the house rule against
+        hit-test/draw drift."""
+        import pygame
+        out = {}
+        x = rect.x + 2
+        limit = rect.right - 38  # minimize+close buttons live past this
+        for pid in ids:
+            if x >= limit:
+                break
+            label = TAB_LABELS.get(pid, pid)
+            tw = self.font_small.size(label)[0] + 16
+            x2 = min(x + tw, limit)
+            out[pid] = pygame.Rect(x, rect.y + 1, max(0, x2 - x), PANEL_TITLE_H - 2)
+            x = x2
+        return out
+
+    def _panel_tab_strip(self, pid, rect):
+        """{member_pid: header_rect} for `pid`'s tab strip if it's currently
+        in a REAL dock group (>=2 VISIBLE members) -- None if `pid` is
+        floating or its group is degenerate (a lone panel), in which case
+        callers must fall back to the plain single-title-bar rendering so
+        that case stays byte-identical to the pre-tabs layout."""
+        info = self._group_for_pid(pid)
+        if info is None:
+            return None
+        _, group = info
+        vis = [p for p in group["ids"] if self.panel_visible.get(p, True)]
+        if len(vis) < 2:
+            return None
+        return self._tab_header_rects(vis, rect)
 
     def _dock_zone_rect(self, side, w, h, layout):
         """Rect used for BOTH drop-zone hit-testing (`_finish_panel_drag`) and
@@ -1747,16 +1908,58 @@ class Editor:
 
     def _panel_drag_target_side(self, pid, mp, w, h, layout):
         """Which dock zone (if any) a drag of `pid` is currently over -- used
-        both to decide where a drop docks and to draw the hover highlight."""
-        if pid in ("outliner", "details"):
-            if self._dock_zone_rect("left", w, h, layout).collidepoint(mp):
-                return "left"
-            if self._dock_zone_rect("right", w, h, layout).collidepoint(mp):
-                return "right"
-        elif pid == "browser":
-            if self._dock_zone_rect("bottom", w, h, layout).collidepoint(mp):
-                return "bottom"
+        both to decide where a "band" drop docks and to draw the hover
+        highlight; `_panel_drag_target` checks this AFTER the more specific
+        tab-join rects."""
+        for side in self._PANEL_ALLOWED_SIDES.get(pid, ()):
+            if self._dock_zone_rect(side, w, h, layout).collidepoint(mp):
+                return side
         return None
+
+    def _panel_drag_target(self, pid, mp, w, h, layout):
+        """Single source of truth for where a title/tab-strip drag of `pid`
+        will land if released right now -- used by BOTH `_finish_panel_drag`
+        (the real drop) and the ghost preview drawn while dragging
+        (`_simulate_drop`), so the preview can never show a spot the drop
+        wouldn't actually honor. Returns one of:
+          {"kind": "tab", "side": side, "anchor": apid}  -- join apid's group
+          {"kind": "band", "side": side}                 -- new stacked group
+          {"kind": "float"}                              -- floats
+
+        Checked most-specific first: mp over an existing DOCKED panel's
+        title/tab-strip rect (any currently-active pid in `layout["panels"]`
+        that belongs to a dock group, gated by `_PANEL_ALLOWED_SIDES` so a
+        browser can't tab into a side-dock slot or vice versa) beats the
+        coarser edge/band zones -- exactly the "as opposed to the dock
+        band's edge zones" distinction from the spec. A floating panel is
+        never a tab-join target (out of scope)."""
+        import pygame
+        for apid, rect in layout["panels"].items():
+            info = self._group_for_pid(apid)
+            if info is None:
+                continue  # floating -- not a tab-join target
+            side = info[0]
+            if side not in self._PANEL_ALLOWED_SIDES.get(pid, ()):
+                continue
+            title_rect = pygame.Rect(rect.x, rect.y, rect.width, PANEL_TITLE_H)
+            if title_rect.collidepoint(mp):
+                return {"kind": "tab", "side": side, "anchor": apid}
+        side = self._panel_drag_target_side(pid, mp, w, h, layout)
+        if side is not None:
+            return {"kind": "band", "side": side}
+        return {"kind": "float"}
+
+    def _simulate_drop(self, pid, target, w, h):
+        """The rect `pid` would occupy immediately after finishing this
+        drag: replays the exact drop mutation (`_apply_panel_drop`) on a
+        scratch clone of the dock state and re-runs the real `_layout` math
+        -- so the drag-preview ghost is computed from the same layout math
+        a real drop would produce, never hand-approximated. None if `pid`
+        wouldn't end up placed (shouldn't happen for "tab"/"band" targets)."""
+        order, floating = self._clone_dock_state()
+        self._apply_panel_drop(order, floating, pid, target)
+        sim = self._layout(w, h, dock_order=order)
+        return sim["panels"].get(pid)
 
     def _finish_panel_drag(self, mp, w, h) -> None:
         import pygame
@@ -1764,13 +1967,14 @@ class Editor:
         pid = g["id"]
         gx, gy = mp[0] - g["dx"], mp[1] - g["dy"]
         layout = self._layout(w, h)
-        side = self._panel_drag_target_side(pid, mp, w, h, layout)
-        if side is not None:
-            self._dock_panel(pid, side)
-        else:
+        target = self._panel_drag_target(pid, mp, w, h, layout)
+        if target["kind"] == "float":
             self.float_rect[pid] = pygame.Rect(gx, gy, g["w"], g["h"])
-            self._dock_panel(pid, "float")
+            self._apply_panel_drop(self.dock_order, self.floating, pid, target)
             self._float_rect_for(pid, w, h)  # clamp on-screen
+        else:
+            self._apply_panel_drop(self.dock_order, self.floating, pid, target)
+        self._save_settings()
         self.panel_drag = None
 
     # ---- splitter drag (docked panel resize) ----
@@ -1852,8 +2056,9 @@ class Editor:
         self.mat_ui = MaterialEditorUI(self, e)
 
     def _reset_layout(self) -> None:
-        self.dock_order = {"left": [], "right": ["outliner", "details"],
-                           "bottom": ["browser"]}
+        self.dock_order = {"left": [], "right": [self._solo_group("outliner"),
+                                                 self._solo_group("details")],
+                           "bottom": [self._solo_group("browser")]}
         self.floating = []
         self.panel_visible = {"outliner": True, "details": True, "browser": True}
         self.panel_minimized = {"outliner": False, "details": False, "browser": False}
@@ -1983,7 +2188,9 @@ class Editor:
             "fullscreen": bool(self.eng.fullscreen),
             "panel_visible": dict(self.panel_visible),
             "panel_minimized": dict(self.panel_minimized),
-            "dock_order": {side: list(ids) for side, ids in self.dock_order.items()},
+            "dock_order": {side: [{"ids": list(g["ids"]), "active": g["active"]}
+                                  for g in groups]
+                          for side, groups in self.dock_order.items()},
             "floating": list(self.floating),
             "float_rect": {pid: [r.x, r.y, r.width, r.height]
                           for pid, r in self.float_rect.items()},
@@ -2017,21 +2224,46 @@ class Editor:
                 and all(isinstance(v, (int, float)) for v in c)):
             self.cursor3d = self.engine_mod.Vec3(float(c[0]), float(c[1]), float(c[2]))
 
+    def _migrate_dock_order(self, raw: dict, valid: set) -> dict:
+        """Build fresh dock groups from a saved `dock_order`, accepting
+        EITHER the pre-tabs flat format ({side: [pid, ...]}) or the current
+        group format ({side: [{"ids": [...], "active": pid}, ...]} written
+        by `_settings_dict`). An old-format entry becomes a solo (single-
+        tab) group -- the same "lone panel is a group of one" degenerate
+        case _layout already renders identically to the flat-list era --
+        so a settings.json saved before this feature loads exactly as it
+        looked before."""
+        out = {"left": [], "right": [], "bottom": []}
+        for side in ("left", "right", "bottom"):
+            for item in raw.get(side, []):
+                if isinstance(item, str):  # old flat {side: [pid, ...]} format
+                    if side in self._PANEL_ALLOWED_SIDES.get(item, ()) and item in valid:
+                        out[side].append(self._solo_group(item))
+                elif isinstance(item, dict):  # current {"ids", "active"} group format
+                    ids = [p for p in item.get("ids", [])
+                          if side in self._PANEL_ALLOWED_SIDES.get(p, ()) and p in valid]
+                    ids = list(dict.fromkeys(ids))  # de-dupe, keep first occurrence's order
+                    if not ids:
+                        continue
+                    active = item.get("active")
+                    if active not in ids:
+                        active = ids[0]
+                    out[side].append({"ids": ids, "active": active})
+        return out
+
     def _apply_layout_settings(self, data: dict) -> None:
         import pygame
         self._apply_snap_settings(data)
         self._apply_pivot_settings(data)
         self._apply_cursor_settings(data)
         valid = {"outliner", "details", "browser"}
-        dock_order = data.get("dock_order", {})
-        left = [p for p in dock_order.get("left", []) if p in ("outliner", "details")]
-        right = [p for p in dock_order.get("right", []) if p in ("outliner", "details")]
-        bottom = [p for p in dock_order.get("bottom", []) if p == "browser"]
+        migrated = self._migrate_dock_order(data.get("dock_order", {}), valid)
         floating = [p for p in data.get("floating", []) if p in valid]
-        placed = left + right + bottom + floating
+        placed = ([p for side in ("left", "right", "bottom")
+                  for g in migrated[side] for p in g["ids"]] + floating)
         if set(placed) != valid or len(placed) != len(valid):
             return  # partial/corrupt layout data: keep the built-in default
-        self.dock_order = {"left": left, "right": right, "bottom": bottom}
+        self.dock_order = migrated
         self.floating = floating
         pv = data.get("panel_visible", {})
         for pid in valid:
@@ -2483,12 +2715,29 @@ class Editor:
                     if title_rect.collidepoint(mp):
                         btns = self._panel_title_buttons(rect)
                         if btns["close"].collidepoint(mp):
+                            # close/minimize apply to the ACTIVE tab -- `target`
+                            # is always that active pid, tabbed or not
                             self.panel_visible[target] = False
                             self._save_settings()
                         elif btns["minimize"].collidepoint(mp):
                             self._toggle_minimize(target)
                         else:
-                            self._begin_panel_drag(target, mp, rect)
+                            drag_pid = target
+                            tabs = self._panel_tab_strip(target, rect)
+                            if tabs is not None:
+                                for tpid, trect in tabs.items():
+                                    if trect.collidepoint(mp):
+                                        drag_pid = tpid
+                                        break
+                            # begin_panel_drag on whichever tab was actually
+                            # clicked (may differ from `target`, the slot's
+                            # current active) -- release re-runs the same
+                            # drop math regardless, so a plain click that
+                            # lands back on this same group just switches
+                            # active (see _apply_panel_drop's fast path)
+                            # while an actual drag can pull it elsewhere or
+                            # out to floating
+                            self._begin_panel_drag(drag_pid, mp, rect)
                     elif not self.panel_minimized.get(target, False):
                         if target in self.floating \
                                 and self._panel_resize_handle(rect).collidepoint(mp):
@@ -2976,7 +3225,11 @@ class Editor:
 
         panels = dict(layout["panels"])
         drag_pid = self.panel_drag["id"] if self.panel_drag else None
-        if drag_pid is not None and drag_pid in panels:
+        if drag_pid is not None:
+            # unconditional: a dragged tab may be an INACTIVE member of its
+            # group (so it has no entry of its own in layout["panels"] --
+            # only the active tab does) yet must still get a ghost rect that
+            # follows the mouse, same as the plain single-panel drag case
             mp = eng.input.mouse_pos
             g = self.panel_drag
             dh = PANEL_TITLE_H if self.panel_minimized.get(drag_pid, False) else g["h"]
@@ -2989,20 +3242,33 @@ class Editor:
         for pid in self.floating:
             if pid in panels and pid != drag_pid:
                 self._draw_panel(surf, pid, panels[pid])
-        if drag_pid is not None and drag_pid in panels:
-            self._draw_panel(surf, drag_pid, panels[drag_pid])
-            # highlight the dock zone (if any) the drag is hovering, on top
-            # of every panel (including docked ones already occupying that
-            # zone) so it stays visible while dragging over an existing
-            # dock -- same rect `_finish_panel_drag` uses to decide the
-            # actual drop, so the highlight never lies about where it lands
-            side = self._panel_drag_target_side(drag_pid, mp, w, h, layout)
-            if side is not None:
-                zone = self._dock_zone_rect(side, w, h, layout)
-                hl = pygame.Surface((zone.width, zone.height), pygame.SRCALPHA)
-                hl.fill((*ACCENT, 60))
-                surf.blit(hl, zone.topleft)
-                pygame.draw.rect(surf, ACCENT, zone, 2)
+        if drag_pid is not None:
+            # docking preview drawn FIRST (underneath), the flying ghost
+            # panel on top of it -- the preview rect can be as large as an
+            # entire merged tab group's slot and may fully contain the
+            # ghost's own on-screen position, so the ghost has to win that
+            # layering fight to stay legible (title text, buttons, ...).
+            # The preview is the ACTUAL rect (and, for a tab-join, the
+            # tab-strip band) `pid` will occupy after the drop -- run
+            # through the exact same math `_finish_panel_drag` uses, so
+            # this can never show a spot the drop wouldn't honor
+            target = self._panel_drag_target(drag_pid, mp, w, h, layout)
+            if target["kind"] != "float":
+                preview = self._simulate_drop(drag_pid, target, w, h)
+                if preview is not None:
+                    hl = pygame.Surface((preview.width, preview.height), pygame.SRCALPHA)
+                    hl.fill((*ACCENT, 55))
+                    surf.blit(hl, preview.topleft)
+                    pygame.draw.rect(surf, ACCENT, preview, 2)
+                    if target["kind"] == "tab":  # emphasize: joins as a tab,
+                                                  # not a side-by-side split
+                        strip = pygame.Rect(preview.x, preview.y,
+                                            preview.width, PANEL_TITLE_H)
+                        pygame.draw.rect(surf, ACCENT, strip, 3)
+            # force_plain: the flying ghost previews just the ONE panel
+            # being pulled, never its (still-intact, until release) tab
+            # strip -- that would look like it dragged its whole group
+            self._draw_panel(surf, drag_pid, panels[drag_pid], force_plain=True)
 
         if self.drag_asset is not None:
             is_mat = isinstance(self.drag_asset, self.engine_mod.MaterialAsset)
@@ -3042,7 +3308,35 @@ class Editor:
             surf.blit(lab, (r.x + (r.width - lab.get_width()) // 2,
                             r.y + (r.height - lab.get_height()) // 2))
 
-    def _draw_panel(self, surf, pid, rect) -> None:
+    def _draw_tab_strip(self, surf, active_pid, tabs) -> None:
+        """Tab headers for a REAL (>=2 visible member) dock group -- active
+        tab brighter with an accent underline, inactive tabs dimmer, styled
+        consistently with the plain panel title bar it replaces (UE-ish)."""
+        import pygame
+        mp = pygame.mouse.get_pos()
+        for pid, r in tabs.items():
+            active = pid == active_pid
+            if active:
+                bg = (40, 44, 54)
+            elif r.collidepoint(mp):
+                bg = (34, 37, 45)
+            else:
+                bg = (27, 29, 35)
+            pygame.draw.rect(surf, bg, r)
+            color = TEXT if active else TEXT_DIM
+            label = TAB_LABELS.get(pid, pid)
+            lab = self.font_small.render(label, True, color)
+            surf.blit(lab, (r.x + (r.width - lab.get_width()) // 2,
+                            r.y + (r.height - lab.get_height()) // 2))
+            if active:
+                pygame.draw.line(surf, ACCENT, (r.x, r.bottom - 1),
+                                 (r.right, r.bottom - 1), 2)
+
+    def _draw_panel(self, surf, pid, rect, force_plain=False) -> None:
+        """`force_plain` skips the tab strip even if `pid`'s group has other
+        visible members -- used only for the flying drag-ghost, which
+        previews just the one panel being pulled, not its (still-intact
+        until release) tab group."""
         import pygame
         pygame.draw.rect(surf, PANEL_BG, rect)
         pygame.draw.rect(surf, PANEL_EDGE, rect, 1)
@@ -3050,8 +3344,12 @@ class Editor:
         pygame.draw.rect(surf, (30, 33, 40), title_rect)
         pygame.draw.line(surf, PANEL_EDGE, (rect.x, rect.y + PANEL_TITLE_H),
                          (rect.right, rect.y + PANEL_TITLE_H))
-        lab = self.font_small.render(self._panel_title(pid)[:40], True, TEXT)
-        surf.blit(lab, (rect.x + 8, rect.y + 3))
+        tabs = None if force_plain else self._panel_tab_strip(pid, rect)
+        if tabs is not None:
+            self._draw_tab_strip(surf, pid, tabs)
+        else:
+            lab = self.font_small.render(self._panel_title(pid)[:40], True, TEXT)
+            surf.blit(lab, (rect.x + 8, rect.y + 3))
         self._draw_title_buttons(surf, rect)
         if self.panel_minimized.get(pid, False):
             return

@@ -167,7 +167,7 @@ mid_right = (right_zone.centerx, right_zone.centery)
 side = editor._panel_drag_target_side("details", mid_right, W, H, lay9)
 assert side == "right", side
 editor._finish_panel_drag(mid_right, W, H)
-assert "details" in editor.dock_order["right"], editor.dock_order
+assert editor._panel_side("details") == "right", editor.dock_order
 print("dock-zone drop OK: dropping over the right dock's band docks there")
 
 editor._dock_panel("details", "float")
