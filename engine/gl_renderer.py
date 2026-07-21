@@ -11,8 +11,12 @@ global face id (`entity's face offset in the scene + local face index`).
 
 Geometry is a per-entity, non-indexed "vertex soup" in LOCAL space (position,
 flat-shaded face normal, face color, local face index), cached by
-`id(entity.mesh)`; only the color buffer is rebuilt when the material editor
-swaps `mesh.face_colors` for a new array. Model/normal matrices are per-draw
+`id(mesh)` -- `mesh` being whichever LOD `entity.render_mesh()` selects this
+frame (see engine/lod.py), NOT necessarily `entity.mesh`; every LOD level an
+entity has gets its own cache entry, kept alive as long as the entity is
+live (see `_prune_geo_cache`) so switching LOD reuses buffers instead of
+rebuilding. Only the color buffer is rebuilt when the material editor swaps
+`mesh.face_colors` for a new array. Model/normal matrices are per-draw
 uniforms -- one draw call per entity, which is plenty for the entity counts
 this engine deals with.
 
@@ -37,7 +41,8 @@ import moderngl
 import numpy as np
 
 from .gpu_geometry import (_build_color, _build_geometry, _build_opacity,
-                           _build_pbr, _entity_world_faces, _scene_environment)
+                           _build_pbr, _entity_world_faces, _lod_gather,
+                           _scene_environment)
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
 from .raytrace import GITracer
@@ -499,14 +504,23 @@ class GLRenderer:
         lights = _gather_lights(scene)[: self.MAX_LIGHTS]
         self.stats["shadow_lights"] = sum(1 for li in lights if li.light.cast_shadows)
 
+        # `render_meshes[i]` is live[i]'s SELECTED LOD (see engine/lod.py) --
+        # the geometry actually rasterized this frame. Shadow/GI values below
+        # are always ray-traced at LOD0 (`_entity_world_faces(entity)`
+        # defaults to `entity.mesh`) and gathered onto the render mesh's own
+        # faces via `_lod_gather` -- occlusion never depends on which LOD the
+        # camera happens to be rasterizing (see raytrace.py's world-version
+        # cache); `_lod_gather` is a no-op whenever `render_mesh IS
+        # entity.mesh` (no LOD active, or every built-in asset).
         live = [e for e in scene.entities if e.mesh is not None and e.visible]
-        face_counts = [int(e.mesh.faces.shape[0]) for e in live]
+        render_meshes = [e.render_mesh() for e in live]
+        face_counts = [int(m.faces.shape[0]) for m in render_meshes]
         total_faces = int(sum(face_counts))
         offsets = np.cumsum([0] + face_counts[:-1]).tolist() if face_counts else []
 
         shadow_data = np.ones((max(total_faces, 1), self.MAX_LIGHTS), dtype=np.float32)
         if tracer is not None and total_faces > 0:
-            for entity, off, m in zip(live, offsets, face_counts):
+            for entity, rmesh, off, m in zip(live, render_meshes, offsets, face_counts):
                 if not any(li.light.cast_shadows for li in lights):
                     break
                 centroids_w, normals_w = _entity_world_faces(entity)
@@ -517,7 +531,7 @@ class GLRenderer:
                     active = strength > 1e-3
                     factors = tracer.shadow_factors(entity, info.light, info.pos,
                                                      centroids_w, normals_w, active)
-                    shadow_data[off:off + m, li_idx] = factors
+                    shadow_data[off:off + m, li_idx] = _lod_gather(entity, rmesh, factors)
         self._upload_shadow_tex(shadow_data, total_faces)
 
         # directional (sun) shadow -- reserved single-column texture, same
@@ -527,14 +541,15 @@ class GLRenderer:
         if tracer is not None and sun is not None and sun.shadow_depth > 1e-6 and total_faces > 0:
             dl_dir = scene.light.direction.to_array()
             to_light = -dl_dir / max(np.linalg.norm(dl_dir), 1e-12)
-            for entity, off, m in zip(live, offsets, face_counts):
+            for entity, rmesh, off, m in zip(live, render_meshes, offsets, face_counts):
                 centroids_w, normals_w = _entity_world_faces(entity)
                 lambert = np.clip(normals_w @ to_light, 0.0, 1.0)
                 active = lambert > 1e-3
                 raw = tracer.directional_shadow_factors(
                     entity, dl_dir, sun.shadow_softness, sun.shadow_samples,
                     centroids_w, normals_w, active)
-                dl_shadow_data[off:off + m, 0] = 1.0 - sun.shadow_depth * (1.0 - raw)
+                dshadow = 1.0 - sun.shadow_depth * (1.0 - raw)
+                dl_shadow_data[off:off + m, 0] = _lod_gather(entity, rmesh, dshadow)
         self._upload_dl_shadow_tex(dl_shadow_data, total_faces)
 
         # one-bounce GI -- baked/cached by GITracer, zero per-frame cost once static
@@ -545,10 +560,10 @@ class GLRenderer:
                                       lambda casters: _gi_direct_lighting(scene, casters, tracer),
                                       _gi_receiver_geometry,
                                       gi_cfg.get("samples", 16), gi_cfg.get("intensity", 1.0))
-            for entity, off, m in zip(live, offsets, face_counts):
+            for entity, rmesh, off, m in zip(live, render_meshes, offsets, face_counts):
                 gi = gi_map.get(id(entity))
                 if gi is not None:
-                    gi_data[off:off + m] = gi
+                    gi_data[off:off + m] = _lod_gather(entity, rmesh, gi)
         self._upload_gi_tex(gi_data, total_faces)
 
         view = camera.view_matrix()
@@ -586,8 +601,8 @@ class GLRenderer:
         ctx.enable(moderngl.CULL_FACE)
         ctx.cull_face = self._cull_face
 
-        def _draw(entity, off) -> int:
-            cache = self._get_geo_cache(entity.mesh)
+        def _draw(entity, rmesh, off) -> int:
+            cache = self._get_geo_cache(rmesh)
             model = entity.transform.matrix()
             mvp = proj @ view @ model
             _write_mat(prog["mvp"], mvp)
@@ -602,13 +617,13 @@ class GLRenderer:
             return cache["count"] // 3
 
         triangles = 0
-        opaque_pairs = [(e, off) for e, off in zip(live, offsets)
-                        if e.mesh.faces.shape[0] > 0 and not _is_translucent(e)]
-        translucent_pairs = [(e, off) for e, off in zip(live, offsets)
-                             if e.mesh.faces.shape[0] > 0 and _is_translucent(e)]
+        opaque_pairs = [(e, m, off) for e, m, off in zip(live, render_meshes, offsets)
+                        if m.faces.shape[0] > 0 and not _is_translucent(e)]
+        translucent_pairs = [(e, m, off) for e, m, off in zip(live, render_meshes, offsets)
+                             if m.faces.shape[0] > 0 and _is_translucent(e)]
 
-        for entity, off in opaque_pairs:
-            triangles += _draw(entity, off)
+        for entity, rmesh, off in opaque_pairs:
+            triangles += _draw(entity, rmesh, off)
 
         if translucent_pairs:
             # Back-to-front per-entity painter order (approximates the CPU
@@ -629,8 +644,8 @@ class GLRenderer:
             self.target.depth_mask = False
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-            for entity, off in translucent_pairs:
-                triangles += _draw(entity, off)
+            for entity, rmesh, off in translucent_pairs:
+                triangles += _draw(entity, rmesh, off)
             ctx.disable(moderngl.BLEND)
             self.target.depth_mask = True
 
@@ -804,7 +819,17 @@ class GLRenderer:
         return cache
 
     def _prune_geo_cache(self, live_entities) -> None:
-        live_ids = {id(e.mesh) for e in live_entities}
+        # keep EVERY LOD level's buffers alive for a live entity, not just
+        # its currently-selected one -- otherwise switching LOD would evict
+        # and rebuild the other level's GPU buffers every time, defeating
+        # the whole point of the runtime selector's hysteresis (see
+        # engine/lod.py). LOD1+ are strictly smaller than LOD0, so this
+        # costs at most a fraction more VRAM than caching LOD0 alone.
+        live_ids = set()
+        for e in live_entities:
+            live_ids.add(id(e.mesh))
+            for m in e.lod_meshes:
+                live_ids.add(id(m))
         for key in [k for k in self._geo_cache if k not in live_ids]:
             c = self._geo_cache.pop(key)
             c["vao"].release()

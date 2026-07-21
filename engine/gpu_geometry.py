@@ -57,9 +57,28 @@ def _build_opacity(mesh, face_id_tri) -> np.ndarray:
     return np.repeat(op, 3)[:, None]
 
 
-def _entity_world_faces(entity):
-    """World-space per-face centroids + normals, mirroring _entity_geometry."""
-    mesh = entity.mesh
+def _lod_gather(entity, render_mesh, values: np.ndarray) -> np.ndarray:
+    """Map a per-LOD0-face array (shape (entity.mesh face count, ...)) onto
+    `render_mesh`'s own faces via its `lod_source_faces` map (see
+    engine/lod.py) -- identity when `render_mesh` IS `entity.mesh` (no LOD
+    active, or the mesh has no LOD data at all -- every built-in asset).
+    Used for shadow/GI values, which are always computed at LOD0 face
+    granularity (ray-traced occlusion/bounce must never depend on which LOD
+    the camera happens to be rasterizing -- see raytrace.py's world-version
+    cache) then gathered onto whichever LOD is actually being drawn.
+    """
+    if render_mesh is entity.mesh:
+        return values
+    src = getattr(render_mesh, "lod_source_faces", None)
+    return values if src is None else values[src]
+
+
+def _entity_world_faces(entity, mesh=None):
+    """World-space per-face centroids + normals, mirroring _entity_geometry.
+    `mesh` defaults to `entity.mesh` (LOD0) -- pass a specific mesh (e.g. an
+    entity's currently-selected render LOD) to get that mesh's own world
+    geometry instead."""
+    mesh = mesh if mesh is not None else entity.mesh
     model = entity.transform.matrix()
     verts_world = mesh.vertices @ model[:3, :3].T + model[:3, 3]
     try:

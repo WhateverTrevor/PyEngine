@@ -60,10 +60,28 @@ class Entity:
         self.sun = None                  # SunDisc: sky-disc + shadow tuning (see lighting.py)
         self.fog_volume = None           # FogVolume: local volumetric fog box (see lighting.py)
         self.asset_name: str | None = None  # set when spawned from an asset file
+        # distance-based LOD (see engine/lod.py): `mesh` is always LOD0 --
+        # collision, ray-traced shadows/GI, and gizmo/AABB math all keep
+        # reading `.mesh` unchanged. `lod_meshes` are LOD1, LOD2, ... in
+        # decreasing detail (empty for every built-in asset and any mesh at
+        # or below lod.LOD_FACE_THRESHOLD); `lod_index` is the currently
+        # selected level, updated once/frame by lod.update_scene_lods.
+        self.lod_meshes: list[Mesh] = []
+        self.lod_index = 0
 
     def add_behavior(self, behavior: Behavior) -> "Entity":
         self.behaviors.append(behavior)
         return self
+
+    def render_mesh(self) -> Mesh | None:
+        """The mesh the rasterizer should draw this frame: `mesh` (LOD0)
+        unless LOD data exists and `lod_index` selects a coarser level. Ray-
+        traced shadows/GI never call this -- they always read `.mesh`
+        directly (see raytrace.py), which is the whole point: occlusion
+        stays pinned to the full mesh regardless of camera-distance LOD."""
+        if not self.lod_meshes or self.lod_index <= 0:
+            return self.mesh
+        return self.lod_meshes[min(self.lod_index, len(self.lod_meshes)) - 1]
 
 
 class Scene:

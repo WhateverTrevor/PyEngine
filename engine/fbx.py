@@ -33,6 +33,9 @@ import zlib
 
 import numpy as np
 
+from .lod import generate_lods
+from .mesh import Mesh
+
 _MAGIC = b"Kaydara FBX Binary  \x00"
 
 _ARRAY_TYPES = {
@@ -383,9 +386,34 @@ def fbx_fit_scale(path: str, up_axis: str = "y", max_bound: float = 4.0,
     return target / largest if largest > 1e-9 else 1.0
 
 
+def _lod_npz_arrays(vertices: np.ndarray, padded_faces, face_colors: np.ndarray) -> dict:
+    """Extra .npz keys for `import_fbx`'s `generate_lods=True` path:
+    decimated LOD1/2/3 levels (see engine/lod.py) built from the exact
+    geometry about to be written as LOD0. Returns {} if the mesh is at or
+    below `lod.LOD_FACE_THRESHOLD` faces (no extra levels are generated) --
+    the .npz then comes out identical to `generate_lods=False`.
+    """
+    mesh = Mesh(vertices, padded_faces,
+               face_colors=np.clip(face_colors * 255.0, 0.0, 255.0))
+    lods = generate_lods(mesh)
+    if len(lods) <= 1:
+        return {}
+    out = {"lod_levels": np.array(len(lods) - 1)}
+    for i, lm in enumerate(lods[1:], start=1):
+        out[f"lod{i}_vertices"] = lm.vertices.astype(np.float32)
+        out[f"lod{i}_faces"] = lm.faces.astype(np.int32)
+        out[f"lod{i}_face_colors"] = np.clip(lm.face_colors, 0, 255).astype(np.uint8)
+        out[f"lod{i}_face_roughness"] = lm.face_roughness.astype(np.float32)
+        out[f"lod{i}_face_metallic"] = lm.face_metallic.astype(np.float32)
+        out[f"lod{i}_face_emissive"] = lm.face_emissive.astype(np.float32)
+        out[f"lod{i}_face_opacity"] = lm.face_opacity.astype(np.float32)
+        out[f"lod{i}_source_faces"] = lm.lod_source_faces.astype(np.int64)
+    return out
+
+
 def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
                max_bound: float = 4.0, scale: float = 1.0,
-               up_axis: str = "y") -> str:
+               up_axis: str = "y", generate_lods: bool = True) -> str:
     """Convert an .fbx into a content-browser asset. Returns the asset name.
 
     `scale` and `up_axis` are baked into the stored vertices at import time
@@ -394,6 +422,13 @@ def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
     size/orientation with no runtime cost. Defaults (scale=1, up_axis="y")
     reproduce this function's pre-dialog behavior exactly, so every other
     caller (tests, the File>Import FBX menu item) is unaffected.
+
+    `generate_lods` (default True, the import dialog's checkbox default):
+    builds decimated LOD1/2/3 levels (see engine/lod.py) from the FINAL
+    (scaled) geometry and stores them in the same .npz as `lod{i}_*` keys.
+    A mesh at or below `lod.LOD_FACE_THRESHOLD` faces produces no extra
+    levels regardless of this flag -- the .npz comes out byte-for-byte the
+    same as if `generate_lods=False`, so small imports are unaffected.
     """
     vertices, faces, face_colors, face_uvs = _prepared_geometry(path, up_axis, max_bound)
     if scale != 1.0:
@@ -408,6 +443,8 @@ def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
     extra = {}
     if face_uvs is not None:
         extra["face_uvs"] = face_uvs.astype(np.float32)
+    if generate_lods:
+        extra.update(_lod_npz_arrays(vertices, padded, face_colors))
     np.savez_compressed(os.path.join(models_dir, f"{stem}.npz"),
                         vertices=vertices.astype(np.float32),
                         faces=np.asarray(padded, dtype=np.int32),

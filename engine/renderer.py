@@ -20,6 +20,7 @@ import math
 import numpy as np
 import pygame
 
+from .gpu_geometry import _lod_gather
 from .lighting import SpotLight, ies_curve
 from .math3d import rotation_x, rotation_y
 from .raytrace import GITracer
@@ -285,9 +286,11 @@ class Renderer:
     # ------------------------------------------------------------------
     # shared geometry: camera-space transform, cull, clip, project
     # ------------------------------------------------------------------
-    def _entity_geometry(self, entity, view, k, cx, cy, near, far):
-        """Returns per-entity geometry dict, or None if nothing to draw."""
-        mesh = entity.mesh
+    def _entity_geometry(self, entity, mesh, view, k, cx, cy, near, far):
+        """Returns per-entity geometry dict, or None if nothing to draw.
+        `mesh` is the mesh to actually rasterize -- the caller's choice of
+        `entity.render_mesh()` (the selected LOD) vs `entity.mesh` (LOD0,
+        e.g. for the GI/shadow occluder soup, which never calls this)."""
         model = entity.transform.matrix()
         verts_world = mesh.vertices @ model[:3, :3].T + model[:3, 3]
         verts_cam = verts_world @ view[:3, :3].T + view[:3, 3]
@@ -346,10 +349,22 @@ class Renderer:
                 return e.environment
         return None
 
-    def _directional_base(self, scene, entity, normals, centroids, env, tracer):
+    def _directional_base(self, scene, entity, render_mesh, normals, centroids, env, tracer):
         """Ambient + directional term for one entity's faces. Only the
         directional (lambert) part is shadowed -- ambient/sky light isn't
         blocked by the sun's ray-traced occlusion test.
+
+        `normals`/`centroids` are `render_mesh`'s own world-space geometry
+        (whichever LOD is being rasterized) -- lambert is computed fresh
+        from them so the visible shading direction always matches the
+        actual drawn surface. The ray-traced shadow test itself always runs
+        at LOD0 geometry (`entity.mesh` -- occlusion must never depend on
+        which LOD the camera happens to be rasterizing, see raytrace.py's
+        world-version cache) and its result is gathered onto `render_mesh`'s
+        faces via `_lod_gather`; when `render_mesh IS entity.mesh` (no LOD
+        active -- true for every built-in and most frames) this collapses to
+        exactly the prior computation, reusing the caller's arrays with zero
+        extra cost.
 
         Returns (base (M, 3), shadowed_lambert (M,)) -- the latter is the
         same shadowed NdotL the diffuse term used, reused by the deferred
@@ -363,16 +378,40 @@ class Renderer:
         if tracer is not None:
             sun = _scene_sun(scene)
             if sun is not None and sun.shadow_depth > 1e-6:
-                active = lambert > 1e-3
+                if render_mesh is entity.mesh:
+                    c0, n0, lam0 = centroids, normals, lambert
+                else:
+                    c0, n0 = _world_face_geometry(entity)
+                    lam0 = np.clip(n0 @ to_light, 0.0, 1.0)
+                active0 = lam0 > 1e-3
                 raw = tracer.directional_shadow_factors(
                     entity, dl_dir, sun.shadow_softness, sun.shadow_samples,
-                    centroids, normals, active)
-                lambert = lambert * (1.0 - sun.shadow_depth * (1.0 - raw))
+                    c0, n0, active0)
+                dshadow0 = 1.0 - sun.shadow_depth * (1.0 - raw)
+                lambert = lambert * _lod_gather(entity, render_mesh, dshadow0)
         if env is not None:  # image-based ambient from the HDRI environment
             base = env.ambient(normals) + dl_color[None, :] * lambert[:, None]
         else:
             base = dl.ambient + dl_color[None, :] * ((1.0 - dl.ambient) * lambert)[:, None]
         return base, lambert
+
+    def _light_shadow_gathered(self, entity, render_mesh, normals, centroids,
+                               active, tracer, info) -> np.ndarray:
+        """Ray-traced point/spot shadow factor for `info.light`, evaluated at
+        LOD0 face granularity (occlusion always uses the full mesh -- see
+        `_directional_base`'s docstring) and gathered onto `render_mesh`'s
+        own faces. `normals`/`centroids`/`active` are the caller's
+        render-mesh-granularity arrays (and its already-computed `active`
+        mask), reused directly -- no LOD0 recompute -- when `render_mesh IS
+        entity.mesh`."""
+        if render_mesh is entity.mesh:
+            c0, n0, active0 = centroids, normals, active
+        else:
+            c0, n0 = _world_face_geometry(entity)
+            active0 = _face_light_strength(info, n0, c0) > 1e-3
+        factors0 = (tracer.shadow_factors(entity, info.light, info.pos, c0, n0, active0)
+                   if active0.any() else np.ones(len(c0)))
+        return _lod_gather(entity, render_mesh, factors0)
 
     def _gi_contrib(self, scene, tracer) -> dict:
         """{id(entity): (M, 3) indirect-light array} from the cached GI bake,
@@ -472,25 +511,26 @@ class Renderer:
         for entity in scene.entities:
             if entity.mesh is None or not entity.visible or _is_translucent(entity):
                 continue
-            geo = self._entity_geometry(entity, view, k, w * 0.5, h * 0.5,
+            render_mesh = entity.render_mesh()
+            geo = self._entity_geometry(entity, render_mesh, view, k, w * 0.5, h * 0.5,
                                         camera.near, camera.far)
             if geo is None:
                 continue
             normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
 
-            lum, _sun_lambert = self._directional_base(scene, entity, normals, centroids,
-                                                        env, tracer)
+            lum, _sun_lambert = self._directional_base(scene, entity, render_mesh, normals,
+                                                        centroids, env, tracer)
             gi = gi_map.get(id(entity))
             if gi is not None:
-                lum = lum + gi
+                lum = lum + _lod_gather(entity, render_mesh, gi)
             for info in lights:
                 strength = _face_light_strength(info, normals, centroids)
                 active = strength > 1e-3
                 if not active.any():
                     continue
                 if tracer is not None and info.light.cast_shadows:
-                    strength = strength * tracer.shadow_factors(
-                        entity, info.light, info.pos, centroids, normals, active)
+                    strength = strength * self._light_shadow_gathered(
+                        entity, render_mesh, normals, centroids, active, tracer, info)
                 lum += info.colorf[None, :] * strength[:, None]
 
             # Flat mode: per-face centroid lighting has no sensible per-pixel
@@ -498,8 +538,8 @@ class Renderer:
             # (metallic darkens the diffuse response, same as the deferred
             # path) + an unconditional emissive term -- no specular highlight.
             # Documented approximation (see class docstring / HANDOFF).
-            lum = lum * (1.0 - entity.mesh.face_metallic)[:, None]
-            colors = entity.mesh.face_colors * lum + entity.mesh.face_emissive
+            lum = lum * (1.0 - render_mesh.face_metallic)[:, None]
+            colors = render_mesh.face_colors * lum + render_mesh.face_emissive
             if fog is not None:
                 f = np.clip((depth - fog.start) / (fog.end - fog.start), 0.0, 1.0)[:, None]
                 colors = colors * (1.0 - f) + fog_color * f
@@ -525,22 +565,24 @@ class Renderer:
         for entity in scene.entities:
             if entity.mesh is None or not entity.visible or not _is_translucent(entity):
                 continue
-            geo = self._entity_geometry(entity, view, k, w * 0.5, h * 0.5,
+            render_mesh = entity.render_mesh()
+            geo = self._entity_geometry(entity, render_mesh, view, k, w * 0.5, h * 0.5,
                                         camera.near, camera.far)
             if geo is None:
                 continue
             normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
-            lum, _sl = self._directional_base(scene, entity, normals, centroids, env, tracer)
+            lum, _sl = self._directional_base(scene, entity, render_mesh, normals,
+                                              centroids, env, tracer)
             for info in lights:
                 strength = _face_light_strength(info, normals, centroids)
                 active = strength > 1e-3
                 if not active.any():
                     continue
                 if tracer is not None and info.light.cast_shadows:
-                    strength = strength * tracer.shadow_factors(
-                        entity, info.light, info.pos, centroids, normals, active)
+                    strength = strength * self._light_shadow_gathered(
+                        entity, render_mesh, normals, centroids, active, tracer, info)
                 lum += info.colorf[None, :] * strength[:, None]
-            colors = np.clip(entity.mesh.face_colors * lum, 0.0, 255.0)
+            colors = np.clip(render_mesh.face_colors * lum, 0.0, 255.0)
             tpolys = []
             if geo["fast_pts"] is not None:
                 idx = geo["fast_idx"]
@@ -606,7 +648,8 @@ class Renderer:
         for entity in scene.entities:
             if entity.mesh is None or not entity.visible or _is_translucent(entity):
                 continue
-            geo = self._entity_geometry(entity, view, k, cx, cy, near, far)
+            render_mesh = entity.render_mesh()
+            geo = self._entity_geometry(entity, render_mesh, view, k, cx, cy, near, far)
             if geo is None:
                 continue
             normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
@@ -614,27 +657,27 @@ class Renderer:
 
             f_normals.append(normals)
             f_centroids.append(centroids)
-            f_albedo.append(entity.mesh.face_colors)
-            f_roughness.append(entity.mesh.face_roughness)
-            f_metallic.append(entity.mesh.face_metallic)
-            f_emissive.append(entity.mesh.face_emissive)
-            base, sun_lambert = self._directional_base(scene, entity, normals, centroids,
-                                                        env, tracer)
+            f_albedo.append(render_mesh.face_colors)
+            f_roughness.append(render_mesh.face_roughness)
+            f_metallic.append(render_mesh.face_metallic)
+            f_emissive.append(render_mesh.face_emissive)
+            base, sun_lambert = self._directional_base(scene, entity, render_mesh, normals,
+                                                        centroids, env, tracer)
             gi = gi_map.get(id(entity))
             if gi is not None:
-                base = base + gi
+                base = base + _lod_gather(entity, render_mesh, gi)
             # PBR diffuse response: metals have (near-)zero diffuse albedo,
             # ambient/directional/GI all treated as diffuse-only terms here.
             # At the default metallic=0 this is a no-op (*1.0).
-            base = base * (1.0 - entity.mesh.face_metallic)[:, None]
+            base = base * (1.0 - render_mesh.face_metallic)[:, None]
             f_base.append(base)
             f_sun_lambert.append(sun_lambert)
             for li, info in enumerate(lights):
                 if tracer is not None and info.light.cast_shadows:
                     strength = _face_light_strength(info, normals, centroids)
-                    f_shadow[li].append(tracer.shadow_factors(
-                        entity, info.light, info.pos, centroids, normals,
-                        strength > 1e-3))
+                    active = strength > 1e-3
+                    f_shadow[li].append(self._light_shadow_gathered(
+                        entity, render_mesh, normals, centroids, active, tracer, info))
                 else:
                     f_shadow[li].append(np.ones(m_faces))
 
@@ -889,22 +932,24 @@ class Renderer:
         cx, cy = w * 0.5, h * 0.5
         polys = []  # (depth, rgba, pts)
         for entity in translucent:
-            geo = self._entity_geometry(entity, view, k, cx, cy, camera.near, camera.far)
+            render_mesh = entity.render_mesh()
+            geo = self._entity_geometry(entity, render_mesh, view, k, cx, cy, camera.near, camera.far)
             if geo is None:
                 continue
             normals, centroids, depth = geo["normals"], geo["centroids"], geo["depth"]
-            lum, _sl = self._directional_base(scene, entity, normals, centroids, env, tracer)
+            lum, _sl = self._directional_base(scene, entity, render_mesh, normals,
+                                              centroids, env, tracer)
             for info in lights:
                 strength = _face_light_strength(info, normals, centroids)
                 active = strength > 1e-3
                 if not active.any():
                     continue
                 if tracer is not None and info.light.cast_shadows:
-                    strength = strength * tracer.shadow_factors(
-                        entity, info.light, info.pos, centroids, normals, active)
+                    strength = strength * self._light_shadow_gathered(
+                        entity, render_mesh, normals, centroids, active, tracer, info)
                 lum += info.colorf[None, :] * strength[:, None]
-            colors = np.clip(entity.mesh.face_colors * lum, 0.0, 255.0).astype(np.uint8)
-            alpha = np.clip(entity.mesh.face_opacity, 0.0, 1.0)
+            colors = np.clip(render_mesh.face_colors * lum, 0.0, 255.0).astype(np.uint8)
+            alpha = np.clip(render_mesh.face_opacity, 0.0, 1.0)
             alpha255 = (alpha * 255.0).astype(np.uint8)
 
             def _emit(idx_iter, pts_iter):

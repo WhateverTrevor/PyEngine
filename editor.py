@@ -95,7 +95,7 @@ PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
 TAB_LABELS = {"outliner": "Outliner", "details": "Details", "browser": "Browser"}
 RESOLUTIONS = ((1280, 720), (1440, 810), (1600, 900), (1920, 1080))
 SETTINGS_SIZE = (380, 246)
-IMPORT_SIZE = (420, 320)   # Unreal-style import-options modal (see _open_import_dialog)
+IMPORT_SIZE = (420, 356)   # Unreal-style import-options modal (see _open_import_dialog)
 # extension -> (internal kind, detected-type display label) for the import
 # dialog's read-only "Type" header; scale/up-axis only apply to "mesh"
 _IMPORT_TYPE_LABELS = {
@@ -2578,6 +2578,10 @@ class Editor:
             "path": path, "ext": ext, "kind": kind, "label": label,
             "name": default_name, "folder": self.selected_folder,
             "scale_text": "1", "up_axis": "y",
+            # "Generate LODs" (mesh only): on by default -- inert for meshes
+            # at or below lod.LOD_FACE_THRESHOLD (generate_lods no-ops) and
+            # for texture/HDRI kinds (grayed out like Scale/Up Axis below).
+            "generate_lods": True,
         }
         self.import_field = None
 
@@ -2631,7 +2635,8 @@ class Editor:
         return final
 
     def _do_import(self, path: str, name: str = "", folder=None,
-                   scale: float = 1.0, up_axis: str = "y") -> None:
+                   scale: float = 1.0, up_axis: str = "y",
+                   generate_lods: bool = True) -> None:
         """Dialog-free import with options: applies the chosen name/folder
         and, for a mesh, bakes the uniform scale + up-axis conversion into
         the stored vertices (Unreal-style "bake import transform"), then
@@ -2647,7 +2652,8 @@ class Editor:
         try:
             if ext == ".fbx":
                 asset_name = self.engine_mod.import_fbx(
-                    path, self.lib.directory, scale=scale, up_axis=up_axis)
+                    path, self.lib.directory, scale=scale, up_axis=up_axis,
+                    generate_lods=generate_lods)
             elif ext == ".hdr":
                 asset_name = self.engine_mod.import_hdri(path, self.lib.directory)
             elif ext in (".png", ".jpg", ".jpeg", ".bmp"):
@@ -2706,6 +2712,10 @@ class Editor:
         y_btn = pygame.Rect(rect.x + 12, y0, 60, 24)
         z_btn = pygame.Rect(rect.x + 12 + 68, y0, 60, 24)
         return y_btn, z_btn
+
+    def _import_lod_checkbox_rect(self, rect):
+        import pygame
+        return pygame.Rect(rect.x + 12, rect.y + 268, 18, 18)
 
     def _import_cancel_rect(self, rect):
         import pygame
@@ -2777,7 +2787,8 @@ class Editor:
         self.import_dialog = None
         self.import_field = None
         self._do_import(d["path"], name=d["name"], folder=d["folder"],
-                        scale=scale, up_axis=d["up_axis"])
+                        scale=scale, up_axis=d["up_axis"],
+                        generate_lods=d.get("generate_lods", True))
 
     def _update_import_dialog(self, engine, w, h) -> None:
         import pygame
@@ -2823,6 +2834,10 @@ class Editor:
             if z_btn.collidepoint(mp):
                 d["up_axis"] = "z"
                 self.import_field = None
+                return
+            if self._import_lod_checkbox_rect(rect).collidepoint(mp):
+                self.import_field = None
+                d["generate_lods"] = not d["generate_lods"]
                 return
         if self._import_cancel_rect(rect).collidepoint(mp):
             self.import_dialog = None
@@ -3859,6 +3874,17 @@ class Editor:
             pygame.draw.rect(surf, box_edge, btn, 1, border_radius=4)
             lab = self.font_small.render(axis.upper(), True, val_col)
             surf.blit(lab, (btn.x + (btn.width - lab.get_width()) // 2, btn.y + 5))
+
+        # ---- Generate LODs checkbox (mesh only) ----
+        lod_r = self._import_lod_checkbox_rect(rect)
+        pygame.draw.rect(surf, box_bg, lod_r, border_radius=3)
+        pygame.draw.rect(surf, box_edge, lod_r, 1, border_radius=3)
+        if is_mesh and d["generate_lods"]:
+            inner = lod_r.inflate(-6, -6)
+            pygame.draw.rect(surf, ACCENT, inner, border_radius=2)
+        lod_lab = self.font_small.render(
+            "Generate LODs" + ("" if is_mesh else " (mesh only)"), True, dim_or_off)
+        surf.blit(lod_lab, (lod_r.right + 8, lod_r.y - 2))
 
         # ---- Cancel / Import ----
         cancel_r = self._import_cancel_rect(rect)

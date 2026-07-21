@@ -103,7 +103,8 @@ import math
 import numpy as np
 
 from .gpu_geometry import (_build_color, _build_geometry, _build_opacity,
-                           _build_pbr, _entity_world_faces, _scene_environment)
+                           _build_pbr, _entity_world_faces, _lod_gather,
+                           _scene_environment)
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
 from .raytrace import GITracer
@@ -874,7 +875,14 @@ class WgpuRenderer:
         return cache
 
     def _prune_geo_cache(self, live_entities) -> None:
-        live_mesh_ids = {id(e.mesh) for e in live_entities}
+        # keep EVERY LOD level's buffers alive for a live entity, not just
+        # its currently-selected one -- see gl_renderer.py's identical
+        # comment on its _prune_geo_cache (mirrors this one).
+        live_mesh_ids = set()
+        for e in live_entities:
+            live_mesh_ids.add(id(e.mesh))
+            for m in e.lod_meshes:
+                live_mesh_ids.add(id(m))
         for key in [k for k in self._geo_cache if k not in live_mesh_ids]:
             c = self._geo_cache.pop(key)
             c["geom_buf"].destroy()
@@ -1033,14 +1041,19 @@ class WgpuRenderer:
         lights = _gather_lights(scene)[: self.MAX_LIGHTS]
         self.stats["shadow_lights"] = sum(1 for li in lights if li.light.cast_shadows)
 
+        # render_meshes[i] is live[i]'s SELECTED LOD -- see gl_renderer.py's
+        # identical comment on its render() (mirrors this one): shadow/GI
+        # values are always ray-traced at LOD0 then gathered onto whichever
+        # LOD is actually drawn, via `_lod_gather`.
         live = [e for e in scene.entities if e.mesh is not None and e.visible]
-        face_counts = [int(e.mesh.faces.shape[0]) for e in live]
+        render_meshes = [e.render_mesh() for e in live]
+        face_counts = [int(m.faces.shape[0]) for m in render_meshes]
         total_faces = int(sum(face_counts))
         offsets = np.cumsum([0] + face_counts[:-1]).tolist() if face_counts else []
 
         shadow_data = np.ones((max(total_faces, 1), self.MAX_LIGHTS), dtype=np.float32)
         if tracer is not None and total_faces > 0:
-            for entity, off, m in zip(live, offsets, face_counts):
+            for entity, rmesh, off, m in zip(live, render_meshes, offsets, face_counts):
                 if not any(li.light.cast_shadows for li in lights):
                     break
                 centroids_w, normals_w = _entity_world_faces(entity)
@@ -1051,7 +1064,7 @@ class WgpuRenderer:
                     active = strength > 1e-3
                     factors = tracer.shadow_factors(entity, info.light, info.pos,
                                                      centroids_w, normals_w, active)
-                    shadow_data[off:off + m, li_idx] = factors
+                    shadow_data[off:off + m, li_idx] = _lod_gather(entity, rmesh, factors)
         self._upload_shadow_tex(shadow_data, total_faces)
 
         # one-bounce GI -- baked/cached by GITracer, zero per-frame cost once
@@ -1063,10 +1076,10 @@ class WgpuRenderer:
                                       lambda casters: _gi_direct_lighting(scene, casters, tracer),
                                       _gi_receiver_geometry,
                                       gi_cfg.get("samples", 16), gi_cfg.get("intensity", 1.0))
-            for entity, off, m in zip(live, offsets, face_counts):
+            for entity, rmesh, off, m in zip(live, render_meshes, offsets, face_counts):
                 gi = gi_map.get(id(entity))
                 if gi is not None:
-                    gi_data[off:off + m] = gi
+                    gi_data[off:off + m] = _lod_gather(entity, rmesh, gi)
         self._upload_gi_tex(gi_data, total_faces)
 
         vols = _fog_volumes(scene)
@@ -1108,8 +1121,8 @@ class WgpuRenderer:
 
         pass_enc.set_bind_group(0, self._frame_bind_group)
 
-        def _draw(entity, off) -> int:
-            geo = self._get_geo_cache(entity.mesh)
+        def _draw(entity, rmesh, off) -> int:
+            geo = self._get_geo_cache(rmesh)
             ent = self._get_entity_uniforms(entity)
             model = entity.transform.matrix()
             mvp = proj @ view @ model
@@ -1128,14 +1141,14 @@ class WgpuRenderer:
             return geo["count"] // 3
 
         triangles = 0
-        opaque_pairs = [(e, off) for e, off in zip(live, offsets)
-                        if e.mesh.faces.shape[0] > 0 and not _is_translucent(e)]
-        translucent_pairs = [(e, off) for e, off in zip(live, offsets)
-                             if e.mesh.faces.shape[0] > 0 and _is_translucent(e)]
+        opaque_pairs = [(e, m, off) for e, m, off in zip(live, render_meshes, offsets)
+                        if m.faces.shape[0] > 0 and not _is_translucent(e)]
+        translucent_pairs = [(e, m, off) for e, m, off in zip(live, render_meshes, offsets)
+                             if m.faces.shape[0] > 0 and _is_translucent(e)]
 
         pass_enc.set_pipeline(self._mesh_pipeline)
-        for entity, off in opaque_pairs:
-            triangles += _draw(entity, off)
+        for entity, rmesh, off in opaque_pairs:
+            triangles += _draw(entity, rmesh, off)
 
         if translucent_pairs:
             # Back-to-front per-entity order, mirroring GLRenderer's
@@ -1146,8 +1159,8 @@ class WgpuRenderer:
                 key=lambda p: -float(np.linalg.norm(
                     p[0].transform.matrix()[:3, 3] - cam_pos)))
             pass_enc.set_pipeline(self._mesh_translucent_pipeline)
-            for entity, off in translucent_pairs:
-                triangles += _draw(entity, off)
+            for entity, rmesh, off in translucent_pairs:
+                triangles += _draw(entity, rmesh, off)
         pass_enc.end()
         self.device.queue.submit([encoder.finish()])
 

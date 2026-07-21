@@ -96,6 +96,23 @@ class AssetDef:
                     face_colors=face_colors, face_uvs=face_uvs,
                     face_roughness=face_roughness, face_metallic=face_metallic,
                     face_emissive=face_emissive)
+                # distance-based LOD (see engine/lod.py import_fbx's
+                # generate_lods=True path) -- absent for every built-in and
+                # any import below the decimation threshold, so this is a
+                # no-op for them (entity.lod_meshes stays [] -> render_mesh()
+                # always returns entity.mesh, byte-identical to before).
+                n_lods = int(data["lod_levels"]) if "lod_levels" in data else 0
+                for i in range(1, n_lods + 1):
+                    lm = mesh_mod.Mesh(
+                        data[f"lod{i}_vertices"],
+                        [tuple(f) for f in data[f"lod{i}_faces"]],
+                        face_colors=data[f"lod{i}_face_colors"].astype(np.float64),
+                        face_roughness=data[f"lod{i}_face_roughness"].astype(np.float64),
+                        face_metallic=data[f"lod{i}_face_metallic"].astype(np.float64),
+                        face_emissive=data[f"lod{i}_face_emissive"].astype(np.float64),
+                        face_opacity=data[f"lod{i}_face_opacity"].astype(np.float64))
+                    lm.lod_source_faces = data[f"lod{i}_source_faces"].astype(np.int64)
+                    entity.lod_meshes.append(lm)
             else:
                 entity.mesh = _MESH_FACTORIES[primitive](**spec)
 

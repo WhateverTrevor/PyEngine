@@ -22,6 +22,7 @@ import numpy as np
 import pygame
 
 from .input import InputManager
+from .lod import update_scene_lods
 from .raytrace import ShadowTracer
 from .renderer import Renderer
 
@@ -362,6 +363,12 @@ class Engine:
             if scene.enable_shadows:
                 self.tracer.refresh(scene)
                 tracer = self.tracer
+
+            # Distance-based LOD selection: once per rendered frame (not
+            # per fixed-timestep update), before whichever backend renders,
+            # so CPU/GL/wgpu all draw the SAME selected LOD per entity this
+            # frame (see engine/lod.py -- hysteresis lives in entity.lod_index).
+            update_scene_lods(scene, camera)
 
             if self.gl_renderer is not None:
                 self.gl_renderer.render(scene, camera, self._size, tracer)

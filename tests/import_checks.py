@@ -301,6 +301,29 @@ try:
          f"Z-swapped extent {swap_extent} (Y<->Z permuted)")
 
     # ========================================================================
+    # 5b. "Generate LODs" checkbox: on by default for a mesh import, toggles
+    # via a real click, and the chosen value reaches import_fbx (the tiny
+    # cube fixture is below the LOD face threshold either way, so this only
+    # checks the dialog->import_fbx plumbing, not decimation itself --
+    # tests/lod_checks.py covers decimation/npz storage end to end).
+    # ========================================================================
+    ed._open_import_dialog(tinycube_fbx)
+    assert ed.import_dialog["generate_lods"] is True, "Generate LODs must default on for a mesh import"
+    lod_r = ed._import_lod_checkbox_rect(rect)
+    click(ed, (lod_r.centerx, lod_r.centery))
+    assert ed.import_dialog["generate_lods"] is False, "clicking the checkbox must toggle it off"
+    click(ed, (lod_r.centerx, lod_r.centery))
+    assert ed.import_dialog["generate_lods"] is True, "clicking again must toggle it back on"
+    with um.patch.object(engine, "import_fbx", wraps=engine.import_fbx) as spy:
+        ed.import_dialog["name"] = "LOD Checkbox Cube"
+        click(ed, (ok_r.centerx, ok_r.centery))
+    assert "import failed" not in ed.status[0], ed.status
+    created_asset_names.append("LOD Checkbox Cube")
+    assert spy.call_args.kwargs.get("generate_lods") is True, \
+        f"the dialog's generate_lods value must reach import_fbx: {spy.call_args}"
+    print("5b. Generate LODs checkbox OK: defaults on, toggles via real click, reaches import_fbx")
+
+    # ========================================================================
     # 6. Cancel imports nothing
     # ========================================================================
     before_cancel = set(lib.by_name)
@@ -331,6 +354,10 @@ try:
     y_btn, z_btn = ed._import_axis_rects(rect)
     click(ed, (z_btn.centerx, z_btn.centery))
     assert ed.import_dialog["up_axis"] == "y", "up-axis buttons must be inert for a texture import"
+    lod_r = ed._import_lod_checkbox_rect(rect)
+    click(ed, (lod_r.centerx, lod_r.centery))
+    assert ed.import_dialog["generate_lods"] is True, \
+        "Generate LODs checkbox must be inert for a texture import (still visually off/grayed)"
     ed.import_dialog["name"] = "Import Dialog Swatch"
     click(ed, (ok_r.centerx, ok_r.centery))
     assert "import failed" not in ed.status[0], ed.status
@@ -352,6 +379,7 @@ try:
     control_rects.append(ed._import_fit_btn_rect(r))
     yb, zb = ed._import_axis_rects(r)
     control_rects += [yb, zb]
+    control_rects.append(ed._import_lod_checkbox_rect(r))
     for cr in control_rects:
         if ed.import_dialog is None:  # a prior click in this loop shouldn't close it
             ed._open_import_dialog(tinycube_fbx)
