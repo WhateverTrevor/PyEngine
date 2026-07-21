@@ -1,34 +1,41 @@
 # No task in flight
 
-Distance-based LOD was judged and squash-merged to main on 2026-07-14,
-completing the import/LOD slate (import dialog + LOD).
+Blueprint asset + Python script editor + in-engine compile/bug-check (run
+1 of 2) was judged and squash-merged to main on 2026-07-14.
 
-engine/lod.py does vertex-clustering decimation (generate_lods -> [LOD0,
-LOD1..]) and per-frame distance selection with hysteresis
-(update_scene_lods, called once in core.py before render dispatch). LODs
-generate at import (import_fbx generate_lods=True, dialog checkbox) for
-meshes >200 faces and store in the .npz; Entity gains lod_meshes /
-lod_index / render_mesh(). All three rasterizers draw render_mesh(); the
-ray-traced ShadowTracer/GITracer stay on entity.mesh (LOD0) so shadow/GI
-caches never invalidate on an LOD switch and shadows don't pop. Built-ins
-(<=200 faces) carry no LOD data and render byte-identical.
+engine/blueprint.py: compile_blueprint(source, name) -> plain dict, NEVER
+raises (SyntaxError with line/col; BaseException during exec, so even
+SystemExit is contained; validates a Behavior subclass exists).
+engine/assets.py: BlueprintAsset {name, category, components[], script,
+compile_result} persisted to assets/blueprints/*.json, folder-tree aware.
+editor.py: "+ Blueprint" browser button, blueprint tiles, and
+ScriptEditorUI — a MaterialEditorUI-style in-app window with a
+line-numbered gutter, caret + arrows/Home/End, Enter/Backspace/Delete,
+Tab=4 spaces, scroll-follows-caret, Compile (Ctrl+Enter) / Save (Ctrl+S),
+error-line highlight + status strip. Compile saves; close auto-saves.
 
-CONTRACT for future work: entity.lod_meshes = generate_lods()[1:]
-(decimated only; LOD0 IS entity.mesh); render_mesh() indexes
-lod_meshes[lod_index-1]. Constants in engine/lod.py: LOD_FACE_THRESHOLD
-200, DEFAULT_LOD_RATIOS (0.5,0.25,0.12), LOD_DISTANCE_FACTORS
-(8,20,45)*bound, LOD_HYSTERESIS 0.2. face_uvs are box-reprojected on
-decimation (not carried); LOD thresholds are fixed constants, not tunable.
+NEXT (run 2 of 2): POSED MESHES + world instantiation. The
+`components` field already exists and is an empty list — fill it with
+{asset_name, position, rotation, scale} entries, add UI to compose/pose
+mesh components inside the blueprint (the transform gizmo can likely be
+reused), and make instantiating a blueprint into the world build the
+composed entity with the compiled Behavior attached and running.
+Behavior runtime errors during update must be caught per-frame and
+surfaced, not crash the game loop.
+
+KNOWN LIMITATION to address eventually: there is NO infinite-loop/hang
+guard on exec — a `while True:` in a user script WILL hang the editor
+(verified). A worker-thread + timeout sandbox is the fix. Also no
+selection/clipboard/undo in the script editor yet.
 
 When a task IS in flight, this file holds its resume state per the
 checkpoint protocol in `CLAUDE.md` and `.claude/agents/engine-coder.md`.
 
 IMPORTANT: settings isolate via PYENGINE_SETTINGS; UI tests drive the real
 event path; DX12 default; DO NOT touch assets/gat.* or folders.json. Full
-battery is TWENTY suites. FPS in this working dir is 2-10x slow + high
-variance — only same-environment A/B is valid.
+battery is TWENTY-ONE suites. FPS here is 2-10x slow + high variance —
+same-environment A/B only.
 
-Backlog: QEM decimation (higher quality than clustering); LOD tuning knobs
-in the import dialog; carry face_uvs through decimation; File-menu import
-paths still folder-unaware; wgpu directional sun-shadow; per-pixel
-texturing; folder deletion.
+Backlog: QEM decimation; LOD tuning knobs; carry face_uvs through
+decimation; File-menu import paths still folder-unaware; wgpu directional
+sun-shadow; per-pixel texturing; folder deletion.

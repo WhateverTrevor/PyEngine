@@ -274,6 +274,24 @@ def make_material_icon(engine, graph, size=ICON):
     return surf
 
 
+BLUEPRINT_TILE_EDGE = (70, 150, 90)  # distinct from materials' purple (90, 60, 140)
+
+
+def make_blueprint_icon(size=ICON):
+    """Placeholder thumbnail for a Blueprint asset tile -- a script glyph.
+    No posed-mesh preview yet (`components` is always [] this run); run 2
+    can render the posed components here instead once they exist."""
+    import pygame
+
+    surf = pygame.Surface((size, size))
+    surf.fill((22, 28, 24))
+    pygame.draw.rect(surf, BLUEPRINT_TILE_EDGE, surf.get_rect(), 2, border_radius=6)
+    font = pygame.font.SysFont("consolas,couriernew,monospace", int(size * 0.4), bold=True)
+    label = font.render("</>", True, (130, 210, 150))
+    surf.blit(label, ((size - label.get_width()) // 2, (size - label.get_height()) // 2))
+    return surf
+
+
 class Editor:
     _MENU_NAMES = ("File", "Edit", "Window", "Help")
     _WINDOW_PANEL_LABELS = {"Outliner": "outliner", "Details": "details",
@@ -341,6 +359,7 @@ class Editor:
                                      # typed into, e.g. ("Position", "x"), or None
         self.edit_buffer = ""       # editable text while editing_field is set
         self.mat_ui = None          # open MaterialEditorUI, or None
+        self.script_ui = None       # open ScriptEditorUI (blueprint script editor), or None
         self.status = ("", 0.0)     # transient message near the content browser
         self.save_flash = 0.0
         # graphics-api preference for *next launch* (live switching is out
@@ -390,6 +409,9 @@ class Editor:
         for m in lib.materials:
             self.mat_icons[m.name] = make_material_icon(engine_mod, m.graph())
         self.mat_icon_cache = {}     # id(entity) -> live Details-slot preview Surface
+        self.bp_icons = {}           # blueprint asset name -> thumbnail Surface
+        for bp in lib.blueprints:
+            self.bp_icons[bp.name] = make_blueprint_icon()
 
     # ---- selection model ----
     # self.selection is the ordered, authoritative set. self.selected (below)
@@ -731,7 +753,8 @@ class Editor:
         return None
 
     def over_ui(self, pos) -> bool:
-        if self.mat_ui is not None or self.settings_open or self.import_dialog is not None:
+        if (self.mat_ui is not None or self.script_ui is not None
+                or self.settings_open or self.import_dialog is not None):
             return True
         if pos[1] < MENU_H:
             return True
@@ -2449,6 +2472,11 @@ class Editor:
         import pygame
         return pygame.Rect(topbar.x + 4, topbar.y + 3, 90, 20)
 
+    def _new_blueprint_btn_rect(self, topbar):
+        import pygame
+        nfb = self._new_folder_btn_rect(topbar)
+        return pygame.Rect(nfb.right + 4, topbar.y + 3, 96, 20)
+
     def _import_btn_rect(self, topbar):
         import pygame
         return pygame.Rect(topbar.right - 74, topbar.y + 3, 70, 20)
@@ -2508,6 +2536,18 @@ class Editor:
         self.lib.save_folders()
         self.selected_folder = fid
         self._begin_rename(fid)
+
+    def _new_blueprint(self) -> None:
+        """"+ Blueprint" topbar button: create a blueprint asset (starter
+        script that already compiles clean), file it into the currently
+        selected folder like a new folder would be, and open it straight
+        into the script editor -- the natural next step after creating one."""
+        bp = self.lib.new_blueprint()
+        self.lib.set_asset_folder(bp.name, self.selected_folder)
+        self.lib.save_folders()
+        self.bp_icons[bp.name] = make_blueprint_icon()
+        self.selected_asset = bp
+        self.script_ui = ScriptEditorUI(self, bp)
 
     def _begin_rename(self, folder_id) -> None:
         """No-ops for the root folder (id None) and unknown ids -- root has
@@ -2946,6 +2986,9 @@ class Editor:
         if self.mat_ui is not None:  # node editor captures all editor input
             self.mat_ui.update(engine, dt)
             return
+        if self.script_ui is not None:  # blueprint script editor captures all editor input
+            self.script_ui.update(engine, dt)
+            return
         if self.settings_open:      # settings dialog captures all editor input
             self._update_settings(engine, w, h)
             return
@@ -3176,6 +3219,9 @@ class Editor:
                 return True
             self.mat_ui.close()
             return True
+        if self.script_ui is not None:
+            self.script_ui.close()
+            return True
         if self.selected is not None:
             self.selected = None
             return True
@@ -3191,11 +3237,14 @@ class Editor:
             blay = self._browser_layout(content)
             if self._new_folder_btn_rect(blay["topbar"]).collidepoint(mp):
                 self._new_folder()
+            elif self._new_blueprint_btn_rect(blay["topbar"]).collidepoint(mp):
+                self._new_blueprint()
             elif self._import_btn_rect(blay["topbar"]).collidepoint(mp):
                 self._import_dialog_to_folder()
             elif self._export_btn_rect(blay["topbar"]).collidepoint(mp):
                 if (self.selected_asset is not None
                         and not isinstance(self.selected_asset, self.engine_mod.MaterialAsset)
+                        and not isinstance(self.selected_asset, self.engine_mod.BlueprintAsset)
                         and self.engine_mod.has_mesh(self.selected_asset)):
                     self._export_fbx_dialog()
             elif blay["tree"].collidepoint(mp):
@@ -3211,7 +3260,17 @@ class Editor:
                 if asset is not None:
                     self.selected_asset = asset
                     is_mat = isinstance(asset, self.engine_mod.MaterialAsset)
-                    if is_mat or "texture" not in asset.data:  # textures aren't placeable
+                    is_bp = isinstance(asset, self.engine_mod.BlueprintAsset)
+                    if is_bp:
+                        # no double-click in this codebase -- a single click
+                        # both selects the tile AND opens the script editor
+                        # (mirrors the M-key-opens-material-editor precedent)
+                        if self.script_ui is None or self.script_ui.blueprint is not asset:
+                            if self.script_ui is not None:
+                                self.script_ui._save()  # persist any pending
+                                                         # edits before switching
+                            self.script_ui = ScriptEditorUI(self, asset)
+                    elif is_mat or "texture" not in asset.data:  # textures aren't placeable
                         self.drag_asset = asset
 
     def _try_drop_material_slot(self, mp, layout) -> bool:
@@ -3577,6 +3636,8 @@ class Editor:
             self._draw_import_dialog(surf, w, h)
         if self.mat_ui is not None:
             self.mat_ui.draw(surf)
+        if self.script_ui is not None:
+            self.script_ui.draw(surf)
 
     def _panel_title(self, pid) -> str:
         if pid == "outliner":
@@ -4226,6 +4287,12 @@ class Editor:
         pygame.draw.rect(surf, PANEL_EDGE, nfb, 1, border_radius=4)
         nflabel = self.font_small.render("+ Folder", True, ACCENT)
         surf.blit(nflabel, (nfb.x + (nfb.width - nflabel.get_width()) // 2, nfb.y + 4))
+        nbb = self._new_blueprint_btn_rect(topbar)
+        pygame.draw.rect(surf, HOVER_BG if nbb.collidepoint(mp) else (33, 36, 44),
+                         nbb, border_radius=4)
+        pygame.draw.rect(surf, BLUEPRINT_TILE_EDGE, nbb, 1, border_radius=4)
+        nblabel = self.font_small.render("+ Blueprint", True, (130, 210, 150))
+        surf.blit(nblabel, (nbb.x + (nbb.width - nblabel.get_width()) // 2, nbb.y + 4))
         btn = self._import_btn_rect(topbar)
         pygame.draw.rect(surf, HOVER_BG if btn.collidepoint(mp) else (33, 36, 44),
                          btn, border_radius=4)
@@ -4235,6 +4302,7 @@ class Editor:
         exp = self._export_btn_rect(topbar)
         exportable = (self.selected_asset is not None
                      and not isinstance(self.selected_asset, self.engine_mod.MaterialAsset)
+                     and not isinstance(self.selected_asset, self.engine_mod.BlueprintAsset)
                      and self.engine_mod.has_mesh(self.selected_asset))
         exp_color = ACCENT if exportable else TEXT_DIM
         pygame.draw.rect(surf, HOVER_BG if exportable and exp.collidepoint(mp)
@@ -4243,10 +4311,10 @@ class Editor:
         exp_label = self.font_small.render("Export", True, exp_color)
         surf.blit(exp_label, (exp.x + (exp.width - exp_label.get_width()) // 2, exp.y + 4))
         if self.status[1] > 0:
-            avail = exp.x - (nfb.right + 8)
+            avail = exp.x - (nbb.right + 8)
             msg = self.font_small.render(self.status[0][:60], True, (235, 210, 140))
             if avail > 20:
-                surf.blit(msg, (nfb.right + 8, topbar.y + 6))
+                surf.blit(msg, (nbb.right + 8, topbar.y + 6))
 
     def _draw_browser_tree(self, surf, tree_rect, mp) -> None:
         import pygame
@@ -4275,9 +4343,10 @@ class Editor:
         surf.blit(hint, (tree_rect.x + 4, tree_rect.bottom - 16))
 
     def _tiles_in(self, folder_id):
-        """Regular assets, then material assets (materials only live at
-        the browser root -- they aren't part of the folder tree)."""
-        tiles = list(self.lib.assets_in(folder_id))
+        """Regular assets, then blueprints (both participate in the folder
+        tree), then material assets (materials only live at the browser
+        root -- they aren't part of the folder tree)."""
+        tiles = list(self.lib.assets_in(folder_id)) + list(self.lib.blueprints_in(folder_id))
         if folder_id is None:
             tiles += list(self.lib.materials)
         return tiles
@@ -4287,6 +4356,7 @@ class Editor:
         x = grid_rect.x + 10 - self.browser_scroll
         for asset in self._tiles_in(self.selected_folder):
             is_mat = isinstance(asset, self.engine_mod.MaterialAsset)
+            is_bp = isinstance(asset, self.engine_mod.BlueprintAsset)
             tile = pygame.Rect(x, grid_rect.y + 6, TILE_W, TILE_H - 12)
             if tile.right > grid_rect.x and tile.left < grid_rect.right:
                 hovered = tile.collidepoint(mp)
@@ -4300,7 +4370,10 @@ class Editor:
                     pygame.draw.rect(surf, ACCENT, tile, 1, border_radius=4)
                 if is_mat:
                     pygame.draw.rect(surf, (90, 60, 140), tile, 1, border_radius=4)
-                icon = (self.mat_icons if is_mat else self.icons).get(asset.name)
+                elif is_bp:
+                    pygame.draw.rect(surf, BLUEPRINT_TILE_EDGE, tile, 1, border_radius=4)
+                icon = (self.mat_icons if is_mat else
+                       (self.bp_icons if is_bp else self.icons)).get(asset.name)
                 if icon is not None:
                     surf.blit(icon, (x + (TILE_W - ICON) // 2, grid_rect.y + 10))
                 label = self.font_small.render(asset.name[:12], True,
@@ -5104,6 +5177,417 @@ class MaterialEditorUI:
                 pygame.draw.rect(surf, HOVER_BG, rect)
             lab = self.editor.font_small.render(label, True, TEXT)
             surf.blit(lab, (rect.x + 8, rect.y + 3))
+
+
+class ScriptEditorUI:
+    """Blueprint Python-script editor: a real multi-line text buffer with a
+    line-number gutter, arrow-key/Home/End caret navigation, and an
+    in-engine Compile step (engine.blueprint.compile_blueprint) that
+    catches SyntaxError, definition-time exceptions, and a missing
+    Behavior subclass without ever crashing or hanging the editor.
+
+    Floating window, same chrome as MaterialEditorUI: drag the title bar
+    to move it, X/Esc closes (both auto-save, see `close()`). No
+    selection/clipboard/undo this run -- typing, Enter/Backspace/Delete,
+    arrow + Home/End caret movement, Tab-inserts-4-spaces, and vertical
+    scroll-follows-caret are what's needed to write and bug-check a
+    Behavior script; those are noted as future work.
+
+    Save policy (all three call `_save`, which just writes `self.lines`
+    joined by "\\n" to the asset JSON): Compile always saves (script text +
+    the new compile_result, since the result must be persisted); the Save
+    button / Ctrl+S persists script text without recompiling (an existing
+    compile_result is left as-is and may go stale -- the status strip's
+    dirty-flag hint covers that); closing the window auto-saves so edits
+    are never silently lost.
+    """
+
+    DEFAULT_SIZE = (760, 560)
+    TOOLBAR_H = 26
+    STATUS_H = 40
+    TAB_SPACES = "    "
+
+    def __init__(self, editor: Editor, blueprint):
+        self.editor = editor
+        self.blueprint = blueprint
+        self.lines = blueprint.script.split("\n") if blueprint.script else [""]
+        self.caret_row = 0
+        self.caret_col = 0
+        self.scroll_row = 0
+        self.pos = [80, 60]
+        self.size = list(self.DEFAULT_SIZE)
+        self.minimized = False
+        self.drag_title = None    # (grab_dx, grab_dy) while dragging the title bar
+        self.dirty = False        # unsaved edits since the last Save/Compile
+        self.compile_result = blueprint.compile_result
+        self.error_line = (self.compile_result.get("line")
+                           if self.compile_result and not self.compile_result.get("ok")
+                           else None)
+
+    def close(self) -> None:
+        self._save()
+        self.editor.script_ui = None
+
+    # ---- geometry (same recompute-from-self.pos/size pattern as MaterialEditorUI) ----
+    def rect(self, w, h):
+        import pygame
+        sw = min(self.size[0], max(420, w - 40))
+        sh = min(self.size[1], max(260, h - 40))
+        x = min(max(self.pos[0], 0), max(0, w - sw))
+        y = min(max(self.pos[1], MENU_H), max(MENU_H, h - sh))
+        self.pos = [x, y]
+        return pygame.Rect(x, y, sw, sh)
+
+    def outer_rect(self, w, h):
+        """The on-screen box -- collapsed to the title bar while minimized."""
+        import pygame
+        r = self.rect(w, h)
+        if self.minimized:
+            return pygame.Rect(r.x, r.y, r.width, PANEL_TITLE_H)
+        return r
+
+    def content_rect(self, w, h):
+        import pygame
+        outer = self.rect(w, h)
+        return pygame.Rect(outer.x, outer.y + PANEL_TITLE_H, outer.width,
+                           max(0, outer.height - PANEL_TITLE_H))
+
+    def _toolbar_rect(self, w, h):
+        import pygame
+        content = self.content_rect(w, h)
+        return pygame.Rect(content.x, content.y, content.width, self.TOOLBAR_H)
+
+    def _status_rect(self, w, h):
+        import pygame
+        content = self.content_rect(w, h)
+        return pygame.Rect(content.x, content.bottom - self.STATUS_H,
+                           content.width, self.STATUS_H)
+
+    def _text_area_rect(self, w, h):
+        import pygame
+        content = self.content_rect(w, h)
+        top = self._toolbar_rect(w, h).bottom
+        status_y = self._status_rect(w, h).y
+        return pygame.Rect(content.x, top, content.width, max(0, status_y - top))
+
+    def _char_w(self) -> int:
+        return self.editor.font_small.size("0")[0]
+
+    def _line_h(self) -> int:
+        return self.editor.font_small.get_height() + 4
+
+    def _gutter_w(self) -> int:
+        digits = max(2, len(str(len(self.lines))))
+        return 10 + digits * self._char_w()
+
+    def _gutter_rect(self, w, h):
+        import pygame
+        area = self._text_area_rect(w, h)
+        return pygame.Rect(area.x, area.y, self._gutter_w(), area.height)
+
+    def _code_rect(self, w, h):
+        import pygame
+        area = self._text_area_rect(w, h)
+        gw = self._gutter_w()
+        return pygame.Rect(area.x + gw, area.y, max(0, area.width - gw), area.height)
+
+    def _visible_rows(self, w, h) -> int:
+        return max(1, self._code_rect(w, h).height // self._line_h())
+
+    def _compile_btn_rect(self, w, h):
+        import pygame
+        tb = self._toolbar_rect(w, h)
+        return pygame.Rect(tb.x + 6, tb.y + 3, 78, 20)
+
+    def _save_btn_rect(self, w, h):
+        import pygame
+        tb = self._toolbar_rect(w, h)
+        cb = self._compile_btn_rect(w, h)
+        return pygame.Rect(cb.right + 6, tb.y + 3, 60, 20)
+
+    # ---- buffer editing ----
+    def _clamp_caret(self) -> None:
+        self.caret_row = max(0, min(self.caret_row, len(self.lines) - 1))
+        self.caret_col = max(0, min(self.caret_col, len(self.lines[self.caret_row])))
+
+    def _ensure_caret_visible(self, w, h) -> None:
+        visible = self._visible_rows(w, h)
+        if self.caret_row < self.scroll_row:
+            self.scroll_row = self.caret_row
+        elif self.caret_row >= self.scroll_row + visible:
+            self.scroll_row = self.caret_row - visible + 1
+        self.scroll_row = max(0, min(self.scroll_row, max(0, len(self.lines) - 1)))
+
+    def _insert_text(self, text: str) -> None:
+        if not text:
+            return
+        line = self.lines[self.caret_row]
+        self.lines[self.caret_row] = line[:self.caret_col] + text + line[self.caret_col:]
+        self.caret_col += len(text)
+        self.dirty = True
+
+    def _insert_newline(self) -> None:
+        line = self.lines[self.caret_row]
+        before, after = line[:self.caret_col], line[self.caret_col:]
+        self.lines[self.caret_row:self.caret_row + 1] = [before, after]
+        self.caret_row += 1
+        self.caret_col = 0
+        self.dirty = True
+
+    def _backspace(self) -> None:
+        if self.caret_col > 0:
+            line = self.lines[self.caret_row]
+            self.lines[self.caret_row] = line[:self.caret_col - 1] + line[self.caret_col:]
+            self.caret_col -= 1
+            self.dirty = True
+        elif self.caret_row > 0:
+            prev = self.lines[self.caret_row - 1]
+            cur = self.lines.pop(self.caret_row)
+            self.caret_row -= 1
+            self.caret_col = len(prev)
+            self.lines[self.caret_row] = prev + cur
+            self.dirty = True
+
+    def _delete_forward(self) -> None:
+        line = self.lines[self.caret_row]
+        if self.caret_col < len(line):
+            self.lines[self.caret_row] = line[:self.caret_col] + line[self.caret_col + 1:]
+            self.dirty = True
+        elif self.caret_row < len(self.lines) - 1:
+            nxt = self.lines.pop(self.caret_row + 1)
+            self.lines[self.caret_row] = line + nxt
+            self.dirty = True
+
+    def _move_left(self) -> None:
+        if self.caret_col > 0:
+            self.caret_col -= 1
+        elif self.caret_row > 0:
+            self.caret_row -= 1
+            self.caret_col = len(self.lines[self.caret_row])
+
+    def _move_right(self) -> None:
+        line = self.lines[self.caret_row]
+        if self.caret_col < len(line):
+            self.caret_col += 1
+        elif self.caret_row < len(self.lines) - 1:
+            self.caret_row += 1
+            self.caret_col = 0
+
+    def _move_up(self) -> None:
+        if self.caret_row > 0:
+            self.caret_row -= 1
+            self.caret_col = min(self.caret_col, len(self.lines[self.caret_row]))
+
+    def _move_down(self) -> None:
+        if self.caret_row < len(self.lines) - 1:
+            self.caret_row += 1
+            self.caret_col = min(self.caret_col, len(self.lines[self.caret_row]))
+
+    def _caret_from_mouse(self, mp, w, h) -> None:
+        code = self._code_rect(w, h)
+        line_h = self._line_h()
+        char_w = max(1, self._char_w())
+        row = self.scroll_row + max(0, mp[1] - code.y) // line_h
+        row = max(0, min(row, len(self.lines) - 1))
+        col = round((mp[0] - code.x) / char_w)
+        col = max(0, min(col, len(self.lines[row])))
+        self.caret_row, self.caret_col = row, col
+
+    # ---- persistence + compile ----
+    def _source(self) -> str:
+        return "\n".join(self.lines)
+
+    def _save(self) -> None:
+        self.blueprint.script = self._source()
+        self.blueprint.save()
+        self.dirty = False
+
+    def _compile(self) -> None:
+        source = self._source()
+        result = self.editor.engine_mod.compile_blueprint(source, self.blueprint.name)
+        self.compile_result = result
+        self.blueprint.script = source
+        self.blueprint.compile_result = result
+        self.blueprint.save()
+        self.dirty = False
+        self.error_line = result.get("line") if not result.get("ok") else None
+        if self.error_line:
+            row = max(0, min(len(self.lines) - 1, self.error_line - 1))
+            self.caret_row, self.caret_col = row, len(self.lines[row])
+
+    def _status_text(self):
+        r = self.compile_result
+        if r is None:
+            return "not compiled yet", TEXT_DIM
+        if r.get("ok"):
+            return f"compiled OK -- Behavior subclass '{r['class_name']}'", (140, 220, 150)
+        if r.get("line") and r.get("col"):
+            loc = f" (line {r['line']}, col {r['col']})"
+        elif r.get("line"):
+            loc = f" (line {r['line']})"
+        else:
+            loc = ""
+        return f"{r['stage']} error{loc}: {r['message']}", (230, 140, 140)
+
+    # ---- interaction ----
+    def update(self, engine, dt: float) -> None:
+        import pygame
+        inp = engine.input
+        mp = inp.mouse_pos
+        w, h = engine.screen.get_size()
+        outer = self.outer_rect(w, h)
+        title_bar = pygame.Rect(outer.x, outer.y, outer.width, PANEL_TITLE_H)
+        close = pygame.Rect(outer.right - 24, outer.y + 2, 16, 16)
+        minimize = pygame.Rect(outer.right - 44, outer.y + 2, 16, 16)
+
+        ctrl = inp.held(pygame.K_LCTRL) or inp.held(pygame.K_RCTRL)
+        if ctrl and inp.pressed(pygame.K_s):
+            self._save()
+        compiled_this_step = False
+        if ctrl and inp.pressed(pygame.K_RETURN):
+            self._compile()
+            compiled_this_step = True
+
+        if inp.mouse_button_pressed(1):
+            if close.collidepoint(mp):
+                self.close()
+                return
+            if minimize.collidepoint(mp):
+                self.minimized = not self.minimized
+                return
+            if not self.minimized:
+                if self._compile_btn_rect(w, h).collidepoint(mp):
+                    self._compile()
+                elif self._save_btn_rect(w, h).collidepoint(mp):
+                    self._save()
+                elif title_bar.collidepoint(mp):
+                    self.drag_title = (mp[0] - outer.x, mp[1] - outer.y)
+                elif self._code_rect(w, h).collidepoint(mp):
+                    self._caret_from_mouse(mp, w, h)
+
+        if inp.mouse_held(1):
+            if self.drag_title is not None:
+                dx, dy = self.drag_title
+                self.pos = [mp[0] - dx, mp[1] - dy]
+        else:
+            self.drag_title = None
+
+        if self.minimized:
+            return
+
+        for ch in inp.take_text():
+            self._insert_text(ch)
+        if not compiled_this_step and (inp.pressed(pygame.K_RETURN)
+                                       or inp.pressed(pygame.K_KP_ENTER)):
+            self._insert_newline()
+        if inp.pressed(pygame.K_BACKSPACE):
+            self._backspace()
+        if inp.pressed(pygame.K_DELETE):
+            self._delete_forward()
+        if inp.pressed(pygame.K_TAB):
+            self._insert_text(self.TAB_SPACES)
+        if inp.pressed(pygame.K_LEFT):
+            self._move_left()
+        if inp.pressed(pygame.K_RIGHT):
+            self._move_right()
+        if inp.pressed(pygame.K_UP):
+            self._move_up()
+        if inp.pressed(pygame.K_DOWN):
+            self._move_down()
+        if inp.pressed(pygame.K_HOME):
+            self.caret_col = 0
+        if inp.pressed(pygame.K_END):
+            self.caret_col = len(self.lines[self.caret_row])
+        self._clamp_caret()
+        self._ensure_caret_visible(w, h)
+        if inp.wheel and self._code_rect(w, h).collidepoint(mp):
+            max_scroll = max(0, len(self.lines) - 1)
+            self.scroll_row = max(0, min(self.scroll_row - int(inp.wheel) * 3, max_scroll))
+
+    # ---- drawing ----
+    def draw(self, surf) -> None:
+        import pygame
+        w, h = surf.get_size()
+        outer = self.outer_rect(w, h)
+        pygame.draw.rect(surf, (18, 20, 25), outer)
+        pygame.draw.rect(surf, PANEL_EDGE, outer, 1)
+        title_bar = pygame.Rect(outer.x, outer.y, outer.width, PANEL_TITLE_H)
+        pygame.draw.rect(surf, (30, 33, 40), title_bar)
+        pygame.draw.line(surf, PANEL_EDGE, (outer.x, outer.y + PANEL_TITLE_H),
+                         (outer.right, outer.y + PANEL_TITLE_H))
+        star = " *" if self.dirty else ""
+        title = self.editor.font_small.render(
+            f"Script — {self.blueprint.name}{star}   "
+            "(Ctrl+Enter compile, Ctrl+S save, Esc close)", True, TEXT)
+        surf.blit(title, (outer.x + 8, outer.y + 3))
+        close = pygame.Rect(outer.right - 24, outer.y + 2, 16, 16)
+        pygame.draw.rect(surf, (60, 34, 34), close, border_radius=3)
+        x_lab = self.editor.font_small.render("X", True, (230, 160, 160))
+        surf.blit(x_lab, (close.x + 4, close.y + 1))
+        minimize = pygame.Rect(outer.right - 44, outer.y + 2, 16, 16)
+        pygame.draw.rect(surf, (40, 44, 54), minimize, border_radius=3)
+        m_lab = self.editor.font_small.render("-", True, TEXT)
+        surf.blit(m_lab, (minimize.x + 5, minimize.y - 1))
+        if self.minimized:
+            return
+
+        mp = pygame.mouse.get_pos()
+
+        tb = self._toolbar_rect(w, h)
+        pygame.draw.rect(surf, (26, 28, 34), tb)
+        pygame.draw.line(surf, PANEL_EDGE, (tb.x, tb.bottom), (tb.right, tb.bottom))
+        cb = self._compile_btn_rect(w, h)
+        pygame.draw.rect(surf, HOVER_BG if cb.collidepoint(mp) else (33, 46, 36), cb,
+                         border_radius=4)
+        pygame.draw.rect(surf, BLUEPRINT_TILE_EDGE, cb, 1, border_radius=4)
+        clab = self.editor.font_small.render("Compile", True, (150, 220, 165))
+        surf.blit(clab, (cb.x + (cb.width - clab.get_width()) // 2, cb.y + 4))
+        sb = self._save_btn_rect(w, h)
+        pygame.draw.rect(surf, HOVER_BG if sb.collidepoint(mp) else (33, 36, 44), sb,
+                         border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, sb, 1, border_radius=4)
+        slab = self.editor.font_small.render("Save", True, ACCENT)
+        surf.blit(slab, (sb.x + (sb.width - slab.get_width()) // 2, sb.y + 4))
+
+        gutter = self._gutter_rect(w, h)
+        code = self._code_rect(w, h)
+        pygame.draw.rect(surf, (24, 26, 31), gutter)
+        pygame.draw.line(surf, PANEL_EDGE, (gutter.right, code.y), (gutter.right, code.bottom))
+        line_h = self._line_h()
+        visible = self._visible_rows(w, h)
+        clip = surf.get_clip()
+        surf.set_clip(code.union(gutter))
+        for i in range(self.scroll_row, min(len(self.lines), self.scroll_row + visible + 1)):
+            y = code.y + (i - self.scroll_row) * line_h
+            line_no = i + 1
+            is_caret_line = i == self.caret_row
+            is_error_line = self.error_line is not None and line_no == self.error_line
+            if is_error_line:
+                pygame.draw.rect(surf, (58, 28, 30), (code.x, y, code.width, line_h))
+                pygame.draw.rect(surf, (58, 28, 30), (gutter.x, y, gutter.width, line_h))
+            elif is_caret_line:
+                pygame.draw.rect(surf, (30, 33, 42), (code.x, y, code.width, line_h))
+            num_color = (220, 130, 130) if is_error_line else (TEXT if is_caret_line else TEXT_DIM)
+            num = self.editor.font_small.render(str(line_no), True, num_color)
+            surf.blit(num, (gutter.right - 6 - num.get_width(), y + 2))
+            text_surf = self.editor.font_small.render(self.lines[i], True, TEXT)
+            surf.blit(text_surf, (code.x + 4, y + 2))
+        surf.set_clip(clip)
+
+        if self.scroll_row <= self.caret_row < self.scroll_row + visible + 1:
+            cy = code.y + (self.caret_row - self.scroll_row) * line_h
+            cx = code.x + 4 + self._char_w() * self.caret_col
+            pygame.draw.line(surf, ACCENT, (cx, cy + 1), (cx, cy + line_h - 3), 2)
+
+        sr = self._status_rect(w, h)
+        pygame.draw.rect(surf, (22, 24, 29), sr)
+        pygame.draw.line(surf, PANEL_EDGE, (sr.x, sr.y), (sr.right, sr.y))
+        msg, color = self._status_text()
+        msg_surf = self.editor.font_small.render(msg[:120], True, color)
+        surf.blit(msg_surf, (sr.x + 8, sr.y + 6))
+        if self.dirty:
+            edited = self.editor.font_small.render("(edited since last save)", True, TEXT_DIM)
+            surf.blit(edited, (sr.right - edited.get_width() - 8, sr.y + 6))
 
 
 class EditorBehavior:

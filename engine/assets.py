@@ -24,6 +24,7 @@ import numpy as np
 
 from . import behaviors as behaviors_mod
 from . import mesh as mesh_mod
+from .blueprint import DEFAULT_BLUEPRINT_SCRIPT
 from .camera import Camera
 from .environment import Environment, load_hdr
 from .lighting import DirectionalLight, Fog, FogVolume, PointLight, SpotLight, SunDisc
@@ -164,6 +165,41 @@ class MaterialAsset:
         return MaterialGraph.from_dict(self.graph_dict)
 
 
+class BlueprintAsset:
+    """A Python-scriptable asset: pairs posed-mesh components (run 2 --
+    empty this run) with a script that defines a Behavior subclass, saved
+    to assets/blueprints/<name>.json. Created/opened from the content
+    browser's "+ Blueprint" button / tile click (editor.py's
+    ScriptEditorUI); compiled + bug-checked in-engine via
+    `engine.blueprint.compile_blueprint`, whose last result is persisted
+    as `compile_result` so the browser tile / editor status strip can show
+    ok/error without recompiling on load.
+
+    Schema (run 1; `components` stays [] until run 2 adds posed meshes --
+    {"asset_name", "position", "rotation", "scale"} per entry, additive,
+    no format change needed here):
+        {"name": str, "category": "blueprints", "components": [],
+         "script": "<python source>", "compile_result": dict | None}
+    """
+
+    def __init__(self, data: dict, path: str):
+        self.name = data["name"]
+        self.category = "blueprints"
+        self.components = list(data.get("components", []))
+        self.script = data.get("script", "")
+        self.compile_result = data.get("compile_result")
+        self.path = path
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "category": "blueprints",
+                "components": self.components, "script": self.script,
+                "compile_result": self.compile_result}
+
+    def save(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+
 class AssetLibrary:
     """Owns the on-disk assets/*.json plus the content-browser folder tree.
 
@@ -180,6 +216,8 @@ class AssetLibrary:
         self.by_name: dict[str, AssetDef] = {}
         self.materials: list[MaterialAsset] = []
         self.material_by_name: dict[str, MaterialAsset] = {}
+        self.blueprints: list[BlueprintAsset] = []
+        self.blueprint_by_name: dict[str, BlueprintAsset] = {}
         self.folders: dict[str, dict] = {}
         self.folder_of: dict[str, str] = {}
         self._next_folder_id = 1
@@ -189,6 +227,9 @@ class AssetLibrary:
 
     def _materials_dir(self) -> str:
         return os.path.join(self.directory, "materials")
+
+    def _blueprints_dir(self) -> str:
+        return os.path.join(self.directory, "blueprints")
 
     def reload(self) -> None:
         self.assets.clear()
@@ -215,6 +256,19 @@ class AssetLibrary:
                 self.materials.append(mat)
                 self.material_by_name[mat.name] = mat
         self.materials.sort(key=lambda m: m.name)
+        self.blueprints.clear()
+        self.blueprint_by_name.clear()
+        bdir = self._blueprints_dir()
+        if os.path.isdir(bdir):
+            for fn in sorted(os.listdir(bdir)):
+                if not fn.lower().endswith(".json"):
+                    continue
+                with open(os.path.join(bdir, fn), encoding="utf-8") as f:
+                    data = json.load(f)
+                bp = BlueprintAsset(data, os.path.join(bdir, fn))
+                self.blueprints.append(bp)
+                self.blueprint_by_name[bp.name] = bp
+        self.blueprints.sort(key=lambda b: b.name)
         self._load_folders()
 
     def save_material(self, name: str, graph: "MaterialGraph") -> MaterialAsset:
@@ -234,6 +288,32 @@ class AssetLibrary:
 
     def instantiate(self, name: str, entity_name: str | None = None) -> Entity:
         return self.by_name[name].instantiate(entity_name)
+
+    def new_blueprint(self, name: str = "New Blueprint") -> BlueprintAsset:
+        """Create + persist a blueprint asset with a starter script (a
+        Behavior subclass that compiles clean out of the box) and a
+        de-duped name, same convention as `_new_folder` in editor.py."""
+        os.makedirs(self._blueprints_dir(), exist_ok=True)
+        final, n = name, 2
+        while final in self.blueprint_by_name:
+            final = f"{name} {n}"
+            n += 1
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in final).strip() or "blueprint"
+        path = os.path.join(self._blueprints_dir(), safe.replace(" ", "_").lower() + ".json")
+        n2 = 2
+        while os.path.exists(path):  # rare: a differently-named blueprint's file already
+            path = os.path.join(self._blueprints_dir(),  # sanitized to the same stem
+                                safe.replace(" ", "_").lower() + f"_{n2}.json")
+            n2 += 1
+        data = {"name": final, "category": "blueprints", "components": [],
+                "script": DEFAULT_BLUEPRINT_SCRIPT, "compile_result": None}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        bp = BlueprintAsset(data, path)
+        self.blueprints.append(bp)
+        self.blueprint_by_name[final] = bp
+        self.blueprints.sort(key=lambda b: b.name)
+        return bp
 
     # ---- folder tree ----
     def _folders_path(self) -> str:
@@ -256,11 +336,14 @@ class AssetLibrary:
                 assignments = data.get("assignments", {})
             except (OSError, ValueError):
                 self.folders = {}
-        # keep only assignments that point at real folders and real assets --
-        # deleting a folder manually (or an asset going away) shouldn't crash
-        # the browser, it should just fall the asset back to root.
+        # keep only assignments that point at real folders and real assets
+        # (blueprints included -- they participate in the folder tree like
+        # regular AssetDefs, unlike materials which only ever live at root)
+        # -- deleting a folder manually (or an asset going away) shouldn't
+        # crash the browser, it should just fall the asset back to root.
         self.folder_of = {name: fid for name, fid in assignments.items()
-                          if fid in self.folders and name in self.by_name}
+                          if fid in self.folders
+                          and (name in self.by_name or name in self.blueprint_by_name)}
 
     def save_folders(self) -> None:
         data = {"folders": self.folders, "assignments": self.folder_of,
@@ -293,6 +376,9 @@ class AssetLibrary:
 
     def assets_in(self, folder_id: str | None) -> list[AssetDef]:
         return [a for a in self.assets if self.folder_of.get(a.name) == folder_id]
+
+    def blueprints_in(self, folder_id: str | None) -> list[BlueprintAsset]:
+        return [b for b in self.blueprints if self.folder_of.get(b.name) == folder_id]
 
 
 def _vec(v: Vec3) -> list[float]:
