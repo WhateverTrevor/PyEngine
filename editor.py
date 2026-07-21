@@ -95,6 +95,17 @@ PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
 TAB_LABELS = {"outliner": "Outliner", "details": "Details", "browser": "Browser"}
 RESOLUTIONS = ((1280, 720), (1440, 810), (1600, 900), (1920, 1080))
 SETTINGS_SIZE = (380, 246)
+IMPORT_SIZE = (420, 320)   # Unreal-style import-options modal (see _open_import_dialog)
+# extension -> (internal kind, detected-type display label) for the import
+# dialog's read-only "Type" header; scale/up-axis only apply to "mesh"
+_IMPORT_TYPE_LABELS = {
+    ".fbx": ("mesh", "Static Mesh"),
+    ".hdr": ("hdri", "HDRI Environment"),
+    ".png": ("texture", "Texture"),
+    ".jpg": ("texture", "Texture"),
+    ".jpeg": ("texture", "Texture"),
+    ".bmp": ("texture", "Texture"),
+}
 
 
 def load_settings(path: str | None = None) -> dict:
@@ -362,6 +373,11 @@ class Editor:
         self.settings_open = False
         self.settings_drag = None   # "pixel" / "max_fps" while dragging a settings slider
         self.show_controls_overlay = False
+        self.import_dialog = None   # dict (path/ext/kind/label/name/folder/scale_text/
+                                     # up_axis) while the import-options modal is open,
+                                     # else None -- see _open_import_dialog
+        self.import_field = None    # "name" / "scale" -- which dialog field has focus,
+                                     # or None (see _update_import_text)
 
         self.font = pygame.font.SysFont("consolas,couriernew,monospace", 14)
         self.font_small = pygame.font.SysFont("consolas,couriernew,monospace", 12)
@@ -715,7 +731,7 @@ class Editor:
         return None
 
     def over_ui(self, pos) -> bool:
-        if self.mat_ui is not None or self.settings_open:
+        if self.mat_ui is not None or self.settings_open or self.import_dialog is not None:
             return True
         if pos[1] < MENU_H:
             return True
@@ -2539,7 +2555,31 @@ class Editor:
             return
         if not path:
             return
-        self._import_path_to_folder(path)
+        self._open_import_dialog(path)
+
+    def _open_import_dialog(self, path: str) -> None:
+        """Open the Unreal-style import-options modal for `path` instead of
+        importing immediately -- lets the user rename, refile, and (for
+        meshes) rescale/reorient before anything is written to disk.
+        Cancel writes nothing; Import routes to `_do_import` (see
+        `_import_confirm`). Kept separate from `_import_path_to_folder`,
+        the dialog-free instant-import path tests and any future Explorer
+        drag-drop use.
+        """
+        ext = os.path.splitext(path)[1].lower()
+        kind_label = _IMPORT_TYPE_LABELS.get(ext)
+        if kind_label is None:
+            self.status = (f"unsupported file type: {ext}", 5.0)
+            return
+        kind, label = kind_label
+        stem = os.path.splitext(os.path.basename(path))[0]
+        default_name = stem.replace("_", " ").strip().title() or "Imported Asset"
+        self.import_dialog = {
+            "path": path, "ext": ext, "kind": kind, "label": label,
+            "name": default_name, "folder": self.selected_folder,
+            "scale_text": "1", "up_axis": "y",
+        }
+        self.import_field = None
 
     def _import_path_to_folder(self, path: str) -> None:
         """Import an .fbx/.hdr file and assign it to `self.selected_folder`.
@@ -2566,6 +2606,233 @@ class Editor:
             self.status = (f"imported '{name}' — drag it from the browser", 5.0)
         except Exception as ex:
             self.status = (f"import failed: {ex}", 6.0)
+
+    def _rename_new_asset(self, old_name: str, new_name: str) -> str:
+        """Apply the import dialog's Name field to a just-imported asset's
+        JSON, de-duped against existing names (same pattern `_new_folder`
+        uses). Called before `set_asset_folder` so the folder assignment
+        lands on the final name. Returns the name actually in effect (the
+        original name if `new_name` is blank or unchanged)."""
+        new_name = (new_name or "").strip()
+        if not new_name or new_name == old_name:
+            return old_name
+        asset = self.lib.by_name.get(old_name)
+        if asset is None:
+            return old_name
+        existing = set(self.lib.by_name) - {old_name}
+        final, n = new_name, 2
+        while final in existing:
+            final = f"{new_name} {n}"
+            n += 1
+        asset.data["name"] = final
+        with open(asset.path, "w", encoding="utf-8") as f:
+            json.dump(asset.data, f, indent=2)
+        self.lib.reload()
+        return final
+
+    def _do_import(self, path: str, name: str = "", folder=None,
+                   scale: float = 1.0, up_axis: str = "y") -> None:
+        """Dialog-free import with options: applies the chosen name/folder
+        and, for a mesh, bakes the uniform scale + up-axis conversion into
+        the stored vertices (Unreal-style "bake import transform"), then
+        NAVIGATES the browser to the result (selected_folder +
+        selected_asset) so the new tile is immediately visible and
+        selected -- the "imported but hidden in another folder" problem
+        this dialog exists to fix. The import dialog's Import button
+        (`_import_confirm`) and tests both call this; a future Explorer
+        drag-drop could call it directly with the defaults to skip the
+        dialog entirely, same contract `_import_path_to_folder` established.
+        """
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".fbx":
+                asset_name = self.engine_mod.import_fbx(
+                    path, self.lib.directory, scale=scale, up_axis=up_axis)
+            elif ext == ".hdr":
+                asset_name = self.engine_mod.import_hdri(path, self.lib.directory)
+            elif ext in (".png", ".jpg", ".jpeg", ".bmp"):
+                asset_name = self.engine_mod.import_texture(path, self.lib.directory)
+            else:
+                self.status = (f"unsupported file type: {ext}", 5.0)
+                return
+            self.lib.reload()
+            asset_name = self._rename_new_asset(asset_name, name)
+            self.lib.set_asset_folder(asset_name, folder)
+            self.lib.save_folders()
+            self.icons[asset_name] = make_icon(self.engine_mod, self.lib.by_name[asset_name])
+            self.selected_folder = folder
+            self.selected_asset = self.lib.by_name[asset_name]
+            self.status = (f"imported '{asset_name}'", 5.0)
+        except Exception as ex:
+            self.status = (f"import failed: {ex}", 6.0)
+
+    # ---- content browser: import-options dialog (rects, styled like Settings) ----
+    def _import_rect(self, w, h):
+        import pygame
+        iw, ih = IMPORT_SIZE
+        return pygame.Rect((w - iw) // 2, max(MENU_H + 20, (h - ih) // 2), iw, ih)
+
+    def _import_close_rect(self, rect):
+        import pygame
+        return pygame.Rect(rect.right - 26, rect.y + 5, 20, 20)
+
+    def _import_name_rect(self, rect):
+        import pygame
+        return pygame.Rect(rect.x + 12, rect.y + 76, rect.width - 24, 24)
+
+    def _import_folder_rects(self, rect):
+        """(prev_btn, label_rect, next_btn) for the target-folder cycle row."""
+        import pygame
+        row = pygame.Rect(rect.x + 12, rect.y + 124, rect.width - 24, 24)
+        prev_btn = pygame.Rect(row.x, row.y, 26, row.height)
+        next_btn = pygame.Rect(row.right - 26, row.y, 26, row.height)
+        label = pygame.Rect(prev_btn.right + 4, row.y,
+                            next_btn.x - prev_btn.right - 8, row.height)
+        return prev_btn, label, next_btn
+
+    def _import_scale_rect(self, rect):
+        import pygame
+        return pygame.Rect(rect.x + 12, rect.y + 172, 100, 24)
+
+    def _import_fit_btn_rect(self, rect):
+        import pygame
+        s = self._import_scale_rect(rect)
+        return pygame.Rect(s.right + 10, s.y, rect.right - 12 - (s.right + 10), 24)
+
+    def _import_axis_rects(self, rect):
+        """(y_btn, z_btn) for the Up Axis toggle."""
+        import pygame
+        y0 = rect.y + 220
+        y_btn = pygame.Rect(rect.x + 12, y0, 60, 24)
+        z_btn = pygame.Rect(rect.x + 12 + 68, y0, 60, 24)
+        return y_btn, z_btn
+
+    def _import_cancel_rect(self, rect):
+        import pygame
+        return pygame.Rect(rect.right - 12 - 90 - 10 - 90, rect.bottom - 34, 90, 26)
+
+    def _import_ok_rect(self, rect):
+        import pygame
+        return pygame.Rect(rect.right - 12 - 90, rect.bottom - 34, 90, 26)
+
+    def _import_folder_options(self):
+        """[(folder_id_or_None, indented display name)] in the same
+        flattened depth-first order the folder-tree panel shows, so cycling
+        through it lands on the same folders in the same order a user
+        would see there."""
+        return [(fid, ("  " * depth) + name) for fid, depth, name in self._folder_tree_rows()]
+
+    def _import_cycle_folder(self, direction: int) -> None:
+        opts = self._import_folder_options()
+        ids = [fid for fid, _name in opts]
+        cur = self.import_dialog["folder"]
+        idx = ids.index(cur) if cur in ids else 0
+        self.import_dialog["folder"] = ids[(idx + direction) % len(ids)]
+
+    # ---- content browser: import-options dialog (update / text entry) ----
+    def _update_import_text(self, inp) -> None:
+        import pygame
+        d = self.import_dialog
+        field = self.import_field
+        typed = inp.take_text()
+        if field == "name":
+            d["name"] += typed
+            if inp.pressed(pygame.K_BACKSPACE):
+                d["name"] = d["name"][:-1]
+        elif field == "scale":
+            for ch in typed:
+                if ch.isdigit() or ch in "-.":
+                    d["scale_text"] += ch
+            if inp.pressed(pygame.K_BACKSPACE):
+                d["scale_text"] = d["scale_text"][:-1]
+        if inp.pressed(pygame.K_RETURN) or inp.pressed(pygame.K_KP_ENTER) \
+                or inp.pressed(pygame.K_TAB):
+            self.import_field = None
+
+    def _import_apply_fit_scale(self) -> None:
+        """"Fit to ~1 unit" button: re-derive the scale that would bring the
+        mesh's largest bbox dimension to ~1 unit, given the currently
+        selected up-axis (so toggling axis then fitting uses the correct
+        orientation's extents)."""
+        d = self.import_dialog
+        if d is None or d["kind"] != "mesh":
+            return
+        try:
+            scale = self.engine_mod.fbx_fit_scale(d["path"], up_axis=d["up_axis"])
+        except Exception as ex:
+            self.status = (f"fit-to-unit failed: {ex}", 5.0)
+            return
+        d["scale_text"] = self._fmt_num(scale)
+
+    def _import_confirm(self) -> None:
+        d = self.import_dialog
+        if d is None:
+            return
+        try:
+            scale = float(d["scale_text"])
+            if scale <= 0:
+                raise ValueError
+        except ValueError:
+            scale = 1.0
+        self.import_dialog = None
+        self.import_field = None
+        self._do_import(d["path"], name=d["name"], folder=d["folder"],
+                        scale=scale, up_axis=d["up_axis"])
+
+    def _update_import_dialog(self, engine, w, h) -> None:
+        import pygame
+        inp = engine.input
+        mp = inp.mouse_pos
+        d = self.import_dialog
+        rect = self._import_rect(w, h)
+
+        if self.import_field is not None:
+            self._update_import_text(inp)
+
+        if not inp.mouse_button_pressed(1):
+            return
+        if self._import_close_rect(rect).collidepoint(mp):
+            self.import_dialog = None
+            self.import_field = None
+            return
+        if self._import_name_rect(rect).collidepoint(mp):
+            self.import_field = "name"
+            return
+        prev_btn, _label, next_btn = self._import_folder_rects(rect)
+        if prev_btn.collidepoint(mp):
+            self.import_field = None
+            self._import_cycle_folder(-1)
+            return
+        if next_btn.collidepoint(mp):
+            self.import_field = None
+            self._import_cycle_folder(1)
+            return
+        if d["kind"] == "mesh":
+            if self._import_scale_rect(rect).collidepoint(mp):
+                self.import_field = "scale"
+                return
+            if self._import_fit_btn_rect(rect).collidepoint(mp):
+                self.import_field = None
+                self._import_apply_fit_scale()
+                return
+            y_btn, z_btn = self._import_axis_rects(rect)
+            if y_btn.collidepoint(mp):
+                d["up_axis"] = "y"
+                self.import_field = None
+                return
+            if z_btn.collidepoint(mp):
+                d["up_axis"] = "z"
+                self.import_field = None
+                return
+        if self._import_cancel_rect(rect).collidepoint(mp):
+            self.import_dialog = None
+            self.import_field = None
+            return
+        if self._import_ok_rect(rect).collidepoint(mp):
+            self._import_confirm()
+            return
+        # click elsewhere inside the dialog defocuses any active text field
+        self.import_field = None
 
     # ---- content browser: export selected tile's mesh to FBX ----
     def _export_asset_to_path(self, asset, path: str) -> None:
@@ -2666,6 +2933,9 @@ class Editor:
             return
         if self.settings_open:      # settings dialog captures all editor input
             self._update_settings(engine, w, h)
+            return
+        if self.import_dialog is not None:  # import-options dialog captures all input
+            self._update_import_dialog(engine, w, h)
             return
         if self.renaming_folder is not _NO_RENAME:  # inline folder rename captures input
             self._update_rename(inp)
@@ -2880,6 +3150,10 @@ class Editor:
             return True
         if self.settings_open:
             self.settings_open = False
+            return True
+        if self.import_dialog is not None:
+            self.import_dialog = None
+            self.import_field = None
             return True
         if self.mat_ui is not None:
             if self.mat_ui.ctx_menu is not None:
@@ -3284,6 +3558,8 @@ class Editor:
             self._draw_controls_overlay(surf, w, h)
         if self.settings_open:
             self._draw_settings(surf, w, h)
+        if self.import_dialog is not None:
+            self._draw_import_dialog(surf, w, h)
         if self.mat_ui is not None:
             self.mat_ui.draw(surf)
 
@@ -3504,6 +3780,99 @@ class Editor:
         pygame.draw.circle(surf, (235, 235, 240), (kx, cy), 5)
         surf.blit(self.font_small.render(str(int(round(value))), True, TEXT),
                   (x1 + 8, row.y + 5))
+
+    def _draw_import_dialog(self, surf, w, h) -> None:
+        import pygame
+        d = self.import_dialog
+        rect = self._import_rect(w, h)
+        mp = pygame.mouse.get_pos()
+        pygame.draw.rect(surf, PANEL_BG, rect, border_radius=6)
+        pygame.draw.rect(surf, PANEL_EDGE, rect, 1, border_radius=6)
+        surf.blit(self.font.render("Import Options", True, TEXT), (rect.x + 12, rect.y + 8))
+
+        close = self._import_close_rect(rect)
+        pygame.draw.rect(surf, (60, 34, 34) if not close.collidepoint(mp) else (90, 44, 44),
+                         close, border_radius=4)
+        surf.blit(self.font_small.render("X", True, (230, 160, 160)),
+                  (close.x + 7, close.y + 4))
+
+        is_mesh = d["kind"] == "mesh"
+        dim_or_off = TEXT_DIM if is_mesh else (75, 77, 84)
+        box_bg = (33, 36, 44) if is_mesh else (26, 28, 33)
+        box_edge = PANEL_EDGE if is_mesh else (44, 47, 54)
+        val_col = TEXT if is_mesh else (90, 92, 98)
+
+        surf.blit(self.font_small.render(f"Type: {d['label']}", True, TEXT_DIM),
+                  (rect.x + 12, rect.y + 34))
+
+        # ---- name ----
+        surf.blit(self.font_small.render("Name", True, TEXT_DIM), (rect.x + 12, rect.y + 60))
+        name_r = self._import_name_rect(rect)
+        editing_name = self.import_field == "name"
+        pygame.draw.rect(surf, (33, 36, 44), name_r, border_radius=4)
+        pygame.draw.rect(surf, ACCENT if editing_name else PANEL_EDGE, name_r, 1, border_radius=4)
+        surf.blit(self.font_small.render(d["name"] + ("_" if editing_name else ""), True, TEXT),
+                  (name_r.x + 6, name_r.y + 5))
+
+        # ---- target folder (cycle) ----
+        surf.blit(self.font_small.render("Target Folder", True, TEXT_DIM),
+                  (rect.x + 12, rect.y + 108))
+        prev_btn, label_r, next_btn = self._import_folder_rects(rect)
+        for btn, glyph in ((prev_btn, "<"), (next_btn, ">")):
+            pygame.draw.rect(surf, HOVER_BG if btn.collidepoint(mp) else (33, 36, 44),
+                             btn, border_radius=4)
+            pygame.draw.rect(surf, PANEL_EDGE, btn, 1, border_radius=4)
+            gl = self.font_small.render(glyph, True, TEXT)
+            surf.blit(gl, (btn.x + (btn.width - gl.get_width()) // 2, btn.y + 4))
+        pygame.draw.rect(surf, (33, 36, 44), label_r, border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, label_r, 1, border_radius=4)
+        fname = dict(self._import_folder_options()).get(d["folder"], "Assets").strip() or "Assets"
+        fl = self.font_small.render(fname, True, TEXT)
+        surf.blit(fl, (label_r.x + max(4, (label_r.width - fl.get_width()) // 2), label_r.y + 5))
+
+        # ---- uniform scale + fit button (mesh only) ----
+        surf.blit(self.font_small.render(
+            "Uniform Scale" + ("" if is_mesh else " (mesh only)"), True, dim_or_off),
+            (rect.x + 12, rect.y + 156))
+        scale_r = self._import_scale_rect(rect)
+        editing_scale = self.import_field == "scale"
+        pygame.draw.rect(surf, box_bg, scale_r, border_radius=4)
+        pygame.draw.rect(surf, (ACCENT if editing_scale else box_edge) if is_mesh else box_edge,
+                         scale_r, 1, border_radius=4)
+        surf.blit(self.font_small.render(d["scale_text"] + ("_" if editing_scale else ""),
+                                         True, val_col), (scale_r.x + 6, scale_r.y + 5))
+        fit_r = self._import_fit_btn_rect(rect)
+        fit_bg = (HOVER_BG if fit_r.collidepoint(mp) else (33, 36, 44)) if is_mesh else box_bg
+        pygame.draw.rect(surf, fit_bg, fit_r, border_radius=4)
+        pygame.draw.rect(surf, box_edge, fit_r, 1, border_radius=4)
+        fit_lab = self.font_small.render("Fit to ~1 unit", True, ACCENT if is_mesh else val_col)
+        surf.blit(fit_lab, (fit_r.x + (fit_r.width - fit_lab.get_width()) // 2, fit_r.y + 5))
+
+        # ---- up axis toggle (mesh only) ----
+        surf.blit(self.font_small.render(
+            "Up Axis" + ("" if is_mesh else " (mesh only)"), True, dim_or_off),
+            (rect.x + 12, rect.y + 204))
+        y_btn, z_btn = self._import_axis_rects(rect)
+        for btn, axis in ((y_btn, "y"), (z_btn, "z")):
+            active = is_mesh and d["up_axis"] == axis
+            pygame.draw.rect(surf, SELECT_BG if active else box_bg, btn, border_radius=4)
+            pygame.draw.rect(surf, box_edge, btn, 1, border_radius=4)
+            lab = self.font_small.render(axis.upper(), True, val_col)
+            surf.blit(lab, (btn.x + (btn.width - lab.get_width()) // 2, btn.y + 5))
+
+        # ---- Cancel / Import ----
+        cancel_r = self._import_cancel_rect(rect)
+        ok_r = self._import_ok_rect(rect)
+        pygame.draw.rect(surf, HOVER_BG if cancel_r.collidepoint(mp) else (33, 36, 44),
+                         cancel_r, border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, cancel_r, 1, border_radius=4)
+        clab = self.font_small.render("Cancel", True, TEXT)
+        surf.blit(clab, (cancel_r.x + (cancel_r.width - clab.get_width()) // 2, cancel_r.y + 6))
+        pygame.draw.rect(surf, (60, 110, 60) if ok_r.collidepoint(mp) else (44, 84, 44),
+                         ok_r, border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, ok_r, 1, border_radius=4)
+        ilab = self.font_small.render("Import", True, (210, 245, 210))
+        surf.blit(ilab, (ok_r.x + (ok_r.width - ilab.get_width()) // 2, ok_r.y + 6))
 
     def _draw_markers(self, surf, w, h) -> None:
         import numpy as np

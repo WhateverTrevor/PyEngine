@@ -344,10 +344,20 @@ def extract_geometry(path: str):
     return vertices, all_faces, np.asarray(all_colors, dtype=np.float64), face_uvs
 
 
-def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
-               max_bound: float = 4.0) -> str:
-    """Convert an .fbx into a content-browser asset. Returns the asset name."""
+def _prepared_geometry(path: str, up_axis: str = "y", max_bound: float = 4.0):
+    """`extract_geometry()` plus the steps `import_fbx()` always applied
+    before writing: an optional manual up-axis override on top of whatever
+    `extract_geometry` already auto-converted from the file's own
+    GlobalSettings (many exporters -- Blender's included -- leave that
+    metadata wrong or absent, so the import dialog's Up Axis toggle lets a
+    user force the Z-up->Y-up swap by hand regardless of what the file
+    claims), ground-centering, and the legacy "outlandish scale" auto-clamp.
+    Shared by `import_fbx` and `fbx_fit_scale` so the dialog's "Fit to ~1
+    unit" button measures the exact mesh that would be written at scale=1.
+    """
     vertices, faces, face_colors, face_uvs = extract_geometry(path)
+    if up_axis == "z":
+        vertices = vertices[:, [0, 2, 1]] * np.array([1.0, 1.0, -1.0])
 
     # center on the ground and normalize outlandish scales
     vertices = vertices - vertices.mean(axis=0)
@@ -355,6 +365,39 @@ def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
     bound = float(np.abs(vertices).max())
     if bound > max_bound and bound > 0:
         vertices *= max_bound / bound
+    return vertices, faces, face_colors, face_uvs
+
+
+def fbx_fit_scale(path: str, up_axis: str = "y", max_bound: float = 4.0,
+                  target: float = 1.0) -> float:
+    """Uniform scale that would bring the mesh's largest bbox dimension (as
+    it would be imported at scale=1 -- i.e. after up-axis conversion,
+    ground-centering, and the auto max_bound clamp) to `target` units.
+    Powers the import dialog's "Fit to ~1 unit" button.
+    """
+    vertices, _faces, _colors, _uvs = _prepared_geometry(path, up_axis, max_bound)
+    if len(vertices) == 0:
+        return 1.0
+    extent = vertices.max(axis=0) - vertices.min(axis=0)
+    largest = float(extent.max())
+    return target / largest if largest > 1e-9 else 1.0
+
+
+def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
+               max_bound: float = 4.0, scale: float = 1.0,
+               up_axis: str = "y") -> str:
+    """Convert an .fbx into a content-browser asset. Returns the asset name.
+
+    `scale` and `up_axis` are baked into the stored vertices at import time
+    (Unreal-style "bake import transform") so the .npz + everything
+    downstream -- rendering, LOD, physics/collision -- see the corrected
+    size/orientation with no runtime cost. Defaults (scale=1, up_axis="y")
+    reproduce this function's pre-dialog behavior exactly, so every other
+    caller (tests, the File>Import FBX menu item) is unaffected.
+    """
+    vertices, faces, face_colors, face_uvs = _prepared_geometry(path, up_axis, max_bound)
+    if scale != 1.0:
+        vertices = vertices * scale
 
     stem = os.path.splitext(os.path.basename(path))[0]
     name = stem.replace("_", " ").strip().title() or "Imported Model"

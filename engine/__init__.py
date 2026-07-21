@@ -4,7 +4,7 @@ from .assets import AssetLibrary, MaterialAsset, load_scene, save_scene
 from .camera import Camera
 from .core import Engine
 from .environment import Environment, import_hdri, load_hdr, save_hdr
-from .fbx import export_asset_fbx, has_mesh, import_fbx
+from .fbx import export_asset_fbx, fbx_fit_scale, has_mesh, import_fbx
 from .lighting import (IES_PROFILES, DirectionalLight, Fog, FogVolume, PointLight,
                        SpotLight, SunDisc)
 from .materials import NODE_DEFS, NODE_OUTPUTS, PARAM_RANGES, MaterialGraph
@@ -21,7 +21,7 @@ __all__ = [
     "DirectionalLight", "PointLight", "SpotLight", "Fog", "Vec3", "IES_PROFILES",
     "SunDisc", "FogVolume",
     "Environment", "load_hdr", "save_hdr", "import_hdri", "import_fbx",
-    "export_asset_fbx", "has_mesh", "import_texture", "texture",
+    "export_asset_fbx", "fbx_fit_scale", "has_mesh", "import_texture", "texture",
     "MaterialGraph", "NODE_DEFS", "NODE_OUTPUTS", "PARAM_RANGES",
     "AssetLibrary", "MaterialAsset", "save_scene", "load_scene",
     "ShadowTracer", "GITracer", "pick_entity",
