@@ -68,6 +68,9 @@ class Entity:
         # selected level, updated once/frame by lod.update_scene_lods.
         self.lod_meshes: list[Mesh] = []
         self.lod_index = 0
+        self._shadow_proxy = None         # cached (mesh, coarse-proxy) for a
+                                          # high-poly mesh that carries NO
+                                          # precomputed LODs (see shadow_mesh)
 
     def add_behavior(self, behavior: Behavior) -> "Entity":
         self.behaviors.append(behavior)
@@ -76,12 +79,50 @@ class Entity:
     def render_mesh(self) -> Mesh | None:
         """The mesh the rasterizer should draw this frame: `mesh` (LOD0)
         unless LOD data exists and `lod_index` selects a coarser level. Ray-
-        traced shadows/GI never call this -- they always read `.mesh`
-        directly (see raytrace.py), which is the whole point: occlusion
-        stays pinned to the full mesh regardless of camera-distance LOD."""
+        traced shadows/GI never call this -- they always read `shadow_mesh()`
+        directly (see raytrace.py), which is pinned to a fixed level
+        regardless of camera-distance LOD (`lod_index` only drives this
+        method)."""
         if not self.lod_meshes or self.lod_index <= 0:
             return self.mesh
         return self.lod_meshes[min(self.lod_index, len(self.lod_meshes)) - 1]
+
+    def shadow_mesh(self) -> Mesh:
+        """The mesh used for ray-traced shadow/GI OCCLUSION (what rays hit)
+        and for this entity's own received shadow/GI granularity (what rays
+        leave from): the COARSEST available LOD (`lod_meshes[-1]`) when the
+        mesh has LOD data, else `mesh` unchanged. Independent of `lod_index`
+        -- occlusion cost scales with occluder-triangle count x receiver-face
+        count, so a high-poly caster/receiver (e.g. a big FBX import) bakes
+        against a coarse proxy instead of paying full LOD0 detail every
+        frame; the result is gathered back onto whichever LOD is actually
+        rasterized (see gpu_geometry.py's `_lod_gather`). Built-ins and any
+        mesh below lod.LOD_FACE_THRESHOLD have no lod_meshes, so this
+        returns `mesh` unchanged -- byte-identical shadow/GI behavior to
+        before this coarsening existed.
+
+        On-demand proxy: a high-poly mesh with NO precomputed LODs (imported
+        before the LOD feature existed, or with "Generate LODs" left off --
+        the user's 10k-face "Gat" is exactly this) would otherwise fall back
+        to the full mesh and freeze the ray-traced bake (~5 min for 10k
+        faces). For that case, decimate a coarse occluder ONCE via
+        lod.generate_lods and cache it keyed by mesh identity, so the bake
+        pays only the proxy's face count and the gather map (shadow_gather_map)
+        maps results back onto the rasterized faces."""
+        if self.lod_meshes:
+            return self.lod_meshes[-1]
+        m = self.mesh
+        if m is None:
+            return m
+        from . import lod as _lod
+        if len(m.faces) <= _lod.SHADOW_PROXY_THRESHOLD:
+            return m
+        cache = self._shadow_proxy
+        if cache is None or cache[0] is not m:
+            proxy = _lod.generate_lods(m)[-1]   # coarsest decimation; == m only
+            self._shadow_proxy = (m, proxy)     # if generate_lods couldn't reduce
+            return proxy
+        return cache[1]
 
 
 class Scene:

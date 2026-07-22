@@ -141,10 +141,16 @@ def _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id, max_t=200.0):
     return out
 
 
-def _world_triangles(entity):
+def _world_triangles(entity, mesh=None):
+    """World-space (v0, e1, e2) triangle-edge arrays for `mesh` (default
+    `entity.mesh`/LOD0 -- exact geometry, used by mouse-picking below).
+    `ShadowTracer.refresh` passes `entity.shadow_mesh()` explicitly to build
+    the occluder soup from a coarse LOD proxy on high-poly casters instead
+    (see scene.py's `Entity.shadow_mesh`)."""
+    mesh = mesh if mesh is not None else entity.mesh
     m = entity.transform.matrix()
-    wv = entity.mesh.vertices @ m[:3, :3].T + m[:3, 3]
-    tri = wv[entity.mesh.tri_faces]
+    wv = mesh.vertices @ m[:3, :3].T + m[:3, 3]
+    tri = wv[mesh.tri_faces]
     return tri[:, 0], tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
 
 
@@ -181,11 +187,18 @@ class ShadowTracer:
         v0s, e1s, e2s, face_ids = [], [], [], []
         face_offset = 0
         for e in casters:
-            v0, e1, e2 = _world_triangles(e)
+            # occluder geometry uses the entity's shadow mesh (a coarse LOD
+            # proxy for high-poly meshes, else `entity.mesh` unchanged --
+            # see `Entity.shadow_mesh`) so occlusion cost scales with the
+            # coarse triangle count, not the full-detail import; face ids
+            # below index into this SAME mesh's faces, matching
+            # `_gi_direct_lighting`'s per-caster arrays one-for-one.
+            occ_mesh = e.shadow_mesh()
+            v0, e1, e2 = _world_triangles(e, occ_mesh)
             v0s.append(v0)
             e1s.append(e1)
             e2s.append(e2)
-            faces = e.mesh.faces
+            faces = occ_mesh.faces
             is_tri = (faces[:, 3] == faces[:, 2]) | (faces[:, 3] == faces[:, 0])
             counts = np.where(is_tri, 1, 2)  # tris contribute 1 tri, quads 2
             face_ids.append(np.repeat(np.arange(len(faces)), counts) + face_offset)
@@ -348,6 +361,12 @@ class GITracer:
         order. `receiver_fn(receivers)` -> (centroids, normals) for every
         visible mesh entity. Both are supplied by the caller (Renderer)
         since the direct-lighting/shadow machinery already lives there.
+
+        Receiver ranges are sized to each entity's `shadow_mesh()` face
+        count (LOD0, or a coarse LOD proxy for high-poly meshes -- see
+        scene.py), matching what `receiver_fn` actually returns per entity;
+        the renderer gathers this coarse result onto whichever LOD is
+        rasterized via `_lod_gather`.
         """
         casters = [e for e in scene.entities
                   if e.mesh is not None and e.visible and e.casts_shadow
@@ -364,7 +383,7 @@ class GITracer:
         ranges = []
         offset = 0
         for e in receivers:
-            m = int(e.mesh.faces.shape[0])
+            m = int(e.shadow_mesh().faces.shape[0])
             ranges.append((e, offset, m))
             offset += m
 

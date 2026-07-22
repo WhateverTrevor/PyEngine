@@ -3,10 +3,12 @@
 Covers engine/lod.py's vertex-clustering decimation + generate_lods, .npz
 storage round-trip, the import dialog's "Generate LODs" toggle, runtime
 distance selection with hysteresis, and renderer/raytrace LOD-pinning parity
-(rasterization draws the selected LOD; ray-traced shadows/GI always use
-LOD0). High-poly fixtures are built in-memory (a subdivided icosphere) --
-this suite never touches the user's real assets/gat.json, assets/models/
-gat.npz, or assets/folders.json.
+(rasterization draws the selected LOD; ray-traced shadow/GI occlusion is
+pinned to `Entity.shadow_mesh()` -- LOD0 for ordinary meshes, but the
+COARSEST available LOD for high-poly ones, see checks 10-13 below and
+scene.py/raytrace.py/gpu_geometry.py). High-poly fixtures are built
+in-memory (a subdivided icosphere) -- this suite never touches the user's
+real assets/gat.json, assets/models/gat.npz, or assets/folders.json.
 """
 import os
 import sys
@@ -251,9 +253,10 @@ print(f"7. triangle count drop OK: close={close_tris} tris (LOD0) -> "
      f"far={far_tris} tris (LOD{tri_entity.lod_index})")
 
 # ========================================================================
-# 8. shadows use LOD0 regardless of which LOD the camera would select --
-#    the caster's occluder role never reads entity.lod_index (see
-#    raytrace.py, entirely unmodified by this feature). Two INDEPENDENT
+# 8. shadows use a FIXED occlusion mesh (shadow_mesh(): LOD0, or the
+#    coarsest LOD for high-poly meshes -- see checks 10-13) regardless of
+#    which LOD the camera would select for rasterization -- the caster's
+#    occluder role never reads entity.lod_index. Two INDEPENDENT
 #    ShadowTracer instances (so nothing is cache-shared) trace the same
 #    fixed receiver against the same fixed caster at two different
 #    lod_index values; the shadow result must be identical.
@@ -323,5 +326,164 @@ mean_px = pygame.surfarray.array3d(starter_surf).astype(np.float64).mean()
 assert mean_px > 5.0, f"starter scene must not render as a black frame: mean {mean_px:.2f}"
 print(f"9. starter-scene parity OK: every entity's render_mesh() is its own mesh (no-op), "
      f"renders fine (mean pixel {mean_px:.1f})")
+
+# ========================================================================
+# 10. Entity.shadow_mesh(): identity for no-LOD entities, COARSEST LOD for
+#     entities with LOD data -- independent of lod_index/camera distance
+#     (that's the whole point: occlusion cost must not depend on which LOD
+#     the camera would pick for rasterization).
+# ========================================================================
+plain = engine.Entity("plain", mesh=small_mesh)
+assert plain.shadow_mesh() is plain.mesh, \
+    "a no-LOD entity's shadow_mesh() must be its mesh, unchanged"
+
+hp_entity = engine.Entity("hp_shadow", mesh=hp_mesh)
+hp_lods = lod.generate_lods(hp_mesh)
+hp_entity.lod_meshes = hp_lods[1:]
+assert hp_entity.shadow_mesh() is hp_lods[-1], \
+    "a high-poly entity's shadow_mesh() must be the COARSEST available LOD"
+hp_entity.lod_index = 0
+assert hp_entity.shadow_mesh() is hp_lods[-1], "shadow_mesh() must not depend on lod_index"
+hp_entity.lod_index = len(hp_entity.lod_meshes)
+assert hp_entity.shadow_mesh() is hp_lods[-1], "shadow_mesh() must not depend on lod_index"
+print(f"10. Entity.shadow_mesh() OK: no-LOD -> mesh identity; high-poly -> coarsest LOD "
+     f"({len(hp_mesh.faces)} -> {len(hp_lods[-1].faces)} faces), independent of lod_index")
+
+# ========================================================================
+# 10b. On-demand shadow proxy for a HIGH-POLY mesh with NO precomputed LODs
+#      (the exact case that froze the bake: the user's Gat was imported
+#      before LODs existed, so lod_meshes is empty and shadow_mesh() would
+#      otherwise fall back to the full 10k-face mesh). shadow_mesh() must
+#      decimate on demand above SHADOW_PROXY_THRESHOLD and cache the proxy;
+#      meshes between LOD_FACE_THRESHOLD and SHADOW_PROXY_THRESHOLD (e.g. the
+#      256-face Stone Floor) must stay identity so built-ins are unchanged.
+# ========================================================================
+big = engine.icosphere(0.8, 3)   # 1280 faces, no lod_meshes -> must proxy
+assert len(big.faces) > lod.SHADOW_PROXY_THRESHOLD
+big_e = engine.Entity("big_nolod", mesh=big)
+assert not big_e.lod_meshes, "fixture must have no precomputed LODs"
+proxy = big_e.shadow_mesh()
+assert proxy is not big, "high-poly no-LOD mesh must get an on-demand shadow proxy"
+assert len(proxy.faces) < len(big.faces), "the proxy must be coarser than the full mesh"
+assert big_e.shadow_mesh() is proxy, "the on-demand proxy must be cached (same object)"
+
+mid = engine.icosphere(0.8, 2)   # 320 faces: above LOD threshold, below proxy threshold
+assert lod.LOD_FACE_THRESHOLD < len(mid.faces) <= lod.SHADOW_PROXY_THRESHOLD
+mid_e = engine.Entity("mid_nolod", mesh=mid)
+assert mid_e.shadow_mesh() is mid, \
+    "a mesh below SHADOW_PROXY_THRESHOLD must keep shadow_mesh() == mesh (built-in compat)"
+print(f"10b. on-demand shadow proxy OK: {len(big.faces)}-face no-LOD mesh -> "
+     f"{len(proxy.faces)}-face proxy (cached); {len(mid.faces)}-face mesh stays identity")
+
+# ========================================================================
+# 11. occluder coarsening: ShadowTracer's world-space triangle soup for a
+#     high-poly shadow caster is built from the COARSE proxy (fewer
+#     triangles than LOD0), while a caster with no LOD data still
+#     contributes its full mesh unchanged -- the backward-compat contract
+#     every built-in relies on. (ShadowTracer already imported by check 8.)
+# ========================================================================
+coarse_scene = engine.Scene(enable_shadows=True)
+coarse_ground = engine.Entity("ground_c", mesh=engine.checkerboard(6, 1.0))
+coarse_ground.casts_shadow = False
+coarse_scene.add(coarse_ground)
+coarse_caster = engine.Entity("hp_caster", mesh=hp_mesh,
+                              position=engine.Vec3(0, hp_mesh.bound + 0.5, 0))
+coarse_caster.lod_meshes = lod.generate_lods(hp_mesh)[1:]
+coarse_scene.add(coarse_caster)
+
+coarse_tracer = ShadowTracer()
+coarse_tracer.refresh(coarse_scene)
+occ_tris = len(coarse_tracer._occ[0])
+assert occ_tris < len(hp_mesh.tri_faces), \
+    (f"occluder soup for a high-poly caster must use the coarse LOD, not LOD0: "
+     f"{occ_tris} tris vs {len(hp_mesh.tri_faces)} at LOD0")
+print(f"11a. occluder coarsening OK: {len(hp_mesh.tri_faces)} LOD0 tris -> "
+     f"{occ_tris} occluder tris (coarsest LOD)")
+
+lowpoly_scene = engine.Scene(enable_shadows=True)
+lowpoly_ground = engine.Entity("ground_lp", mesh=engine.checkerboard(6, 1.0))
+lowpoly_ground.casts_shadow = False
+lowpoly_scene.add(lowpoly_ground)
+lowpoly_caster = engine.Entity("cube_caster", mesh=small_mesh,
+                               position=engine.Vec3(0, 2.0, 0))
+lowpoly_scene.add(lowpoly_caster)
+lowpoly_tracer = ShadowTracer()
+lowpoly_tracer.refresh(lowpoly_scene)
+assert len(lowpoly_tracer._occ[0]) == len(small_mesh.tri_faces), \
+    "a caster with no LOD data must contribute its full (unchanged) mesh to the occluder soup"
+print(f"11b. low-poly backward-compat OK: occluder soup uses the full "
+     f"{len(small_mesh.tri_faces)}-tri mesh unchanged (no coarsening applied)")
+
+# ========================================================================
+# 12. THE FIX: a high-poly shadow-casting mesh (subdivided icosphere, built
+#     in-memory -- never the user's real assets/gat.*) bakes its first
+#     shadow+GI pass in a few seconds, not the minutes the old LOD0-pinned
+#     occluder soup cost (task diagnosis: a 10,448-face import took 295s
+#     pre-fix vs 0.76s for a 594-face scene). Also proves the coarse
+#     occluder still actually produces shadows -- coarsening must not
+#     silently disable them.
+# ========================================================================
+import time
+
+bake_scene = engine.Scene(enable_shadows=True)
+bake_ground = engine.Entity("ground_bake", mesh=engine.checkerboard(6, 1.0))
+bake_ground.casts_shadow = False
+bake_scene.add(bake_ground)
+
+bake_caster = engine.Entity("bake_caster", mesh=hp_mesh,
+                            position=engine.Vec3(0, hp_mesh.bound + 0.5, 0))
+bake_caster.lod_meshes = lod.generate_lods(hp_mesh)[1:]
+bake_scene.add(bake_caster)
+
+bake_lamp = engine.Entity("bake_lamp", light=engine.PointLight(
+    intensity=4.0, range=25.0, radius=0.2, cast_shadows=True),
+    position=engine.Vec3(0, hp_mesh.bound + 6.0, 0))
+bake_scene.add(bake_lamp)
+bake_scene.gi = {"enabled": True, "intensity": 1.0, "samples": 16}
+
+bake_cam = Camera(position=engine.Vec3(0, hp_mesh.bound + 3.0, hp_mesh.bound * 4.0))
+bake_surf = pygame.Surface((320, 240))
+bake_tracer = ShadowTracer()
+
+t0 = time.perf_counter()
+bake_tracer.refresh(bake_scene)
+renderer.render(bake_surf, bake_scene, bake_cam, tracer=bake_tracer)
+elapsed = time.perf_counter() - t0
+BOUND_S = 10.0
+assert elapsed < BOUND_S, \
+    f"high-poly shadow/GI bake took {elapsed:.2f}s, must be under {BOUND_S}s (was minutes pre-fix)"
+
+bg_centroids, bg_normals = _world_face_geometry(bake_ground)
+bg_active = np.ones(len(bg_centroids), dtype=bool)
+binfo = _gather_lights(bake_scene)[0]
+shadow_vals = bake_tracer.shadow_factors(bake_ground, binfo.light, binfo.pos,
+                                         bg_centroids, bg_normals, bg_active)
+assert shadow_vals.min() < 0.9, \
+    "the coarse occluder must still cast a real shadow onto the ground, not just pass rays through"
+print(f"12. shadow/GI bake time OK: {elapsed:.2f}s for a {len(hp_mesh.faces)}-face self-shadowing "
+     f"+ GI scene (bound {BOUND_S}s; was minutes pre-fix with LOD0-pinned occlusion); "
+     f"coarse occluder still shadows the ground (min factor {shadow_vals.min():.3f})")
+
+# ========================================================================
+# 13. starter-scene shadow/GI parity: every built-in has no LOD data, so
+#     entity.shadow_mesh() is entity.mesh for the whole scene -- the new
+#     coarsening mechanism is a structural no-op here -- and a full render
+#     with ray-traced shadows/GI actually turned on (unlike check 9, which
+#     renders with tracer=None) still produces a sane, non-black frame.
+# ========================================================================
+for e in starter_scene.entities:
+    if e.mesh is not None:
+        assert e.shadow_mesh() is e.mesh, \
+            f"built-in entity '{e.name}' must take the shadow_mesh() == mesh identity path"
+
+starter_scene.gi = {"enabled": True, "intensity": 1.0, "samples": 16}
+starter_tracer = ShadowTracer()
+starter_tracer.refresh(starter_scene)
+starter_surf2 = pygame.Surface((320, 240))
+renderer.render(starter_surf2, starter_scene, starter_cam, tracer=starter_tracer)
+mean_px2 = pygame.surfarray.array3d(starter_surf2).astype(np.float64).mean()
+assert mean_px2 > 5.0, f"starter scene with shadows/GI must not render black: mean {mean_px2:.2f}"
+print(f"13. starter-scene shadow/GI parity OK: every built-in takes the shadow_mesh() == mesh "
+     f"identity path; full shadow+GI render is sane (mean pixel {mean_px2:.1f})")
 
 print("ALL LOD CHECKS PASSED")

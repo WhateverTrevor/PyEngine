@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .lod import shadow_gather_map
+
 
 def _build_geometry(mesh):
     """Non-indexed (T*3, ...) vertex soup in LOCAL space + per-triangle face id."""
@@ -58,27 +60,40 @@ def _build_opacity(mesh, face_id_tri) -> np.ndarray:
 
 
 def _lod_gather(entity, render_mesh, values: np.ndarray) -> np.ndarray:
-    """Map a per-LOD0-face array (shape (entity.mesh face count, ...)) onto
-    `render_mesh`'s own faces via its `lod_source_faces` map (see
-    engine/lod.py) -- identity when `render_mesh` IS `entity.mesh` (no LOD
-    active, or the mesh has no LOD data at all -- every built-in asset).
-    Used for shadow/GI values, which are always computed at LOD0 face
-    granularity (ray-traced occlusion/bounce must never depend on which LOD
-    the camera happens to be rasterizing -- see raytrace.py's world-version
-    cache) then gathered onto whichever LOD is actually being drawn.
+    """Map a per-`entity.shadow_mesh()`-face array onto `render_mesh`'s own
+    faces -- identity when `render_mesh` IS `shadow_mesh` (no LOD active, or
+    the mesh has no LOD data at all -- every built-in asset, the common
+    case). Used for shadow/GI values, which are always computed at
+    `shadow_mesh` granularity (a coarse LOD proxy for high-poly meshes, see
+    `Entity.shadow_mesh` in scene.py -- ray-traced occlusion/bounce must
+    never depend on which LOD the camera happens to be rasterizing, see
+    raytrace.py's world-version cache) then gathered onto whichever LOD is
+    actually being drawn.
+
+    Two hops when `render_mesh` differs from `shadow_mesh`: `render_mesh`'s
+    own `lod_source_faces` map (its faces -> LOD0 faces, identity if
+    `render_mesh IS entity.mesh`) composed with `shadow_gather_map` (LOD0
+    faces -> `shadow_mesh` faces, see engine/lod.py) -- both are no-ops for
+    a mesh with no coarser LOD, collapsing this to the identity return
+    above.
     """
-    if render_mesh is entity.mesh:
+    shadow = entity.shadow_mesh()
+    if render_mesh is shadow:
         return values
-    src = getattr(render_mesh, "lod_source_faces", None)
-    return values if src is None else values[src]
+    lod0_idx = getattr(render_mesh, "lod_source_faces", None)
+    if lod0_idx is None:
+        lod0_idx = np.arange(render_mesh.faces.shape[0])
+    return values[shadow_gather_map(entity)[lod0_idx]]
 
 
 def _entity_world_faces(entity, mesh=None):
     """World-space per-face centroids + normals, mirroring _entity_geometry.
-    `mesh` defaults to `entity.mesh` (LOD0) -- pass a specific mesh (e.g. an
-    entity's currently-selected render LOD) to get that mesh's own world
-    geometry instead."""
-    mesh = mesh if mesh is not None else entity.mesh
+    `mesh` defaults to `entity.shadow_mesh()` (LOD0, or a coarse LOD proxy
+    for high-poly meshes -- see scene.py) since every current caller uses
+    this for ray-traced shadow/GI occlusion or receiver geometry; pass a
+    specific mesh (e.g. an entity's currently-selected render LOD) to get
+    that mesh's own world geometry instead."""
+    mesh = mesh if mesh is not None else entity.shadow_mesh()
     model = entity.transform.matrix()
     verts_world = mesh.vertices @ model[:3, :3].T + model[:3, 3]
     try:

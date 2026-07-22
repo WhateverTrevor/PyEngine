@@ -506,12 +506,14 @@ class GLRenderer:
 
         # `render_meshes[i]` is live[i]'s SELECTED LOD (see engine/lod.py) --
         # the geometry actually rasterized this frame. Shadow/GI values below
-        # are always ray-traced at LOD0 (`_entity_world_faces(entity)`
-        # defaults to `entity.mesh`) and gathered onto the render mesh's own
-        # faces via `_lod_gather` -- occlusion never depends on which LOD the
-        # camera happens to be rasterizing (see raytrace.py's world-version
-        # cache); `_lod_gather` is a no-op whenever `render_mesh IS
-        # entity.mesh` (no LOD active, or every built-in asset).
+        # are always ray-traced at `entity.shadow_mesh()` granularity
+        # (`_entity_world_faces(entity)` defaults to it -- LOD0 unless the
+        # mesh has coarser LODs, in which case the coarsest one, see
+        # scene.py) and gathered onto the render mesh's own faces via
+        # `_lod_gather` -- occlusion never depends on which LOD the camera
+        # happens to be rasterizing (see raytrace.py's world-version cache);
+        # `_lod_gather` is a no-op whenever `render_mesh IS shadow_mesh` (no
+        # LOD active, or every built-in asset).
         live = [e for e in scene.entities if e.mesh is not None and e.visible]
         render_meshes = [e.render_mesh() for e in live]
         face_counts = [int(m.faces.shape[0]) for m in render_meshes]

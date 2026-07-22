@@ -152,11 +152,13 @@ def _scene_sun(scene):
     return None
 
 
-def _world_face_geometry(entity):
+def _world_face_geometry(entity, mesh=None):
     """World-space per-face centroids + normals -- no camera needed, used by
     GI's direct-lighting pass which evaluates every occluder face, not just
-    what's on screen."""
-    mesh = entity.mesh
+    what's on screen. `mesh` defaults to `entity.mesh` (LOD0); callers doing
+    ray-traced shadow/GI work pass `entity.shadow_mesh()` explicitly (a
+    coarse LOD proxy on high-poly meshes, see scene.py)."""
+    mesh = mesh if mesh is not None else entity.mesh
     model = entity.transform.matrix()
     verts_world = mesh.vertices @ model[:3, :3].T + model[:3, 3]
     try:
@@ -175,6 +177,13 @@ def _gi_direct_lighting(scene, casters, tracer):
     `direct` = directional (lambert, sun-shadowed) + point/spot (strength,
     shadowed) -- no ambient, since GI bounces measured light, not the
     ambient/sky term (matching the spec's "direct light" definition).
+
+    Geometry/albedo are read from each caster's `shadow_mesh()` (a coarse
+    LOD proxy for high-poly meshes, else `entity.mesh` unchanged -- see
+    scene.py) so both the bounce-source arrays here and the occluder soup
+    `ShadowTracer.refresh` builds share the same coarse face-id space --
+    required for `GITracer.compute`'s `tri_face_id -> albedo_c/direct_c`
+    lookup to line up.
     """
     lights = _gather_lights(scene)
     dl = scene.light
@@ -185,7 +194,8 @@ def _gi_direct_lighting(scene, casters, tracer):
 
     c_list, n_list, a_list, d_list = [], [], [], []
     for e in casters:
-        centroids, normals = _world_face_geometry(e)
+        shadow_mesh = e.shadow_mesh()
+        centroids, normals = _world_face_geometry(e, shadow_mesh)
         lambert = np.clip(normals @ to_light, 0.0, 1.0)
         if sun is not None and sun.shadow_depth > 1e-6:
             active = lambert > 1e-3
@@ -204,7 +214,7 @@ def _gi_direct_lighting(scene, casters, tracer):
             direct = direct + info.colorf[None, :] * strength[:, None]
         c_list.append(centroids)
         n_list.append(normals)
-        a_list.append(e.mesh.face_colors)
+        a_list.append(shadow_mesh.face_colors)
         d_list.append(direct)
     return (np.concatenate(c_list), np.concatenate(n_list),
            np.concatenate(a_list), np.concatenate(d_list))
@@ -215,10 +225,14 @@ def _gi_receiver_geometry(receivers):
     entity, regardless of `casts_shadow`. Cheaper than `_gi_direct_lighting`
     since receivers don't need their own direct/albedo (the bounced color
     already carries the source's albedo; the receiver's own albedo is
-    applied later, same as ambient/directional/point terms)."""
+    applied later, same as ambient/directional/point terms). Read at
+    `shadow_mesh()` granularity (coarse LOD proxy for high-poly meshes, see
+    scene.py) -- a high-poly entity's OWN received shadow/GI is computed at
+    this coarse granularity too, then gathered onto whichever LOD is
+    actually rasterized (see `GITracer._entity_ranges` / `_lod_gather`)."""
     c_list, n_list = [], []
     for e in receivers:
-        centroids, normals = _world_face_geometry(e)
+        centroids, normals = _world_face_geometry(e, e.shadow_mesh())
         c_list.append(centroids)
         n_list.append(normals)
     return np.concatenate(c_list), np.concatenate(n_list)
@@ -358,13 +372,14 @@ class Renderer:
         (whichever LOD is being rasterized) -- lambert is computed fresh
         from them so the visible shading direction always matches the
         actual drawn surface. The ray-traced shadow test itself always runs
-        at LOD0 geometry (`entity.mesh` -- occlusion must never depend on
-        which LOD the camera happens to be rasterizing, see raytrace.py's
-        world-version cache) and its result is gathered onto `render_mesh`'s
-        faces via `_lod_gather`; when `render_mesh IS entity.mesh` (no LOD
-        active -- true for every built-in and most frames) this collapses to
-        exactly the prior computation, reusing the caller's arrays with zero
-        extra cost.
+        at `entity.shadow_mesh()` geometry (LOD0, or a coarse LOD proxy on
+        high-poly meshes -- occlusion must never depend on which LOD the
+        camera happens to be rasterizing, see raytrace.py's world-version
+        cache) and its result is gathered onto `render_mesh`'s faces via
+        `_lod_gather`; when `render_mesh IS shadow_mesh` (no LOD active --
+        true for every built-in and most frames) this collapses to exactly
+        the prior computation, reusing the caller's arrays with zero extra
+        cost.
 
         Returns (base (M, 3), shadowed_lambert (M,)) -- the latter is the
         same shadowed NdotL the diffuse term used, reused by the deferred
@@ -378,10 +393,11 @@ class Renderer:
         if tracer is not None:
             sun = _scene_sun(scene)
             if sun is not None and sun.shadow_depth > 1e-6:
-                if render_mesh is entity.mesh:
+                shadow_mesh = entity.shadow_mesh()
+                if render_mesh is shadow_mesh:
                     c0, n0, lam0 = centroids, normals, lambert
                 else:
-                    c0, n0 = _world_face_geometry(entity)
+                    c0, n0 = _world_face_geometry(entity, shadow_mesh)
                     lam0 = np.clip(n0 @ to_light, 0.0, 1.0)
                 active0 = lam0 > 1e-3
                 raw = tracer.directional_shadow_factors(
@@ -398,16 +414,17 @@ class Renderer:
     def _light_shadow_gathered(self, entity, render_mesh, normals, centroids,
                                active, tracer, info) -> np.ndarray:
         """Ray-traced point/spot shadow factor for `info.light`, evaluated at
-        LOD0 face granularity (occlusion always uses the full mesh -- see
-        `_directional_base`'s docstring) and gathered onto `render_mesh`'s
-        own faces. `normals`/`centroids`/`active` are the caller's
-        render-mesh-granularity arrays (and its already-computed `active`
-        mask), reused directly -- no LOD0 recompute -- when `render_mesh IS
-        entity.mesh`."""
-        if render_mesh is entity.mesh:
+        `entity.shadow_mesh()` granularity (occlusion always uses the coarse
+        proxy on high-poly meshes, LOD0 otherwise -- see `_directional_base`'s
+        docstring) and gathered onto `render_mesh`'s own faces.
+        `normals`/`centroids`/`active` are the caller's render-mesh-
+        granularity arrays (and its already-computed `active` mask), reused
+        directly -- no recompute -- when `render_mesh IS shadow_mesh`."""
+        shadow_mesh = entity.shadow_mesh()
+        if render_mesh is shadow_mesh:
             c0, n0, active0 = centroids, normals, active
         else:
-            c0, n0 = _world_face_geometry(entity)
+            c0, n0 = _world_face_geometry(entity, shadow_mesh)
             active0 = _face_light_strength(info, n0, c0) > 1e-3
         factors0 = (tracer.shadow_factors(entity, info.light, info.pos, c0, n0, active0)
                    if active0.any() else np.ones(len(c0)))

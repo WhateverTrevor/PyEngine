@@ -1043,8 +1043,9 @@ class WgpuRenderer:
 
         # render_meshes[i] is live[i]'s SELECTED LOD -- see gl_renderer.py's
         # identical comment on its render() (mirrors this one): shadow/GI
-        # values are always ray-traced at LOD0 then gathered onto whichever
-        # LOD is actually drawn, via `_lod_gather`.
+        # values are always ray-traced at `entity.shadow_mesh()` granularity
+        # then gathered onto whichever LOD is actually drawn, via
+        # `_lod_gather`.
         live = [e for e in scene.entities if e.mesh is not None and e.visible]
         render_meshes = [e.render_mesh() for e in live]
         face_counts = [int(m.faces.shape[0]) for m in render_meshes]

@@ -1,41 +1,41 @@
 # No task in flight
 
-Blueprint asset + Python script editor + in-engine compile/bug-check (run
-1 of 2) was judged and squash-merged to main on 2026-07-14.
+The high-poly shadow/GI freeze fix was judged and squash-merged to main on
+2026-07-14. Root cause: ShadowTracer/GITracer built their ray-traced
+occluder soup + receiver geometry from the full mesh, so placing a
+10,448-face import made the first bake take ~295s (total engine lockup).
+Fix: shadow/GI geometry routes through Entity.shadow_mesh() — the coarsest
+LOD when the mesh has precomputed LODs, OR an on-demand decimated proxy
+(cached, lod.generate_lods) for any mesh above lod.SHADOW_PROXY_THRESHOLD
+(1000) that has NO LODs. The gather map (lod.shadow_gather_map) maps
+proxy-face shadow/GI values back onto the rasterized faces across
+CPU/GL/wgpu. Real Gat: 295s -> 8.9s. Built-ins (<=256 faces) keep
+shadow_mesh() == mesh, byte-identical shadows.
 
-engine/blueprint.py: compile_blueprint(source, name) -> plain dict, NEVER
-raises (SyntaxError with line/col; BaseException during exec, so even
-SystemExit is contained; validates a Behavior subclass exists).
-engine/assets.py: BlueprintAsset {name, category, components[], script,
-compile_result} persisted to assets/blueprints/*.json, folder-tree aware.
-editor.py: "+ Blueprint" browser button, blueprint tiles, and
-ScriptEditorUI — a MaterialEditorUI-style in-app window with a
-line-numbered gutter, caret + arrows/Home/End, Enter/Backspace/Delete,
-Tab=4 spaces, scroll-follows-caret, Compile (Ctrl+Enter) / Save (Ctrl+S),
-error-line highlight + status strip. Compile saves; close auto-saves.
+SUPERVISOR NOTE: the agent's first pass only handled meshes WITH
+precomputed LODs and missed the actual user asset (imported pre-LOD, no
+LOD data) — the supervisor caught it (real Gat still 283s), the agent
+thrashed (~575k tokens, stopped mid-benchmark), and the supervisor
+finished the on-demand-proxy fix directly. 8.9s is still a one-time hitch
+on placement; run 2's async bake makes it non-blocking.
 
-NEXT (run 2 of 2): POSED MESHES + world instantiation. The
-`components` field already exists and is an empty list — fill it with
-{asset_name, position, rotation, scale} entries, add UI to compose/pose
-mesh components inside the blueprint (the transform gizmo can likely be
-reused), and make instantiating a blueprint into the world build the
-composed entity with the compiled Behavior attached and running.
-Behavior runtime errors during update must be caught per-frame and
-surfaced, not crash the game loop.
-
-KNOWN LIMITATION to address eventually: there is NO infinite-loop/hang
-guard on exec — a `while True:` in a user script WILL hang the editor
-(verified). A worker-thread + timeout sandbox is the fix. Also no
-selection/clipboard/undo in the script editor yet.
+Two features REMAIN from the user's request (2026-07-14):
+1. Collapsible side toolbar + a minimizable/tabbable CONSOLE that reports
+   what the engine is doing ("baking lighting…", import/compile progress,
+   errors). Move the shadow/GI bake onto a BACKGROUND THREAD so even the
+   8.9s hitch never blocks the UI; show progress in the console.
+2. FPS: uncapped smooth frame pacing with an OPTIONAL clamp setting (the
+   user reports the frame rate "jumping around"). Investigate the
+   fixed-60Hz loop + present timing in engine/core.py.
 
 When a task IS in flight, this file holds its resume state per the
 checkpoint protocol in `CLAUDE.md` and `.claude/agents/engine-coder.md`.
 
 IMPORTANT: settings isolate via PYENGINE_SETTINGS; UI tests drive the real
-event path; DX12 default; DO NOT touch assets/gat.* or folders.json. Full
-battery is TWENTY-ONE suites. FPS here is 2-10x slow + high variance —
-same-environment A/B only.
+event path; DX12 default; DO NOT touch assets/gat.* or folders.json /
+blueprints. Full battery is TWENTY-ONE suites. FPS here is 2-10x slow +
+high variance — same-environment A/B only.
 
-Backlog: QEM decimation; LOD tuning knobs; carry face_uvs through
-decimation; File-menu import paths still folder-unaware; wgpu directional
-sun-shadow; per-pixel texturing; folder deletion.
+Backlog: BVH for the ray tracer (real long-term shadow/GI perf); QEM
+decimation; blueprint posed-mesh components (run 2 of blueprint) +
+infinite-loop guard on script exec; per-pixel texturing; folder deletion.

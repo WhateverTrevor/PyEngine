@@ -43,6 +43,13 @@ from .mesh import Mesh
 # renders through the exact same code path as before this feature existed.
 LOD_FACE_THRESHOLD = 200
 
+# Above this face count, a mesh that carries NO precomputed LODs gets an
+# on-demand coarse shadow/GI occluder proxy (see Entity.shadow_mesh). Kept
+# well above the largest built-in procedural mesh (~256 faces) so every
+# built-in keeps shadow_mesh() == mesh (byte-identical shadows); only heavy
+# imports (the ~10k-face FBX that froze the bake) are ever proxied.
+SHADOW_PROXY_THRESHOLD = 1000
+
 # LOD1/2/3 target ~50%/25%/12% of the source face count.
 DEFAULT_LOD_RATIOS = (0.5, 0.25, 0.12)
 
@@ -225,6 +232,39 @@ def update_entity_lod(entity, camera) -> None:
     while idx > 0 and dist < bound * factors[idx - 1] * (1.0 - LOD_HYSTERESIS):
         idx -= 1
     entity.lod_index = idx
+
+
+def shadow_gather_map(entity) -> np.ndarray:
+    """(N0,) int array mapping every LOD0 face of `entity.mesh` to the
+    nearest face (by local-space centroid distance) of `entity.shadow_mesh()`
+    -- `arange(N0)` (identity) when the entity has no coarser LOD (shadow_
+    mesh IS mesh). Used by `gpu_geometry._lod_gather` to gather shadow/GI
+    results computed at `shadow_mesh` granularity onto LOD0 (see
+    scene.py's `Entity.shadow_mesh` / renderer.py's `_directional_base`).
+
+    Cached on the shadow mesh object (`_lod0_gather` attribute, mirroring
+    `lod_source_faces`'s bolt-on pattern) since the mapping only depends on
+    the fixed LOD0/coarse-mesh pair, never on anything per-frame -- computed
+    once per high-poly entity, not once per frame. Chunked brute-force
+    nearest-neighbor (no scipy dependency): the coarse side is already a
+    few hundred to a couple thousand faces even for a 10k-face import, so
+    this is milliseconds despite being O(N0 x Nc).
+    """
+    shadow = entity.shadow_mesh()
+    if shadow is entity.mesh:
+        return np.arange(len(entity.mesh.faces))
+    cached = getattr(shadow, "_lod0_gather", None)
+    if cached is not None:
+        return cached
+    src = entity.mesh.vertices[entity.mesh.faces].mean(axis=1)  # (N0, 3) local
+    dst = shadow.vertices[shadow.faces].mean(axis=1)            # (Nc, 3) local
+    out = np.empty(len(src), dtype=np.int64)
+    chunk = 1024
+    for i in range(0, len(src), chunk):
+        d = src[i:i + chunk, None, :] - dst[None, :, :]
+        out[i:i + chunk] = np.einsum("ijk,ijk->ij", d, d).argmin(axis=1)
+    shadow._lod0_gather = out
+    return out
 
 
 def update_scene_lods(scene, camera) -> None:
