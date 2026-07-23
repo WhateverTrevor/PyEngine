@@ -175,15 +175,22 @@ class ShadowTracer:
         self._world_version = -1
         self._cache = {}            # (entity, light) -> cache dict
 
-    def refresh(self, scene) -> None:
-        """Rebuild the world-space occluder soup if any shadow caster moved."""
+    def refresh(self, scene) -> bool:
+        """Rebuild the world-space occluder soup if any shadow caster moved.
+
+        Returns True iff a rebuild actually happened (world_version bumped).
+        The rebuild itself is cheap; callers (engine/core.py) use this
+        return value to bracket a console-log message around the render()
+        call that follows, since THAT'S where the expensive per-pixel
+        shadow_factors/GI recompute actually happens (only on a world-
+        version change -- see shadow_factors' cache check below)."""
         self.frame += 1
         casters = [e for e in scene.entities
                    if e.mesh is not None and e.visible and e.casts_shadow
                    and not _is_translucent(e)]
         mats = {id(e): e.transform.matrix().tobytes() for e in casters}
         if mats == self._caster_mats and self._occ is not None:
-            return
+            return False
         v0s, e1s, e2s, face_ids = [], [], [], []
         face_offset = 0
         for e in casters:
@@ -219,6 +226,12 @@ class ShadowTracer:
         # drop cache entries for entities no longer in the scene
         live = set(scene.entities)
         self._cache = {k: v for k, v in self._cache.items() if k[0] in live}
+        return True
+
+    def occluder_triangle_count(self) -> int:
+        """Triangle count of the current occluder soup, 0 before the first
+        refresh() -- sizes the "Baking lighting (...)" console message."""
+        return 0 if self._occ is None else int(self._occ[0].shape[0])
 
     def shadow_factors(self, entity, light, light_pos: np.ndarray,
                        centroids: np.ndarray, normals: np.ndarray,

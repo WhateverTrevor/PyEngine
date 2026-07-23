@@ -21,6 +21,7 @@ import time
 import numpy as np
 import pygame
 
+from . import console_log
 from .input import InputManager
 from .lod import update_scene_lods
 from .raytrace import ShadowTracer
@@ -360,8 +361,21 @@ class Engine:
                 self.input.consume_edges()
 
             tracer = None
+            baking = False
             if scene.enable_shadows:
-                self.tracer.refresh(scene)
+                if self.tracer.refresh(scene):
+                    # a rebuild happened -- the expensive part is NOT this
+                    # call (cheap occluder-soup rebuild) but the per-pixel
+                    # shadow_factors/GI recompute the render() call below
+                    # triggers once per light/entity whose cache just went
+                    # stale; bracket that so the console shows the hitch
+                    # (this can be several seconds for a big import) while
+                    # it's happening, not just after the fact.
+                    console_log.log_info(
+                        f"Baking lighting ({self.tracer.occluder_triangle_count()} "
+                        f"occluder triangles)...")
+                    bake_t0 = time.perf_counter()
+                    baking = True
                 tracer = self.tracer
 
             # Distance-based LOD selection: once per rendered frame (not
@@ -397,6 +411,9 @@ class Engine:
                     self._draw_hud(clock.get_fps(), scene)
                 if overlay is not None:
                     overlay(self)
+            if baking:
+                console_log.log_info(
+                    f"Lighting baked in {time.perf_counter() - bake_t0:.1f}s")
             pygame.display.flip()
             clock.tick(self.max_fps)
 

@@ -1,41 +1,39 @@
 # No task in flight
 
-The high-poly shadow/GI freeze fix was judged and squash-merged to main on
-2026-07-14. Root cause: ShadowTracer/GITracer built their ray-traced
-occluder soup + receiver geometry from the full mesh, so placing a
-10,448-face import made the first bake take ~295s (total engine lockup).
-Fix: shadow/GI geometry routes through Entity.shadow_mesh() — the coarsest
-LOD when the mesh has precomputed LODs, OR an on-demand decimated proxy
-(cached, lod.generate_lods) for any mesh above lod.SHADOW_PROXY_THRESHOLD
-(1000) that has NO LODs. The gather map (lod.shadow_gather_map) maps
-proxy-face shadow/GI values back onto the rasterized faces across
-CPU/GL/wgpu. Real Gat: 295s -> 8.9s. Built-ins (<=256 faces) keep
-shadow_mesh() == mesh, byte-identical shadows.
+Collapsible side toolbar + engine console was judged and squash-merged to
+main on 2026-07-14. engine/console_log.py is a bounded ring-buffer log
+(info/warn/error, timestamped) with module helpers log_info/warn/error +
+get_log(). Producers wired: FBX/HDRI/texture import, blueprint compile,
+the shadow/GI bake ("Baking lighting (N occluder triangles)..." /
+"Lighting baked in X.Xs" in core.py's run loop), and Editor.status mirrors
+into it. The Console is a first-class dockable/tabbable/minimizable panel
+(id "console") in the Window menu; a new collapsible LEFT side toolbar
+houses its toggle (declarative growable button list; collapse state
+persists). All 22 suites pass; the agent also fixed a real forward-compat
+bug (saved layout was discarded when a new panel id appeared).
 
-SUPERVISOR NOTE: the agent's first pass only handled meshes WITH
-precomputed LODs and missed the actual user asset (imported pre-LOD, no
-LOD data) — the supervisor caught it (real Gat still 283s), the agent
-thrashed (~575k tokens, stopped mid-benchmark), and the supervisor
-finished the on-demand-proxy fix directly. 8.9s is still a one-time hitch
-on placement; run 2's async bake makes it non-blocking.
-
-Two features REMAIN from the user's request (2026-07-14):
-1. Collapsible side toolbar + a minimizable/tabbable CONSOLE that reports
-   what the engine is doing ("baking lighting…", import/compile progress,
-   errors). Move the shadow/GI bake onto a BACKGROUND THREAD so even the
-   8.9s hitch never blocks the UI; show progress in the console.
-2. FPS: uncapped smooth frame pacing with an OPTIONAL clamp setting (the
-   user reports the frame rate "jumping around"). Investigate the
-   fixed-60Hz loop + present timing in engine/core.py.
+REMAINING (run 2 of the user's request): FPS. The user reports the frame
+rate "jumping around" and wants smooth UNCAPPED FPS with an OPTIONAL clamp
+setting. Investigate engine/core.py's loop (fixed 60Hz update + present
+timing). FOLD IN the async lighting bake here: move the shadow/GI bake
+onto a BACKGROUND THREAD so it never stalls a frame (the console already
+shows "Baking lighting…"; make it non-blocking + show progress). The bake
+result must swap in atomically; render prior/no lighting until ready;
+mind thread-safety on the tracer cache.
 
 When a task IS in flight, this file holds its resume state per the
 checkpoint protocol in `CLAUDE.md` and `.claude/agents/engine-coder.md`.
 
-IMPORTANT: settings isolate via PYENGINE_SETTINGS; UI tests drive the real
-event path; DX12 default; DO NOT touch assets/gat.* or folders.json /
-blueprints. Full battery is TWENTY-ONE suites. FPS here is 2-10x slow +
-high variance — same-environment A/B only.
+KNOWN minor issue (not blocking): import status double-logs (redundant,
+harmless) — clean up opportunistically. console_checks has NO bake-log
+assertion (supervisor verified the bake logs via the real run loop
+manually) — add one if touching console tests.
 
-Backlog: BVH for the ray tracer (real long-term shadow/GI perf); QEM
-decimation; blueprint posed-mesh components (run 2 of blueprint) +
-infinite-loop guard on script exec; per-pixel texturing; folder deletion.
+IMPORTANT: settings isolate via PYENGINE_SETTINGS; UI tests drive the real
+event path; DX12 default; DO NOT touch assets/gat.*, folders.json,
+blueprints/. Full battery is TWENTY-TWO suites. FPS here is 2-10x slow +
+high variance — same-environment A/B only; never run multi-minute benches.
+
+Backlog: BVH for the ray tracer (real shadow/GI perf); blueprint posed
+meshes (run 2 of blueprint) + infinite-loop guard on script exec; QEM
+decimation; per-pixel texturing; folder deletion.

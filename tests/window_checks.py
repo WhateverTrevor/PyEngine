@@ -51,11 +51,14 @@ lay2 = editor._layout(W, H)
 assert lay2["viewport"].width > vw0 + 50, (vw0, lay2["viewport"].width)
 print(f"collapsed dock OK: viewport {vw0} -> {lay2['viewport'].width}")
 
-# 3. close via flag; viewport reaches window bottom when browser closed
+# 3. close via flag; viewport reaches window bottom once every bottom-dock
+# panel is closed (browser AND console -- the console panel now ships
+# docked there by default, alongside browser, see Editor.__init__)
 editor.panel_visible["browser"] = False
+editor.panel_visible["console"] = False
 lay3 = editor._layout(W, H)
 assert lay3["viewport"].bottom == H
-print("close OK: viewport reaches window bottom with browser closed")
+print("close OK: viewport reaches window bottom with browser+console closed")
 
 # 4. reset layout restores everything
 editor.floating.append("details")

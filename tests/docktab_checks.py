@@ -93,9 +93,14 @@ assert ed1.dock_order["right"] == [
     {"ids": ["outliner"], "active": "outliner"},
     {"ids": ["details"], "active": "details"},
 ], ed1.dock_order["right"]
-assert ed1.dock_order["bottom"] == [{"ids": ["browser"], "active": "browser"}]
+# "console" isn't in this legacy fixture (it predates that panel) --
+# _apply_layout_settings auto-places it as a fresh solo group on "bottom"
+# (its preferred fallback side, see _PANEL_ALLOWED_SIDES) rather than
+# resetting the whole migrated layout just because one new id is missing
+assert ed1.dock_order["bottom"] == [{"ids": ["browser"], "active": "browser"},
+                                    {"ids": ["console"], "active": "console"}]
 assert ed1.dock_order["left"] == []
-print("old-format settings migrate to solo groups OK")
+print("old-format settings migrate to solo groups OK (+ console auto-placed)")
 
 # ============================================================================
 # 2. degenerate single-panel groups render byte-identical layout rects to
@@ -106,6 +111,8 @@ def pre_tabs_layout(ed, w, h, flat_dock_order):
     (flat {side: [pid, ...]} instead of groups) -- the no-drift proof that
     today's degenerate-group rendering hasn't silently changed anything."""
     menu = pygame.Rect(0, 0, w, MENU_H)
+    tb_w = ed._side_toolbar_w()  # side toolbar claims the window's left edge
+                                  # (see editor.py's _layout) -- must match here too
     left_ids = [p for p in flat_dock_order["left"] if ed.panel_visible.get(p, True)]
     right_ids = [p for p in flat_dock_order["right"] if ed.panel_visible.get(p, True)]
     bottom_ids = [p for p in flat_dock_order["bottom"] if ed.panel_visible.get(p, True)]
@@ -115,8 +122,8 @@ def pre_tabs_layout(ed, w, h, flat_dock_order):
     right_w = 0
     if right_ids:
         right_w = MIN_DOCK_W if ed._all_minimized(right_ids) else ed._dock_side_w("right", w)
-    if left_w + right_w > max(0, w - MIN_PANEL_W):
-        scale = max(0, w - MIN_PANEL_W) / max(1, left_w + right_w)
+    if left_w + right_w > max(0, w - tb_w - MIN_PANEL_W):
+        scale = max(0, w - tb_w - MIN_PANEL_W) / max(1, left_w + right_w)
         left_w, right_w = int(left_w * scale), int(right_w * scale)
     bottom_h = 0
     if bottom_ids:
@@ -145,39 +152,40 @@ def pre_tabs_layout(ed, w, h, flat_dock_order):
             panels[pid] = pygame.Rect(x, y, width, max(0, hh))
             y += hh
 
-    stack(left_ids, 0, left_w)
+    stack(left_ids, tb_w, left_w)
     stack(right_ids, w - right_w, right_w)
     if bottom_ids:
-        bw_total = max(0, w - left_w - right_w)
+        bw_total = max(0, w - tb_w - left_w - right_w)
         n = len(bottom_ids)
         share = bw_total // n
-        x = left_w
+        x = tb_w + left_w
         for i, pid in enumerate(bottom_ids):
             ww = share if i < n - 1 else bw_total - share * (n - 1)
             hh = PANEL_TITLE_H if ed.panel_minimized.get(pid, False) else bottom_h
             panels[pid] = pygame.Rect(x, stack_bottom, max(0, ww), hh)
             x += ww
-    for pid in ("outliner", "details", "browser"):
+    for pid in ("outliner", "details", "browser", "console"):
         if not ed.panel_visible.get(pid, True) or pid in panels:
             continue
         r = ed._float_rect_for(pid, w, h)
         if ed.panel_minimized.get(pid, False):
             r = pygame.Rect(r.x, r.y, r.width, PANEL_TITLE_H)
         panels[pid] = r
-    viewport = pygame.Rect(left_w, top, max(0, w - left_w - right_w),
+    viewport = pygame.Rect(tb_w + left_w, top, max(0, w - tb_w - left_w - right_w),
                            max(0, stack_bottom - top))
     return {"viewport": viewport, "panels": panels,
             "left_w": left_w, "right_w": right_w, "bottom_h": bottom_h}
 
 
 ed2 = new_editor()
-factory_flat = {"left": [], "right": ["outliner", "details"], "bottom": ["browser"]}
+factory_flat = {"left": [], "right": ["outliner", "details"],
+                "bottom": ["browser", "console"]}
 old = pre_tabs_layout(ed2, W, H, factory_flat)
 new = ed2._layout(W, H)
 assert new["viewport"] == old["viewport"]
 assert new["left_w"] == old["left_w"] and new["right_w"] == old["right_w"]
 assert new["bottom_h"] == old["bottom_h"]
-for pid in ("outliner", "details", "browser"):
+for pid in ("outliner", "details", "browser", "console"):
     assert new["panels"][pid] == old["panels"][pid], (pid, new["panels"][pid], old["panels"][pid])
 print("degenerate factory layout OK: byte-identical to the pre-groups flat-list math")
 
@@ -334,7 +342,8 @@ assert ed9.dock_order["right"] == [
     {"ids": ["outliner"], "active": "outliner"},
     {"ids": ["details"], "active": "details"},
 ], ed9.dock_order["right"]
-assert ed9.dock_order["bottom"] == [{"ids": ["browser"], "active": "browser"}]
+assert ed9.dock_order["bottom"] == [{"ids": ["browser"], "active": "browser"},
+                                    {"ids": ["console"], "active": "console"}]
 assert ed9.dock_order["left"] == []
 assert not ed9.floating
 print("Reset Layout OK: restores the factory ungrouped layout")

@@ -54,6 +54,9 @@ BROWSER_H = 118           # docked bottom panel height (factory default)
 MIN_PANEL_W = 150         # smallest a dragged side-dock or floating panel can go
 MIN_PANEL_H = 90          # smallest a dragged floating panel or bottom dock can go
 SPLITTER_PX = 6           # hit-test/hover band around a dock splitter, in pixels
+SIDE_TOOLBAR_W_EXPANDED = 128   # labeled-button width, docked to the window's LEFT
+SIDE_TOOLBAR_W_COLLAPSED = 30   # icon-only width when collapsed
+SIDE_TOOLBAR_BTN_H = 28
 _LAYOUT_REF_W, _LAYOUT_REF_H = 1440, 810  # resolution the factory fractions assume
 DOCK_FRAC_DEFAULT = {"left": OUTLINER_W / _LAYOUT_REF_W,
                      "right": OUTLINER_W / _LAYOUT_REF_W,
@@ -91,8 +94,13 @@ PANEL_DEFAULT_FLOAT = {   # (w, h) used the first time a panel floats
     "outliner": (OUTLINER_W, 360),
     "details": (OUTLINER_W, DETAILS_H),
     "browser": (760, BROWSER_H),
+    "console": (520, BROWSER_H),
 }
-TAB_LABELS = {"outliner": "Outliner", "details": "Details", "browser": "Browser"}
+TAB_LABELS = {"outliner": "Outliner", "details": "Details", "browser": "Browser",
+             "console": "Console"}
+CONSOLE_ROW_H = 15       # monospace line height in the console panel
+CONSOLE_LEVEL_COLOR = {"info": (190, 193, 200), "warn": (225, 175, 70),
+                       "error": (230, 100, 100)}
 RESOLUTIONS = ((1280, 720), (1440, 810), (1600, 900), (1920, 1080))
 SETTINGS_SIZE = (380, 246)
 IMPORT_SIZE = (420, 356)   # Unreal-style import-options modal (see _open_import_dialog)
@@ -295,7 +303,7 @@ def make_blueprint_icon(size=ICON):
 class Editor:
     _MENU_NAMES = ("File", "Edit", "Window", "Help")
     _WINDOW_PANEL_LABELS = {"Outliner": "outliner", "Details": "details",
-                            "Content Browser": "browser"}
+                            "Content Browser": "browser", "Console": "console"}
     _MENU_HOTKEYS = {
         "File": {"Save": "Ctrl+S"},
         "Edit": {"Duplicate": "Ctrl+D", "Delete": "Del", "Focus Selection": "F",
@@ -326,6 +334,9 @@ class Editor:
         self.dirty = False
         self.outliner_scroll = 0
         self.browser_scroll = 0
+        self.console_scroll = 0     # lines scrolled UP from the latest entry;
+                                     # 0 == pinned to the bottom (auto-scroll
+                                     # follows new entries only while pinned)
         self.drag_asset = None
         self.selected_asset = None  # AssetDef of the last-clicked grid tile, for Export
         # ---- content-browser folder tree ----
@@ -360,7 +371,8 @@ class Editor:
         self.edit_buffer = ""       # editable text while editing_field is set
         self.mat_ui = None          # open MaterialEditorUI, or None
         self.script_ui = None       # open ScriptEditorUI (blueprint script editor), or None
-        self.status = ("", 0.0)     # transient message near the content browser
+        self._status = ("", 0.0)    # transient message near the content browser --
+                                     # backing field for the `status` property below
         self.save_flash = 0.0
         # graphics-api preference for *next launch* (live switching is out
         # of scope); defaults to whatever this session actually ended up
@@ -375,10 +387,13 @@ class Editor:
         # the old flat {side: [pid, ...]} model this replaced.
         self.dock_order = {"left": [], "right": [self._solo_group("outliner"),
                                                  self._solo_group("details")],
-                           "bottom": [self._solo_group("browser")]}
+                           "bottom": [self._solo_group("browser"),
+                                     self._solo_group("console")]}
         self.floating = []          # panel ids currently floating, z-order (front=last)
-        self.panel_visible = {"outliner": True, "details": True, "browser": True}
-        self.panel_minimized = {"outliner": False, "details": False, "browser": False}
+        self.panel_visible = {"outliner": True, "details": True, "browser": True,
+                              "console": True}
+        self.panel_minimized = {"outliner": False, "details": False, "browser": False,
+                                "console": False}
         self.float_rect = {}        # panel id -> pygame.Rect, used only while floating
         self.panel_drag = None      # {"id","dx","dy","w","h"} while dragging a title bar
         self.dock_frac = dict(DOCK_FRAC_DEFAULT)  # side -> fraction of window w/h;
@@ -397,6 +412,12 @@ class Editor:
                                      # else None -- see _open_import_dialog
         self.import_field = None    # "name" / "scale" -- which dialog field has focus,
                                      # or None (see _update_import_text)
+
+        # ---- collapsible side toolbar: a slim strip docked to the window's
+        # LEFT edge, distinct from the "left" dock zone panels can drop
+        # into (which starts AFTER this strip -- see _layout). Declarative
+        # button list (_side_toolbar_buttons) so future tools just append.
+        self.side_toolbar_collapsed = False
 
         self.font = pygame.font.SysFont("consolas,couriernew,monospace", 14)
         self.font_small = pygame.font.SysFont("consolas,couriernew,monospace", 12)
@@ -435,6 +456,28 @@ class Editor:
     def selected(self, value) -> None:
         self._selected = value
         self.selection = [] if value is None else [value]
+
+    # ---- transient status strip -- mirrored into the engine console log ----
+    # `status` is (message, ttl); every one of the ~30 call sites across this
+    # file that does `self.status = (msg, ttl)` now also appends to the
+    # console log, so the log doubles as a persistent history of every status
+    # message ever shown, with NO call sites needing to change. The per-frame
+    # ttl countdown (`self.status = (self.status[0], self.status[1] - dt)`)
+    # re-assigns the SAME text every tick, so the setter only logs when the
+    # text actually changes -- otherwise the log would fill with duplicates
+    # of one message every frame until its ttl expired.
+    @property
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, value) -> None:
+        text, _ttl = value
+        if text and text != self._status[0]:
+            from engine import console_log
+            level = "error" if "failed" in text.lower() else "info"
+            console_log.log(level, text)
+        self._status = value
 
     def _set_selection(self, entities, active=None) -> None:
         """Replace the selection with an explicit ordered list (shift-click
@@ -619,6 +662,9 @@ class Editor:
         import pygame
         dock_order = self.dock_order if dock_order is None else dock_order
         menu = pygame.Rect(0, 0, w, MENU_H)
+        tb_w = self._side_toolbar_w()  # side toolbar claims the window's left
+                                        # edge; the "left" dock zone below
+                                        # starts AFTER it, not at x=0
 
         def side_ids(side):
             """Active id per visible group on `side`, in group order -- a
@@ -640,8 +686,8 @@ class Editor:
         right_w = 0
         if right_ids:
             right_w = MIN_DOCK_W if self._all_minimized(right_ids) else self._dock_side_w("right", w)
-        if left_w + right_w > max(0, w - MIN_PANEL_W):  # keep a usable viewport strip
-            scale = max(0, w - MIN_PANEL_W) / max(1, left_w + right_w)
+        if left_w + right_w > max(0, w - tb_w - MIN_PANEL_W):  # keep a usable viewport strip
+            scale = max(0, w - tb_w - MIN_PANEL_W) / max(1, left_w + right_w)
             left_w, right_w = int(left_w * scale), int(right_w * scale)
         bottom_h = 0
         if bottom_ids:
@@ -670,13 +716,13 @@ class Editor:
                 panels[pid] = pygame.Rect(x, y, width, max(0, hh))
                 y += hh
 
-        stack(left_ids, 0, left_w)
+        stack(left_ids, tb_w, left_w)
         stack(right_ids, w - right_w, right_w)
         if bottom_ids:
-            bw_total = max(0, w - left_w - right_w)
+            bw_total = max(0, w - tb_w - left_w - right_w)
             n = len(bottom_ids)
             share = bw_total // n
-            x = left_w
+            x = tb_w + left_w
             for i, pid in enumerate(bottom_ids):
                 ww = share if i < n - 1 else bw_total - share * (n - 1)
                 hh = PANEL_TITLE_H if self.panel_minimized.get(pid, False) else bottom_h
@@ -685,7 +731,7 @@ class Editor:
 
         grouped = {p for side in ("left", "right", "bottom")
                   for group in dock_order[side] for p in group["ids"]}
-        for pid in ("outliner", "details", "browser"):
+        for pid in ("outliner", "details", "browser", "console"):
             # `pid in panels` skips anything a stack() call already placed;
             # `pid in grouped` additionally skips an INACTIVE tab of a real
             # group (visible, but not the one currently showing -- it must
@@ -697,24 +743,24 @@ class Editor:
                 r = pygame.Rect(r.x, r.y, r.width, PANEL_TITLE_H)
             panels[pid] = r
 
-        viewport = pygame.Rect(left_w, top, max(0, w - left_w - right_w),
+        viewport = pygame.Rect(tb_w + left_w, top, max(0, w - tb_w - left_w - right_w),
                                max(0, stack_bottom - top))
 
         splitters = {}
         half = SPLITTER_PX // 2
         if left_ids and not self._all_minimized(left_ids):
-            splitters["left"] = pygame.Rect(left_w - half, top, SPLITTER_PX,
+            splitters["left"] = pygame.Rect(tb_w + left_w - half, top, SPLITTER_PX,
                                             max(0, stack_bottom - top))
         if right_ids and not self._all_minimized(right_ids):
             splitters["right"] = pygame.Rect(w - right_w - half, top, SPLITTER_PX,
                                              max(0, stack_bottom - top))
         if bottom_ids and not self._all_minimized(bottom_ids):
-            splitters["bottom"] = pygame.Rect(left_w, stack_bottom - half,
-                                              max(0, w - left_w - right_w), SPLITTER_PX)
+            splitters["bottom"] = pygame.Rect(tb_w + left_w, stack_bottom - half,
+                                              max(0, w - tb_w - left_w - right_w), SPLITTER_PX)
 
         return {"menu": menu, "viewport": viewport, "panels": panels,
                 "left_w": left_w, "right_w": right_w, "bottom_h": bottom_h,
-                "splitters": splitters}
+                "splitters": splitters, "side_toolbar_w": tb_w}
 
     def _panel_content_rect(self, pid, layout):
         import pygame
@@ -763,6 +809,8 @@ class Editor:
             drop, _rows = self._dropdown_geom(self.open_menu, w)
             if drop.collidepoint(pos):
                 return True
+        if self._side_toolbar_rect(w, h).collidepoint(pos):
+            return True
         layout = self._layout(w, h)
         if layout["viewport"].collidepoint(pos) \
                 and self._viewport_toolbar_rect(layout["viewport"]).collidepoint(pos):
@@ -1038,6 +1086,87 @@ class Editor:
             text = self.font_small.render(label, True, color)
             surf.blit(text, (r.x + (r.width - text.get_width()) // 2,
                              r.y + (r.height - text.get_height()) // 2))
+
+    # ---- collapsible side toolbar: docked to the window's LEFT edge, a
+    # NEW distinct element from the docked panels/viewport toolbar above --
+    # declarative button list so future tools just append (mirrors
+    # _toolbar_buttons' pattern, stacked vertically instead of horizontal). ----
+    def _side_toolbar_w(self) -> int:
+        return SIDE_TOOLBAR_W_COLLAPSED if self.side_toolbar_collapsed \
+            else SIDE_TOOLBAR_W_EXPANDED
+
+    def _side_toolbar_rect(self, w, h):
+        import pygame
+        return pygame.Rect(0, MENU_H, self._side_toolbar_w(), max(0, h - MENU_H))
+
+    def _toggle_side_toolbar(self) -> None:
+        self.side_toolbar_collapsed = not self.side_toolbar_collapsed
+        self._save_settings()
+
+    def _side_toolbar_buttons(self):
+        """[{"id","label","icon","active","action"}, ...] -- `label` shows
+        when expanded, `icon` (a short glyph) when collapsed. Growable: a
+        future tool just appends another entry here."""
+        return [
+            {"id": "console", "label": "Console", "icon": "C",
+             "active": lambda: self.panel_visible.get("console", False),
+             "action": lambda: self._toggle_panel("console")},
+        ]
+
+    def _side_toolbar_collapse_rect(self, rect):
+        import pygame
+        return pygame.Rect(rect.x + 3, rect.y + 3, rect.width - 6, SIDE_TOOLBAR_BTN_H)
+
+    def _side_toolbar_button_rects(self, rect):
+        """[(button_def, rect), ...] below the collapse toggle -- the single
+        source both the draw call and its click router use."""
+        import pygame
+        out = []
+        y = rect.y + SIDE_TOOLBAR_BTN_H + 9
+        for btn in self._side_toolbar_buttons():
+            out.append((btn, pygame.Rect(rect.x + 3, y, rect.width - 6, SIDE_TOOLBAR_BTN_H)))
+            y += SIDE_TOOLBAR_BTN_H + 4
+        return out
+
+    def _click_side_toolbar(self, mp, rect) -> bool:
+        if self._side_toolbar_collapse_rect(rect).collidepoint(mp):
+            self._toggle_side_toolbar()
+            return True
+        for btn, r in self._side_toolbar_button_rects(rect):
+            if r.collidepoint(mp):
+                btn["action"]()
+                return True
+        return True  # any other click on the strip is still consumed (over-UI)
+
+    def _draw_side_toolbar(self, surf, rect, mp) -> None:
+        import pygame
+        pygame.draw.rect(surf, PANEL_BG, rect)
+        pygame.draw.line(surf, PANEL_EDGE, (rect.right - 1, rect.y),
+                         (rect.right - 1, rect.bottom))
+        collapsed = self.side_toolbar_collapsed
+        cr = self._side_toolbar_collapse_rect(rect)
+        hov = cr.collidepoint(mp)
+        pygame.draw.rect(surf, HOVER_BG if hov else (33, 36, 44), cr, border_radius=4)
+        pygame.draw.rect(surf, PANEL_EDGE, cr, 1, border_radius=4)
+        glyph = ">" if collapsed else "<"
+        lab = self.font_small.render(glyph, True, TEXT)
+        surf.blit(lab, (cr.x + (cr.width - lab.get_width()) // 2,
+                        cr.y + (cr.height - lab.get_height()) // 2))
+        for btn, r in self._side_toolbar_button_rects(rect):
+            active = btn["active"]()
+            if active:
+                bg = ACCENT
+            elif r.collidepoint(mp):
+                bg = HOVER_BG
+            else:
+                bg = (33, 36, 44)
+            pygame.draw.rect(surf, bg, r, border_radius=4)
+            pygame.draw.rect(surf, PANEL_EDGE, r, 1, border_radius=4)
+            text_color = (20, 20, 24) if active else ACCENT
+            label = btn["icon"] if collapsed else btn["label"]
+            lab2 = self.font_small.render(label, True, text_color)
+            surf.blit(lab2, (r.x + (r.width - lab2.get_width()) // 2,
+                             r.y + (r.height - lab2.get_height()) // 2))
 
     # ---- transform gizmo: W/E/R select translate / rotate / scale ----
     _GIZMO_AXES = (((1.0, 0.0, 0.0), (225, 85, 85)),
@@ -1738,6 +1867,7 @@ class Editor:
                 ("Outliner", lambda: self._toggle_panel("outliner"), True),
                 ("Details", lambda: self._toggle_panel("details"), True),
                 ("Content Browser", lambda: self._toggle_panel("browser"), True),
+                ("Console", lambda: self._toggle_panel("console"), True),
                 ("Material Editor", self._toggle_material_editor, True),
                 ("Fullscreen", self._toggle_fullscreen, True),
                 ("Settings...", self._open_settings, True),
@@ -1806,7 +1936,14 @@ class Editor:
     # restriction (outliner/details are side-dock-only, browser is
     # bottom-dock-only) and now gates BOTH kinds of drop.
     _PANEL_ALLOWED_SIDES = {"outliner": ("left", "right"), "details": ("left", "right"),
-                            "browser": ("bottom",)}
+                            "browser": ("bottom",),
+                            # "bottom" listed first: it's this panel's
+                            # fallback side in _apply_layout_settings when
+                            # migrating a settings.json saved before the
+                            # console panel existed (index [0] of this
+                            # tuple), matching where it lands by default in
+                            # a fresh install (Editor.__init__/_reset_layout)
+                            "console": ("bottom", "left", "right")}
 
     @staticmethod
     def _remove_pid_from(dock_order, floating, pid) -> None:
@@ -1934,15 +2071,16 @@ class Editor:
         make docking feel broken (a real user complaint -- EDGE_SNAP=48px is
         a sliver on a 2560px-wide window)."""
         import pygame
+        tb_w = layout.get("side_toolbar_w", 0)
         if side == "left":
             width = layout["left_w"] or max(EDGE_SNAP, int(w * 0.04))
-            return pygame.Rect(0, MENU_H, width, max(0, h - MENU_H))
+            return pygame.Rect(tb_w, MENU_H, width, max(0, h - MENU_H))
         if side == "right":
             width = layout["right_w"] or max(EDGE_SNAP, int(w * 0.04))
             return pygame.Rect(w - width, MENU_H, width, max(0, h - MENU_H))
         if side == "bottom":
             height = layout["bottom_h"] or max(EDGE_SNAP, int(h * 0.04))
-            return pygame.Rect(0, h - height, w, height)
+            return pygame.Rect(tb_w, h - height, max(0, w - tb_w), height)
         raise ValueError(side)
 
     def _panel_drag_target_side(self, pid, mp, w, h, layout):
@@ -2097,10 +2235,13 @@ class Editor:
     def _reset_layout(self) -> None:
         self.dock_order = {"left": [], "right": [self._solo_group("outliner"),
                                                  self._solo_group("details")],
-                           "bottom": [self._solo_group("browser")]}
+                           "bottom": [self._solo_group("browser"),
+                                     self._solo_group("console")]}
         self.floating = []
-        self.panel_visible = {"outliner": True, "details": True, "browser": True}
-        self.panel_minimized = {"outliner": False, "details": False, "browser": False}
+        self.panel_visible = {"outliner": True, "details": True, "browser": True,
+                              "console": True}
+        self.panel_minimized = {"outliner": False, "details": False, "browser": False,
+                                "console": False}
         self.float_rect = {}
         self.dock_frac = dict(DOCK_FRAC_DEFAULT)
         self._save_settings()
@@ -2238,6 +2379,7 @@ class Editor:
             "snap_index": dict(self.snap_index),
             "pivot_mode": self.pivot_mode,
             "cursor3d": [self.cursor3d.x, self.cursor3d.y, self.cursor3d.z],
+            "side_toolbar_collapsed": self.side_toolbar_collapsed,
         }
 
     def _save_settings(self) -> None:
@@ -2262,6 +2404,11 @@ class Editor:
         if (isinstance(c, list) and len(c) == 3
                 and all(isinstance(v, (int, float)) for v in c)):
             self.cursor3d = self.engine_mod.Vec3(float(c[0]), float(c[1]), float(c[2]))
+
+    def _apply_side_toolbar_settings(self, data: dict) -> None:
+        v = data.get("side_toolbar_collapsed")
+        if isinstance(v, bool):
+            self.side_toolbar_collapsed = v
 
     def _migrate_dock_order(self, raw: dict, valid: set) -> dict:
         """Build fresh dock groups from a saved `dock_order`, accepting
@@ -2295,13 +2442,30 @@ class Editor:
         self._apply_snap_settings(data)
         self._apply_pivot_settings(data)
         self._apply_cursor_settings(data)
-        valid = {"outliner", "details", "browser"}
+        self._apply_side_toolbar_settings(data)
+        valid = {"outliner", "details", "browser", "console"}
         migrated = self._migrate_dock_order(data.get("dock_order", {}), valid)
         floating = [p for p in data.get("floating", []) if p in valid]
         placed = ([p for side in ("left", "right", "bottom")
                   for g in migrated[side] for p in g["ids"]] + floating)
-        if set(placed) != valid or len(placed) != len(valid):
-            return  # partial/corrupt layout data: keep the built-in default
+        if not placed:
+            return  # no saved layout at all (fresh install / blank temp
+                     # settings in a test) -- keep the constructor's
+                     # hand-built default untouched, exactly like before
+        if len(placed) != len(set(placed)):
+            return  # a pid placed twice somewhere: corrupt data, keep default
+        # a panel introduced AFTER whatever version wrote `data` (e.g.
+        # "console", added post-hoc) won't be in `placed` -- default-dock it
+        # instead of discarding the WHOLE saved layout just because one new
+        # id is absent, which would otherwise reset every other panel's
+        # carefully-arranged position on every settings.json written before
+        # this panel existed.
+        for pid in valid - set(placed):
+            side = self._PANEL_ALLOWED_SIDES.get(pid, ("bottom",))[0]
+            migrated[side].append(self._solo_group(pid))
+            placed.append(pid)
+        if set(placed) != valid:
+            return  # still partial/corrupt: keep the built-in default
         self.dock_order = migrated
         self.floating = floating
         pv = data.get("panel_visible", {})
@@ -2625,6 +2789,18 @@ class Editor:
         }
         self.import_field = None
 
+    def _face_count_suffix(self, asset_name: str) -> str:
+        """" (<N> faces)" for a mesh asset, "" otherwise -- used to shape the
+        console-log import-complete message; cheap (one extra instantiate,
+        same cost `make_icon` already pays for the thumbnail)."""
+        asset = self.lib.by_name.get(asset_name)
+        if asset is None:
+            return ""
+        entity = asset.instantiate()
+        if entity.mesh is None:
+            return ""
+        return f" ({entity.mesh.faces.shape[0]} faces)"
+
     def _import_path_to_folder(self, path: str) -> None:
         """Import an .fbx/.hdr file and assign it to `self.selected_folder`.
 
@@ -2632,13 +2808,17 @@ class Editor:
         drag-and-drop from Explorer) can drive the import with a real path,
         no tkinter dialog involved.
         """
+        from engine import console_log
         ext = os.path.splitext(path)[1].lower()
         try:
             if ext == ".fbx":
+                console_log.log_info(f"Importing '{os.path.basename(path)}'...")
                 name = self.engine_mod.import_fbx(path, self.lib.directory)
             elif ext == ".hdr":
+                console_log.log_info(f"Importing '{os.path.basename(path)}'...")
                 name = self.engine_mod.import_hdri(path, self.lib.directory)
             elif ext in (".png", ".jpg", ".jpeg", ".bmp"):
+                console_log.log_info(f"Importing '{os.path.basename(path)}'...")
                 name = self.engine_mod.import_texture(path, self.lib.directory)
             else:
                 self.status = (f"unsupported file type: {ext}", 5.0)
@@ -2647,8 +2827,10 @@ class Editor:
             self.lib.set_asset_folder(name, self.selected_folder)
             self.lib.save_folders()
             self.icons[name] = make_icon(self.engine_mod, self.lib.by_name[name])
+            console_log.log_info(f"imported '{name}'{self._face_count_suffix(name)}")
             self.status = (f"imported '{name}' — drag it from the browser", 5.0)
         except Exception as ex:
+            console_log.log_error(f"import failed: {ex}")
             self.status = (f"import failed: {ex}", 6.0)
 
     def _rename_new_asset(self, old_name: str, new_name: str) -> str:
@@ -2688,8 +2870,10 @@ class Editor:
         drag-drop could call it directly with the defaults to skip the
         dialog entirely, same contract `_import_path_to_folder` established.
         """
+        from engine import console_log
         ext = os.path.splitext(path)[1].lower()
         try:
+            console_log.log_info(f"Importing '{os.path.basename(path)}'...")
             if ext == ".fbx":
                 asset_name = self.engine_mod.import_fbx(
                     path, self.lib.directory, scale=scale, up_axis=up_axis,
@@ -2708,8 +2892,11 @@ class Editor:
             self.icons[asset_name] = make_icon(self.engine_mod, self.lib.by_name[asset_name])
             self.selected_folder = folder
             self.selected_asset = self.lib.by_name[asset_name]
+            console_log.log_info(
+                f"imported '{asset_name}'{self._face_count_suffix(asset_name)}")
             self.status = (f"imported '{asset_name}'", 5.0)
         except Exception as ex:
+            console_log.log_error(f"import failed: {ex}")
             self.status = (f"import failed: {ex}", 6.0)
 
     # ---- content browser: import-options dialog (rects, styled like Settings) ----
@@ -3006,6 +3193,7 @@ class Editor:
         self._update_cursor(mp, layout)
 
         if inp.wheel and not looking:
+            from engine import console_log
             target = self._hit_panel(mp, layout)
             if target is not None and self.panel_minimized.get(target, False):
                 target = None
@@ -3022,6 +3210,15 @@ class Editor:
                         max(0, (n_rows - visible) * TREE_ROW_H)))
                 else:
                     self.browser_scroll = max(0, self.browser_scroll - int(inp.wheel) * 70)
+            elif target == "console":
+                # scroll UP (positive wheel) moves AWAY from the latest entry
+                # (console_scroll counts up from the pinned-to-bottom anchor,
+                # the opposite sense from outliner/browser's top-anchored
+                # scroll) -- clamped for real at draw time (_draw_console),
+                # this clamp is just a sane upper bound so it can't grow
+                # unbounded while the panel isn't even visible/rendering
+                self.console_scroll = max(0, min(self.console_scroll + int(inp.wheel) * 3,
+                                                 console_log.get_log().entries.maxlen))
 
         if inp.mouse_button_pressed(1):
             self._commit_edit_field()
@@ -3073,6 +3270,13 @@ class Editor:
                         else:
                             content = self._panel_content_rect(target, layout)
                             self._route_panel_click(target, mp, content, inp)
+                elif self._side_toolbar_rect(w, h).collidepoint(mp):
+                    # checked AFTER _hit_panel (so a floating panel that
+                    # happens to overlap the strip still wins, same
+                    # precedence the viewport toolbar gets below) but BEFORE
+                    # the viewport branch -- a click here must never start a
+                    # marquee or place/deselect in the 3D view
+                    self._click_side_toolbar(mp, self._side_toolbar_rect(w, h))
                 elif layout["viewport"].collidepoint(mp):
                     toolbar_rect = self._viewport_toolbar_rect(layout["viewport"])
                     if not (toolbar_rect.collidepoint(mp)
@@ -3547,23 +3751,26 @@ class Editor:
         surf = eng.screen
         w, h = surf.get_size()
         layout = self._layout(w, h)
+        mp = eng.input.mouse_pos
         self._draw_markers(surf, w, h)
         self._draw_marquee(surf, layout)
 
         # backdrop so gaps between a side dock and the bottom dock (if both
-        # are present) read as UI, not a hole showing the 3D scene through
+        # are present) read as UI, not a hole showing the 3D scene through --
+        # docked panels start AFTER the side toolbar (tb_w), not at x=0
+        tb_w = layout["side_toolbar_w"]
         if layout["left_w"]:
             pygame.draw.rect(surf, PANEL_BG,
-                             pygame.Rect(0, MENU_H, layout["left_w"], h - MENU_H))
+                             pygame.Rect(tb_w, MENU_H, layout["left_w"], h - MENU_H))
         if layout["right_w"]:
             pygame.draw.rect(surf, PANEL_BG, pygame.Rect(
                 w - layout["right_w"], MENU_H, layout["right_w"], h - MENU_H))
         if layout["bottom_h"]:
             pygame.draw.rect(surf, PANEL_BG, pygame.Rect(
-                layout["left_w"], h - layout["bottom_h"],
-                w - layout["left_w"] - layout["right_w"], layout["bottom_h"]))
+                tb_w + layout["left_w"], h - layout["bottom_h"],
+                w - tb_w - layout["left_w"] - layout["right_w"], layout["bottom_h"]))
 
-        mp = eng.input.mouse_pos
+        self._draw_side_toolbar(surf, self._side_toolbar_rect(w, h), mp)
         if layout["viewport"].width > 0 and layout["viewport"].height > 0:
             self._draw_viewport_toolbar(surf, self._viewport_toolbar_rect(layout["viewport"]), mp)
         for side, r in layout["splitters"].items():
@@ -3584,7 +3791,7 @@ class Editor:
             panels[drag_pid] = pygame.Rect(mp[0] - g["dx"], mp[1] - g["dy"],
                                            g["w"], dh)
 
-        for pid in ("outliner", "details", "browser"):
+        for pid in ("outliner", "details", "browser", "console"):
             if pid in panels and pid not in self.floating and pid != drag_pid:
                 self._draw_panel(surf, pid, panels[pid])
         for pid in self.floating:
@@ -3647,6 +3854,8 @@ class Editor:
             return f"World Outliner — {name}"
         if pid == "details":
             return "Details"
+        if pid == "console":
+            return "Console"
         return "Content Browser"
 
     def _draw_title_buttons(self, surf, rect) -> None:
@@ -3713,6 +3922,8 @@ class Editor:
             self._draw_details(surf, content)
         elif pid == "browser":
             self._draw_browser(surf, content)
+        elif pid == "console":
+            self._draw_console(surf, content)
         if pid in self.floating:
             grip = self._panel_resize_handle(rect)
             corner = (ACCENT if self.panel_resize is not None
@@ -4389,6 +4600,50 @@ class Editor:
         self._draw_browser_topbar(surf, blay["topbar"], mp)
         self._draw_browser_tree(surf, blay["tree"], mp)
         self._draw_browser_grid(surf, blay["grid"], mp)
+
+    def _draw_console(self, surf, rect) -> None:
+        """Engine message log -- newest at the bottom, auto-scrolling to
+        follow new entries UNLESS the user has scrolled up into history (see
+        `console_scroll`'s docstring in __init__), level-colored, monospace.
+        """
+        import time as _time
+
+        import pygame
+        from engine import console_log
+
+        pygame.draw.rect(surf, (16, 17, 21), rect)
+        entries = list(console_log.get_log().entries)
+        n = len(entries)
+        top_pad = 4
+        visible = max(0, (rect.height - top_pad * 2)) // CONSOLE_ROW_H
+        # a scrolled-up viewport must not get yanked back to the tail just
+        # because new entries arrived -- advance the offset by exactly how
+        # many new entries showed up so the SAME historical lines stay put
+        prev_n = getattr(self, "_console_last_len", n)
+        if self.console_scroll > 0:
+            self.console_scroll += max(0, n - prev_n)
+        self._console_last_len = n
+        max_scroll = max(0, n - visible)
+        self.console_scroll = max(0, min(self.console_scroll, max_scroll))
+        end = n - self.console_scroll
+        start = max(0, end - visible)
+        prev_clip = surf.get_clip()
+        surf.set_clip(rect)
+        y = rect.y + top_pad
+        for entry in entries[start:end]:
+            color = CONSOLE_LEVEL_COLOR.get(entry["level"], TEXT)
+            ts = _time.strftime("%H:%M:%S", _time.localtime(entry["time"]))
+            line = f"[{ts}] {entry['text']}"
+            lab = self.font_small.render(line, True, color)
+            surf.blit(lab, (rect.x + 6, y))
+            y += CONSOLE_ROW_H
+        surf.set_clip(prev_clip)
+        if self.console_scroll > 0:
+            hint = self.font_small.render(
+                f"-- scrolled up ({self.console_scroll}) -- scroll down to follow --",
+                True, TEXT_DIM)
+            surf.blit(hint, (rect.right - hint.get_width() - 6,
+                             rect.bottom - hint.get_height() - 2))
 
 
 NODE_W = 150
@@ -5403,6 +5658,7 @@ class ScriptEditorUI:
         self.dirty = False
 
     def _compile(self) -> None:
+        from engine import console_log
         source = self._source()
         result = self.editor.engine_mod.compile_blueprint(source, self.blueprint.name)
         self.compile_result = result
@@ -5414,6 +5670,15 @@ class ScriptEditorUI:
         if self.error_line:
             row = max(0, min(len(self.lines) - 1, self.error_line - 1))
             self.caret_row, self.caret_col = row, len(self.lines[row])
+        if result.get("ok"):
+            console_log.log_info(
+                f"blueprint '{self.blueprint.name}' compiled OK "
+                f"-- Behavior subclass '{result['class_name']}'")
+        else:
+            loc = f" (line {result['line']})" if result.get("line") else ""
+            console_log.log_error(
+                f"blueprint '{self.blueprint.name}' {result['stage']} "
+                f"error{loc}: {result['message']}")
 
     def _status_text(self):
         r = self.compile_result
@@ -5697,8 +5962,17 @@ def main() -> None:
 
     # trace the static lights' shadows now so the first frame doesn't hitch
     eng.loading_step("pre-tracing shadows", 0.8)
-    eng.tracer.refresh(scene)
+    import time as _time
+    _rebuilt = eng.tracer.refresh(scene)
+    if _rebuilt:
+        engine.console_log.log_info(
+            f"Baking lighting ({eng.tracer.occluder_triangle_count()} "
+            f"occluder triangles)...")
+        _t0 = _time.perf_counter()
     eng.renderer.render(pygame.Surface((320, 180)), scene, camera, eng.tracer)
+    if _rebuilt:
+        engine.console_log.log_info(
+            f"Lighting baked in {_time.perf_counter() - _t0:.1f}s")
 
     eng.loading_step("opening world", 0.95)
     eng.esc_handler = editor.handle_escape
