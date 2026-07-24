@@ -39,38 +39,86 @@ survival horror game. Repo: https://github.com/WhateverTrevor/PyEngine.
 
 ## Verification (run these as judge; all must pass before merging)
 
-- `py tests\smoke_test.py`     — full engine/editor battery (CPU paths)
-- `py tests\gl_checks.py`      — OpenGL backend: CPU parity, IES, cone, shadows, depth
-- `py tests\wgpu_checks.py`    — DX12 backend: 3-way parity, shadows, HDRI sky
-- `py tests\env_checks.py`     — sun disc tracking, directional shadows, GI
-  green-bleed, fog volumes, sky-material bake, HDRI import
-- `py tests\window_checks.py`  — panel minimize/close/reset layout math,
-  settings round-trip, material-editor bake
-- FPS reference (post environment features, 2026-07-11): editor cpu ~23 /
-  dx12 ~53; demo cpu ~44-52 / gl ~116 / dx12 ~81 / vulkan ~85. If a number
-  regresses >20%, investigate before merging.
+The battery is now **25 suites** (`py tests\<name>.py`, each ends with an
+"ALL ... PASSED"/"JUDGE ... PASSED" line + exit 0). Name ALL of them in
+every engine-coder brief and run every one before merging:
+smoke_test, gl_checks, wgpu_checks, env_checks, window_checks, browser_checks,
+toolbar_checks, texture_checks, material_checks, mat_ui_checks, pbr_checks,
+transparency_checks, snap_checks, multiselect_checks, pivot_checks,
+marquee_checks, cursor_checks, docktab_checks, import_checks, lod_checks,
+blueprint_checks, console_checks, fps_checks, async_bake_checks, bvh_checks.
+
+- UI/interaction tests MUST drive the real event path (pygame event
+  injection through eng.input.process + editor.update), NOT direct handler
+  calls — a ctx-menu click crash slipped past handler-only tests. Held
+  modifier keys / mouse aren't reachable by synthetic SDL events; patch
+  pygame.key.get_pressed + mouse.get_pos + mouse.get_pressed at the OS
+  boundary (see marquee_checks / snap_checks / async_bake_checks).
+- Tests isolate settings via PYENGINE_SETTINGS; a no-pollution guard asserts
+  the real settings.json is untouched.
+- **FPS BENCHMARKING IS UNRELIABLE HERE.** This working dir benches 2-10x
+  slow AND high-variance (identical code has swung e.g. demo dx12 61-102).
+  Only same-environment A/B (branch vs a `git worktree` of main, same run)
+  is meaningful — never trust a single sample vs an absolute reference.
+  ALSO: the repo-root settings.json holds the user's real 5120x1369 /
+  pixel_scale 3 — a headless bench without PYENGINE_SETTINGS isolation looks
+  catastrophically slow (1-2 FPS). Rough in-place references w/ settings
+  aside: editor cpu ~23 / dx12 ~49; demo cpu ~52 / gl ~116 / dx12 ~85-98.
 
 ## Known gaps / natural backlog
 
-- **Top queued task: wgpu directional (sun) shadow attenuation on mesh
-  faces** — the only remaining wgpu visual gap after the parity merge
-  (52f0601); mirror GL's `_upload_dl_shadow_tex` + `dlShadowTex`
-  texelFetch pattern.
-- Software flat mode (F2) is painter-only (approximate depth); GPU paths cap
-  at 16 lights; wgpu path = offscreen+readback, no wireframe.
-- Fog Volume boxes are world-axis-aligned (rotation ignored, v1). GI is
-  one-bounce, per-face, static-scene cached (~300ms starter-scene bake).
-- No undo system. FBX import is geometry+diffuse colors only (no textures/UVs).
-- Next obvious features: walking player (gravity), interactions
-  (doors/pickups), enemy AI, texture/UV pipeline.
+- Blueprint POSED MESHES (run 2 of the blueprint feature): the
+  BlueprintAsset schema already has an (empty) `components` list; fill it
+  with {asset_name, position, rotation, scale} posed meshes + UI to compose
+  them, and instantiate a blueprint into the world with its compiled
+  Behavior attached and running (catch per-frame update errors). Also: NO
+  infinite-loop guard on script exec — a `while True:` hangs the editor
+  (worker-thread timeout is the fix).
+- wgpu directional (sun) shadow attenuation on mesh faces (GL's dlShadowTex)
+  — the last wgpu visual gap.
+- Per-pixel texturing (materials bake per-face; would unlock texture-mapped
+  roughness/metallic and higher-fidelity textures).
+- LOD/decimation is vertex-clustering (not QEM); BVH split is median (not
+  SAH); shadow/GI still one-bounce, per-face.
+- No undo system; folder deletion in the content browser; flat-mode (F2)
+  translucency; import status double-logs (harmless).
+- Longer-horizon game features: walking player (gravity), interactions
+  (doors/pickups), enemy AI.
 
-## State at last supervisor retirement (2026-07-11)
+## State at last supervisor retirement (2026-07-14)
 
-Everything requested by the user is merged and pushed through `8ef3dc2`:
-GPU backends (gl/dx12/vulkan + settings API selector), Sun (time-of-day
-rotation, disc, directional ray-traced shadows), HDRI import + editable sky
-materials (node editor, Unreal-vocabulary nodes), one-bounce GI, atmospheric
-fog + Fog Volume assets, and full window management (minimize/close on every
-panel, Window-menu registry, factory Reset Layout). No task in flight; no
-wip branches; `.claude/wip/HANDOFF.md` is the no-task stub. Token ledger is
-current through the window-management run.
+Big multi-day push, all merged + pushed through `e477b49`, working tree
+clean, no wip branches, HANDOFF is the no-task stub. Shipped since the
+2026-07-11 retirement:
+- **Rendering:** full PBR (metallic-roughness GGX) across CPU/GL/wgpu;
+  wgpu visual parity (sun disc, GI, fog); material transparency/opacity
+  (blend modes) on all three backends; DX12 is now the DEFAULT renderer
+  (CPU opt-in — user preference, in supervisor memory).
+- **Editor UX:** resizable panels + fullscreen adaptive; dockable panels
+  with drop-previews + TABBED docking; viewport toolbar (gizmo modes,
+  World/Local); editable transform vectors; snapping (grid/floor/mesh) +
+  Alt-drag gizmo duplicate; multi-selection + 5 Blender pivot modes
+  (incl. 3D cursor); box/marquee select; collapsible left side toolbar +
+  dockable engine CONSOLE (logs imports/compiles/lighting bakes).
+- **Content:** content-browser folder tree; texture assets w/ previews +
+  UV pipeline + TexCoord/TextureSample nodes; UE-style material node
+  overhaul + drag-drop material assignment; FBX EXPORT; Unreal-style
+  import-options dialog (scale/up-axis/fit-to-unit/folder nav); distance
+  LOD w/ decimation; Python BLUEPRINT assets + in-engine script editor
+  with compile/bug-check (posed meshes still TODO — see backlog).
+- **Performance (the big one):** the user's 10k-face FBX import went from a
+  ~5-MINUTE lighting-bake FREEZE to ~1.1s, via three merged changes —
+  coarse-LOD shadow/GI occluder proxy (incl. on-demand decimation for
+  meshes lacking LODs), ASYNC non-blocking bake (background thread, atomic
+  install), and a BVH ray-tracer acceleration structure. Uncapped FPS by
+  default + optional clamp + smoothed readout.
+
+Process notes for the next supervisor: engine-coder runs THIS SESSION
+consistently ran 1.5-2.7x the 150k token budget on large features — split
+big/cross-cutting work (esp. anything touching all 3 renderers, threading,
+or big refactors) into MORE, smaller runs, and enforce per-milestone
+checkpoints. Several review send-backs and one supervisor-implemented fix
+(the on-demand shadow proxy — the agent's version missed the user's
+LOD-less asset) are recorded in the ledger. The user's real imported asset
+files (assets/gat.json, assets/models/gat.npz, assets/folders.json,
+assets/blueprints/) are UNTRACKED local data — never modify or commit them.

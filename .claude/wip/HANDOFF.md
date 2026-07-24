@@ -1,41 +1,43 @@
-# No task in flight
+# No task in flight — supervisor retirement 2026-07-14
 
-BVH ray-trace acceleration was judged and squash-merged to main on
-2026-07-14, completing the 2-run RT responsiveness effort (async bake +
-BVH). engine/bvh.py is a pure-numpy flat BVH: build_bvh(v0,e1,e2),
-any_hit(bvh,origins,dirs,t_max), nearest(bvh,origins,dirs). Traversal
-advances a (ray_id,node_id) frontier one tree LEVEL per Python iteration —
-no per-ray Python loop. raytrace.py's _intersect_any/_nearest_hit_faces
-take an optional bvh= and route through it only above BVH_THRESHOLD (256);
-at/below threshold the exact brute-force path runs, so all low-poly
-content is byte-identical. The BVH is built once per occluder-soup version
-(cached on the tracer, snapshot into lighting_bake for the worker thread).
+Everything the user asked for is merged and pushed through `e477b49`.
+Working tree clean, no wip branches, no agent runs in flight.
 
-RESULTS (RT effort complete): the user's 10,448-face Gat first-render
-lighting bake went 295.63s (original freeze) -> 8.9s (coarse shadow proxy)
--> 1.14s (BVH), and that 1.14s runs on the async worker thread so the
-frame never blocks (1.3ms dispatch). Supervisor independently verified:
-BVH any_hit EXACT vs brute-force (0 mismatches / 1500 rays), nearest exact
-(t-diff 0.0), 11x isolation speedup; starter scene byte-identical main
-(brute) vs branch (BVH) — 0 differing pixels even though it's above the
-threshold; all 25 suites pass.
+Read `CLAUDE.md` first — its "Verification", "Known gaps / natural
+backlog", and "State at last supervisor retirement (2026-07-14)" sections
+were refreshed at this retirement and are the authoritative summary of
+what shipped, what's queued, and the process lessons.
 
-NOTE: the starter scene (~368 occluder tris) is just above BVH_THRESHOLD
-so it exercises the BVH in normal runs — verified byte-identical, but if a
-future high-poly scene ever shows tie-break pixel diffs vs brute-force,
-that's the expected sub-pixel nearest-hit tie-break behavior (raise the
-threshold if it ever matters). The repo-root settings.json holds the
-user's real 5120x1369 / pixel_scale 3 — headless benchmarks MUST use
-PYENGINE_SETTINGS isolation or numbers look catastrophically slow.
+## If you are the next supervisor, know these five things
 
-When a task IS in flight, this file holds its resume state per the
+1. **The test battery is 25 suites** (listed in CLAUDE.md). Name every one
+   in every brief; agents have skipped the suites most coupled to their
+   own changes and shipped a break that way.
+2. **UI tests must drive the real pygame event path**, not handlers
+   directly (a basic click crash slipped through handler-only tests).
+   Held modifiers need OS-boundary patching — see marquee_checks.
+3. **FPS numbers here are untrustworthy**: 2-10x slow, high variance, and
+   the repo-root settings.json (user's real 5120x1369) makes headless
+   benches look catastrophic. Same-environment A/B only, with
+   PYENGINE_SETTINGS isolation.
+4. **Budget**: engine-coder runs this session ran 1.5-2.7x the 150k
+   target on large features (worst: 405k threading rewrite, and one
+   ~575k thrash across two stops). Split cross-cutting work (3 render
+   backends / threading / big refactors) into more, smaller runs and
+   enforce a pushed checkpoint per milestone.
+5. **Never touch the user's untracked asset data**: assets/gat.json,
+   assets/models/gat.npz, assets/folders.json, assets/blueprints/.
+
+## Immediate candidates (user's own priorities first)
+
+- Blueprint POSED MESHES — run 2 of the blueprint feature the user
+  explicitly scoped ("assets that house their own posed meshes and
+  code"). Schema field `components` already exists and is empty, so the
+  work is additive. Pair it with the missing infinite-loop guard on
+  script exec (a `while True:` currently hangs the editor).
+- wgpu directional sun-shadow attenuation (last wgpu visual gap).
+- Per-pixel texturing (unlocks texture-mapped PBR).
+
+When a task IS in flight, this file holds its resume state (task, DONE
+with evidence, NEXT, known issues, temp-artifact paths) per the
 checkpoint protocol in `CLAUDE.md` and `.claude/agents/engine-coder.md`.
-
-IMPORTANT: settings isolate via PYENGINE_SETTINGS; UI tests drive the real
-event path; DX12 default; DO NOT touch assets/gat.*, folders.json,
-blueprints/. Full battery is TWENTY-FIVE suites. FPS here is 2-10x slow +
-high variance — same-environment A/B only; never run multi-minute benches.
-
-Backlog: blueprint posed meshes (run 2 of blueprint) + infinite-loop guard
-on script exec; QEM decimation; per-pixel texturing; folder deletion;
-import status double-log cleanup; SAH BVH split (currently median).
