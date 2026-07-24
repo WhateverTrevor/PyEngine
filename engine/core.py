@@ -15,6 +15,7 @@ lifecycle, the api fallback chain, and the per-frame composite/blit.
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -28,6 +29,33 @@ from .raytrace import ShadowTracer
 from .renderer import Renderer
 
 _SPLASH_SIZE = (460, 260)
+
+
+class FpsSmoother:
+    """Exponential moving average of instantaneous frame rate, with a fixed
+    WALL-CLOCK time constant (not a frame-count window) -- so the HUD
+    readout stays visually calm no matter how fast frames are arriving.
+    `pygame.time.Clock.get_fps()` also averages, but only over its last
+    ~10 tick() calls; at an uncapped render rate that window can be a
+    handful of milliseconds, nowhere near enough to hide the frame-to-frame
+    jitter of an uneven per-frame workload (see `Engine.run`)."""
+
+    def __init__(self, tau: float = 0.5):
+        self.tau = tau  # seconds to settle most of the way to a new rate
+        self.value = 0.0
+
+    def update(self, dt: float) -> float:
+        """Fold one frame's wall-clock duration `dt` (seconds) into the
+        average and return the new smoothed FPS."""
+        if dt <= 1e-9:
+            return self.value
+        inst = 1.0 / dt
+        if self.value <= 0.0:
+            self.value = inst  # first sample -- snap, nothing to blend yet
+        else:
+            alpha = 1.0 - math.exp(-dt / self.tau)
+            self.value += (inst - self.value) * alpha
+        return self.value
 
 _UI_VS = """
 #version 330 core
@@ -48,10 +76,17 @@ void main() { fragColor = texture(tex, v_uv); }
 
 class Engine:
     def __init__(self, width: int = 1280, height: int = 720, title: str = "PyEngine",
-                 max_fps: int = 120, fixed_dt: float = 1.0 / 60.0, splash: bool = True,
+                 max_fps: int = 0, fixed_dt: float = 1.0 / 60.0, splash: bool = True,
                  api: str = "dx12", gpu: "str | bool | None" = None,
                  fullscreen: bool = False):
-        """`api`: "dx12" (WebGPU via wgpu-py, see wgpu_renderer.py; the
+        """`max_fps`: 0 (the default) means UNCAPPED -- render/present as
+        fast as the frame allows; any positive value clamps via
+        `clock.tick()` in `run()`. The fixed-timestep `scene.update` cadence
+        (`fixed_dt`, 60 Hz by default) is independent of this and always
+        runs -- capping or uncapping only changes how often a render/present
+        happens between updates, never behavior determinism.
+
+        `api`: "dx12" (WebGPU via wgpu-py, see wgpu_renderer.py; the
         default -- CPU rendering is opt-in only), "vulkan" (WebGPU, other
         adapter), "auto" (alias for "dx12"), "gl" (OpenGL 3.3 via moderngl),
         "cpu" (software only). Headless/dummy driver always forces "cpu"
@@ -84,8 +119,9 @@ class Engine:
         self._gl_ctx = None
         self._ui_prog = self._ui_vbo = self._ui_vao = self._ui_tex = None
         self.tracer = ShadowTracer()
-        self.max_fps = max_fps
+        self.max_fps = max_fps  # 0 == uncapped, see class docstring above
         self.fixed_dt = fixed_dt
+        self.fps_smoother = FpsSmoother()  # smoothed HUD readout, see run()
         self.show_hud = True
         self.hud_text: str | None = None  # optional controls line, set by the app
         self._font = pygame.font.SysFont("consolas,couriernew,monospace", 15)
@@ -302,9 +338,14 @@ class Engine:
         """Run the game loop until quit.
 
         Updates run on a fixed timestep (deterministic behaviors); rendering
-        runs as fast as the frame allows, capped at max_fps. `overlay(engine)`
+        runs as fast as the frame allows, optionally clamped by `max_fps`
+        (0 = uncapped, the default -- see `Engine.__init__`). `overlay(engine)`
         is called after the 3D render, before flip — used by the editor UI.
-        `max_frames` + `screenshot_path` support benchmarking.
+        `max_frames` + `screenshot_path` support benchmarking: the fixed-
+        timestep accumulator always advances by exactly `fixed_dt` per loop
+        iteration in that mode (see `frame_dt` below), regardless of the
+        real wall-clock time a headless iteration takes or of `max_fps`, so
+        a benchmark run's scene.update sequence is bit-for-bit deterministic.
         """
         self._end_splash()
         self.scene = scene  # behaviors (e.g. collision) may query the live scene
@@ -334,10 +375,14 @@ class Engine:
             self.input.process(events)
 
             now = time.perf_counter()
-            frame_dt = min(now - last, 0.25)
+            raw_dt = min(now - last, 0.25)  # actual wall-clock frame duration
             last = now
-            if max_frames is not None:
-                frame_dt = self.fixed_dt  # deterministic benchmark runs
+            # deterministic benchmark runs always advance the accumulator by
+            # exactly fixed_dt, independent of real timing or max_fps, so
+            # scene.update's call sequence is reproducible frame-for-frame;
+            # the HUD/fps_smoother below still use the real raw_dt so a
+            # benchmark's on-screen readout (and screenshot) reflect true pacing.
+            frame_dt = self.fixed_dt if max_frames is not None else raw_dt
             accumulator += frame_dt
             steps = 0
             while accumulator >= self.fixed_dt:
@@ -384,11 +429,17 @@ class Engine:
             # frame (see engine/lod.py -- hysteresis lives in entity.lod_index).
             update_scene_lods(scene, camera)
 
+            # HUD readout: an EMA over wall-clock time (see FpsSmoother),
+            # NOT clock.get_fps() -- that only averages pygame's last ~10
+            # tick() calls, which at an uncapped render rate is a few
+            # milliseconds of history and visibly flickers frame to frame.
+            hud_fps = self.fps_smoother.update(raw_dt)
+
             if self.gl_renderer is not None:
                 self.gl_renderer.render(scene, camera, self._size, tracer)
                 self.screen.fill((0, 0, 0, 0))
                 if self.show_hud:
-                    self._draw_hud(clock.get_fps(), scene)
+                    self._draw_hud(hud_fps, scene)
                 if overlay is not None:
                     overlay(self)
                 self._composite_gpu_overlay()
@@ -402,20 +453,24 @@ class Engine:
                 surf = pygame.image.frombuffer(frame, self._size, "RGBA")
                 self.screen.blit(surf, (0, 0))
                 if self.show_hud:
-                    self._draw_hud(clock.get_fps(), scene)
+                    self._draw_hud(hud_fps, scene)
                 if overlay is not None:
                     overlay(self)
             else:
                 self.renderer.render(self.screen, scene, camera, tracer)
                 if self.show_hud:
-                    self._draw_hud(clock.get_fps(), scene)
+                    self._draw_hud(hud_fps, scene)
                 if overlay is not None:
                     overlay(self)
             if baking:
                 console_log.log_info(
                     f"Lighting baked in {time.perf_counter() - bake_t0:.1f}s")
             pygame.display.flip()
-            clock.tick(self.max_fps)
+            # Clock.tick(0) (pygame's own default) applies no delay at all --
+            # that's "uncapped" -- so self.max_fps == 0 falls straight into
+            # the uncapped behavior with no special-casing needed here; `or 0`
+            # only guards a stray None (see class docstring: 0 or None).
+            clock.tick(self.max_fps or 0)
 
             frames += 1
             if max_frames is not None and frames >= max_frames:

@@ -102,7 +102,8 @@ CONSOLE_ROW_H = 15       # monospace line height in the console panel
 CONSOLE_LEVEL_COLOR = {"info": (190, 193, 200), "warn": (225, 175, 70),
                        "error": (230, 100, 100)}
 RESOLUTIONS = ((1280, 720), (1440, 810), (1600, 900), (1920, 1080))
-SETTINGS_SIZE = (380, 246)
+FPS_CAP_OPTIONS = (0, 30, 60, 120, 144)  # 0 == uncapped (see engine.core.Engine)
+SETTINGS_SIZE = (380, 268)
 IMPORT_SIZE = (420, 356)   # Unreal-style import-options modal (see _open_import_dialog)
 # extension -> (internal kind, detected-type display label) for the import
 # dialog's read-only "Type" header; scale/up-axis only apply to "mesh"
@@ -134,6 +135,15 @@ def save_settings(data: dict, path: str | None = None) -> None:
             json.dump(data, f, indent=2)
     except OSError:
         pass
+
+
+def _fps_cap_label(v: int) -> str:
+    """Button/HUD label for a `max_fps` value -- 0 reads as "Uncapped";
+    anything else (including an old slider-era value outside
+    FPS_CAP_OPTIONS, e.g. a settings.json saved before this feature) is
+    just its number, which still works with clock.tick even if it isn't
+    one of the five preset buttons."""
+    return "Uncapped" if not v else str(int(v))
 
 
 def base_height(entity) -> float:
@@ -405,7 +415,8 @@ class Editor:
         # ---- menu bar / dialogs ----
         self.open_menu = None       # name of the open dropdown, or None
         self.settings_open = False
-        self.settings_drag = None   # "pixel" / "max_fps" while dragging a settings slider
+        self.settings_drag = None   # "pixel" while dragging the pixel-scale slider
+                                    # (FPS cap is a button row -- discrete click, no drag)
         self.show_controls_overlay = False
         self.import_dialog = None   # dict (path/ext/kind/label/name/folder/scale_text/
                                      # up_axis) while the import-options modal is open,
@@ -2289,17 +2300,28 @@ class Editor:
             x += bw + gap
         return out
 
-    def _settings_slider_row(self, rect, which):
+    def _settings_slider_row(self, rect):
         import pygame
-        y = rect.y + (92 if which == "pixel" else 126)
-        return pygame.Rect(rect.x + 12, y, rect.width - 24, 24)
+        return pygame.Rect(rect.x + 12, rect.y + 92, rect.width - 24, 24)
 
     def _settings_slider_track(self, row):
         return (row.x + 100, row.right - 50)
 
+    def _settings_fps_buttons(self, rect):
+        """FPS-cap button row -- same size/spacing as `_settings_api_buttons`
+        below for a consistent look (5 discrete choices either way)."""
+        import pygame
+        x, y = rect.x + 12, rect.y + 142
+        bw, bh, gap = 62, 22, 6
+        out = []
+        for v in FPS_CAP_OPTIONS:
+            out.append((v, pygame.Rect(x, y, bw, bh)))
+            x += bw + gap
+        return out
+
     def _settings_api_buttons(self, rect):
         import pygame
-        x, y = rect.x + 12, rect.y + 180
+        x, y = rect.x + 12, rect.y + 202
         bw, bh, gap = 62, 22, 6
         out = []
         for key in ("dx12", "vulkan", "gl", "auto", "cpu"):
@@ -2307,15 +2329,19 @@ class Editor:
             x += bw + gap
         return out
 
-    def _apply_settings_slider(self, which, row, mx) -> None:
+    def _apply_settings_slider(self, row, mx) -> None:
         x0, x1 = self._settings_slider_track(row)
         f = min(max((mx - x0) / max(x1 - x0, 1), 0.0), 1.0)
-        if which == "pixel":
-            v = int(round(1 + f * 5))
-            self.eng.renderer.render_scale = max(1, v)
-        else:
-            v = int(round(30 + f * 210))
-            self.eng.max_fps = max(1, v)
+        v = int(round(1 + f * 5))
+        self.eng.renderer.render_scale = max(1, v)
+
+    def _set_fps_cap(self, v: int) -> None:
+        """Apply + persist an FPS-cap button click; logs a one-line note to
+        the console (via the `status` setter's mirroring, same as the
+        Graphics API preference below) so a cap change is visible/traceable."""
+        self.eng.max_fps = v
+        self._save_settings()
+        self.status = (f"FPS cap set to {_fps_cap_label(v)}", 2.0)
 
     def _update_settings(self, engine, w, h) -> None:
         import pygame
@@ -2332,24 +2358,26 @@ class Editor:
                     self.eng.set_resolution(rw, rh)
                     self._save_settings()
                     return
+            for v, btn in self._settings_fps_buttons(rect):
+                if btn.collidepoint(mp):
+                    self._set_fps_cap(v)
+                    return
             for key, btn in self._settings_api_buttons(rect):
                 if btn.collidepoint(mp):
                     self.api_pref = key
                     self._save_settings()
                     self.status = ("Graphics API preference saved — restart to apply", 3.0)
                     return
-            for which in ("pixel", "max_fps"):
-                if which == "pixel" and not self._software_active():
-                    continue  # pixel scale only affects the software per-pixel pass
-                row = self._settings_slider_row(rect, which)
+            if self._software_active():  # pixel scale only affects the software per-pixel pass
+                row = self._settings_slider_row(rect)
                 if row.collidepoint(mp):
-                    self.settings_drag = which
-                    self._apply_settings_slider(which, row, mp[0])
+                    self.settings_drag = "pixel"
+                    self._apply_settings_slider(row, mp[0])
                     return
         if self.settings_drag is not None:
             if inp.mouse_held(1):
-                row = self._settings_slider_row(rect, self.settings_drag)
-                self._apply_settings_slider(self.settings_drag, row, mp[0])
+                row = self._settings_slider_row(rect)
+                self._apply_settings_slider(row, mp[0])
             else:
                 self.settings_drag = None
                 self._save_settings()
@@ -4036,13 +4064,21 @@ class Editor:
             surf.blit(lab, (btn.x + (btn.width - lab.get_width()) // 2, btn.y + 5))
 
         if self._software_active():
-            self._draw_settings_slider(surf, rect, "pixel", "pixel scale",
+            self._draw_settings_slider(surf, rect, "pixel scale",
                                        self.eng.renderer.render_scale, 1, 6)
-        self._draw_settings_slider(surf, rect, "max_fps", "max fps",
-                                   self.eng.max_fps, 30, 240)
+
+        surf.blit(self.font_small.render("FPS cap", True, TEXT_DIM),
+                  (rect.x + 12, rect.y + 126))
+        for v, btn in self._settings_fps_buttons(rect):
+            active = int(self.eng.max_fps) == v
+            pygame.draw.rect(surf, SELECT_BG if active else (33, 36, 44), btn,
+                             border_radius=4)
+            pygame.draw.rect(surf, PANEL_EDGE, btn, 1, border_radius=4)
+            lab = self.font_small.render(_fps_cap_label(v), True, TEXT)
+            surf.blit(lab, (btn.x + (btn.width - lab.get_width()) // 2, btn.y + 4))
 
         surf.blit(self.font_small.render("Graphics API (restart)", True, TEXT_DIM),
-                  (rect.x + 12, rect.y + 160))
+                  (rect.x + 12, rect.y + 182))
         for key, btn in self._settings_api_buttons(rect):
             active = self.api_pref == key
             pygame.draw.rect(surf, SELECT_BG if active else (33, 36, 44), btn,
@@ -4052,11 +4088,11 @@ class Editor:
             surf.blit(lab, (btn.x + (btn.width - lab.get_width()) // 2, btn.y + 4))
 
         active_lab = self.font_small.render(f"Active: {self._active_api()}", True, TEXT_DIM)
-        surf.blit(active_lab, (rect.x + 12, rect.y + 210))
+        surf.blit(active_lab, (rect.x + 12, rect.y + 232))
 
-    def _draw_settings_slider(self, surf, rect, which, label, value, lo, hi) -> None:
+    def _draw_settings_slider(self, surf, rect, label, value, lo, hi) -> None:
         import pygame
-        row = self._settings_slider_row(rect, which)
+        row = self._settings_slider_row(rect)
         surf.blit(self.font_small.render(label, True, TEXT_DIM), (row.x, row.y + 5))
         x0, x1 = self._settings_slider_track(row)
         cy = row.y + row.height // 2
@@ -5908,7 +5944,11 @@ def main() -> None:
     height = args.height if args.height is not None else settings.get("height", 810)
     pixel_scale = (args.pixel_scale if args.pixel_scale is not None
                    else settings.get("pixel_scale", 4))
-    max_fps = settings.get("max_fps", 120)
+    # 0 == uncapped, the new default for a fresh install (no settings.json /
+    # no max_fps key yet); an old settings.json with an integer max_fps
+    # (e.g. 120, from the pre-uncap slider) needs no migration -- it's
+    # already a plain int and loads/works exactly as before.
+    max_fps = settings.get("max_fps", 0)
     fullscreen = bool(settings.get("fullscreen", False)) and not args.headless
 
     api_mode = "dx12"
