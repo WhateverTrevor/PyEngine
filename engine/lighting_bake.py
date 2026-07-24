@@ -48,6 +48,10 @@ class LightingSnapshot:
     on the main thread. `bake()` reads only this -- no scene/tracer access."""
     geom_version: int
     occ: tuple                  # (v0, e1, e2, occ_centroids) world occluder soup
+    occ_bvh: object             # BVH over occ (engine.bvh.BVH), or None at/below
+                                 # BVH_THRESHOLD -- built by ShadowTracer.refresh(),
+                                 # read-only here (immutable numpy arrays, safe to
+                                 # hand to the worker thread untouched)
     occ_face_ids: np.ndarray    # per-occluder-triangle -> coarse caster-face id
     receivers: list             # [(entity, centroids, normals), ...] shadow_mesh() granularity
     caster_ids: set             # {id(entity), ...} subset of receivers that cast shadows/bounce GI
@@ -130,7 +134,8 @@ def snapshot_scene(scene, tracer) -> LightingSnapshot:
                   "intensity": gi_cfg_raw.get("intensity", 1.0)}
 
     return LightingSnapshot(
-        geom_version=tracer._world_version, occ=tracer._occ, occ_face_ids=tracer._occ_face_ids,
+        geom_version=tracer._world_version, occ=tracer._occ, occ_bvh=tracer._occ_bvh,
+        occ_face_ids=tracer._occ_face_ids,
         receivers=receivers, caster_ids=caster_ids, caster_albedo=caster_albedo,
         sun=sun, lights=lights, gi_cfg=gi_cfg,
         mkeys=mkeys, light_lkeys=light_lkeys, sun_lkey=sun_lkey)
@@ -157,14 +162,15 @@ def bake(snapshot: LightingSnapshot) -> BakeResult:
             active = lambert > 1e-3
             sun_factors[entity] = _directional_shadow_math(
                 occ, snapshot.sun["dir"], snapshot.sun["softness"], snapshot.sun["samples"],
-                centroids, normals, active)
+                centroids, normals, active, bvh=snapshot.occ_bvh)
         for info in snapshot.lights:
             strength = _face_light_strength(info, normals, centroids)
             active = strength > 1e-3
             if active.any() and info.light.cast_shadows:
                 light_factors[(entity, info.light)] = _point_shadow_math(
                     occ, info.pos, info.light.radius, info.light.range,
-                    info.light.shadow_samples, centroids, normals, active)
+                    info.light.shadow_samples, centroids, normals, active,
+                    bvh=snapshot.occ_bvh)
 
     gi = {}
     gi_concat = np.zeros((0, 3), dtype=np.float32)
@@ -214,7 +220,8 @@ def bake(snapshot: LightingSnapshot) -> BakeResult:
 
             gi_concat = _gi_math(occ, snapshot.occ_face_ids, albedo_c, direct_c,
                                  receivers_c, receivers_n,
-                                 snapshot.gi_cfg["samples"], snapshot.gi_cfg["intensity"])
+                                 snapshot.gi_cfg["samples"], snapshot.gi_cfg["intensity"],
+                                 bvh=snapshot.occ_bvh)
             gi = {id(e): gi_concat[start:start + m] for e, start, m in gi_entity_ranges}
 
     return BakeResult(

@@ -20,9 +20,18 @@ import math
 
 import numpy as np
 
+from .bvh import any_hit as _bvh_any_hit
+from .bvh import build_bvh
+from .bvh import nearest as _bvh_nearest
+
 _RAY_CHUNK = 128       # rays per Moller-Trumbore batch (bounds temp memory)
 _ORIGIN_OFFSET = 0.02  # push ray origins off the surface to avoid self-hits
 _RECEIVER_INTERVAL = 3  # frames a moving receiver may reuse its cached shadows
+BVH_THRESHOLD = 256    # occluder triangle count above which _intersect_any/
+                       # _nearest_hit_faces route through engine/bvh.py
+                       # instead of the dense (rays x triangles) arrays below;
+                       # <= threshold keeps every existing low-poly scene on
+                       # the untouched brute-force path (byte-identical).
 
 
 def _is_translucent(entity) -> bool:
@@ -70,8 +79,17 @@ def hemisphere_samples(n: int) -> np.ndarray:
     return np.stack([x, y, z], axis=-1)
 
 
-def _intersect_any(origins, dirs, max_t, v0, e1, e2) -> np.ndarray:
-    """For each ray, is anything hit before max_t? (R,) bool."""
+def _intersect_any(origins, dirs, max_t, v0, e1, e2, bvh=None) -> np.ndarray:
+    """For each ray, is anything hit before max_t? (R,) bool.
+
+    When `bvh` is given (occluder count above BVH_THRESHOLD -- see
+    `build_bvh_for_occ`), traversal routes through engine/bvh.py instead of
+    the dense (rays x triangles) arrays below; `v0`/`e1`/`e2` go unused in
+    that branch (kept for call-site symmetry). `bvh is None` leaves this
+    function's body completely untouched, so the <=threshold brute-force
+    path stays byte-identical to before this module had a BVH at all."""
+    if bvh is not None:
+        return _bvh_any_hit(bvh, origins, dirs, max_t)
     blocked = np.zeros(len(origins), dtype=bool)
     if len(v0) == 0:
         return blocked
@@ -116,41 +134,61 @@ def _intersect_nearest(origin, direction, v0, e1, e2) -> float | None:
 
 def _point_shadow_math(occ, light_pos: np.ndarray, radius: float, rng: float,
                        samples_n: int, centroids: np.ndarray, normals: np.ndarray,
-                       active: np.ndarray) -> np.ndarray:
+                       active: np.ndarray, bvh=None) -> np.ndarray:
     """Pure core of point/spot soft-shadow tracing -- no cache, no `self`.
     `occ` is the (v0, e1, e2, centroids) occluder soup. Extracted verbatim
     from `ShadowTracer.shadow_factors` so that method's cache wrapper and
     `lighting_bake.bake`'s whole-scene, off-render-loop pass share one
-    implementation (see lighting_bake.py's module docstring)."""
+    implementation (see lighting_bake.py's module docstring).
+
+    `bvh` (built once per occluder-soup version above BVH_THRESHOLD -- see
+    `build_bvh_for_occ`) is `None` for every scene at/below the threshold,
+    in which case this function is EXACTLY what it always was (the `else`
+    branch below, byte-identical). Above threshold, the distance-based
+    `near` occluder prefilter is skipped in favor of querying the BVH
+    against the full soup directly: the BVH's own spatial traversal already
+    prunes far-away triangles faster than that linear cull approximates, so
+    re-deriving the same prefilter first would be redundant work."""
     factors = np.ones(len(centroids))
     idx = np.nonzero(active)[0]
     v0, e1, e2, occ_c = occ
     if len(idx) == 0 or len(v0) == 0:
         return factors
-    reach = rng + radius + 1.0
-    near = np.linalg.norm(occ_c - light_pos, axis=1) < reach
-    ov0, oe1, oe2 = v0[near], e1[near], e2[near]
-    if len(ov0) == 0:
-        return factors
     origins = centroids[idx] + normals[idx] * _ORIGIN_OFFSET
     samples = light_pos + sphere_samples(samples_n) * radius
     hits = np.zeros(len(idx))
-    for s in samples:
-        d = s - origins
-        dist = np.linalg.norm(d, axis=1)
-        dist = np.maximum(dist, 1e-9)
-        blocked = _intersect_any(origins, d / dist[:, None], dist - 0.05, ov0, oe1, oe2)
-        hits += blocked
+    if bvh is not None:
+        for s in samples:
+            d = s - origins
+            dist = np.maximum(np.linalg.norm(d, axis=1), 1e-9)
+            blocked = _intersect_any(origins, d / dist[:, None], dist - 0.05,
+                                     v0, e1, e2, bvh=bvh)
+            hits += blocked
+    else:
+        reach = rng + radius + 1.0
+        near = np.linalg.norm(occ_c - light_pos, axis=1) < reach
+        ov0, oe1, oe2 = v0[near], e1[near], e2[near]
+        if len(ov0) == 0:
+            return factors
+        for s in samples:
+            d = s - origins
+            dist = np.linalg.norm(d, axis=1)
+            dist = np.maximum(dist, 1e-9)
+            blocked = _intersect_any(origins, d / dist[:, None], dist - 0.05, ov0, oe1, oe2)
+            hits += blocked
     factors[idx] = 1.0 - hits / len(samples)
     return factors
 
 
 def _directional_shadow_math(occ, direction: np.ndarray, softness_deg: float, samples_n: int,
                              centroids: np.ndarray, normals: np.ndarray, active: np.ndarray,
-                             max_t: float = 500.0) -> np.ndarray:
+                             max_t: float = 500.0, bvh=None) -> np.ndarray:
     """Pure core of directional (sun) soft-shadow tracing -- no cache, no
     `self`. Extracted verbatim from `ShadowTracer.directional_shadow_factors`
-    (see `_point_shadow_math`'s docstring for why)."""
+    (see `_point_shadow_math`'s docstring for why, and for the `bvh`
+    contract -- this function already used the full soup with no distance
+    prefilter, so passing `bvh` through changes no behavior beyond routing
+    the intersection test itself)."""
     factors = np.ones(len(centroids))
     idx = np.nonzero(active)[0]
     v0, e1, e2, _occ_c = occ
@@ -170,7 +208,7 @@ def _directional_shadow_math(occ, direction: np.ndarray, softness_deg: float, sa
         d = to_light + tx * (ox * radius) + ty * (oy * radius)
         d = d / max(np.linalg.norm(d), 1e-12)
         d_b = np.broadcast_to(d, (len(idx), 3))
-        blocked = _intersect_any(origins, d_b, max_t_arr, v0, e1, e2)
+        blocked = _intersect_any(origins, d_b, max_t_arr, v0, e1, e2, bvh=bvh)
         hits += blocked
     factors[idx] = 1.0 - hits / max(samples_n, 1)
     return factors
@@ -178,7 +216,7 @@ def _directional_shadow_math(occ, direction: np.ndarray, softness_deg: float, sa
 
 def _gi_math(occ, tri_face_id: np.ndarray, albedo_c: np.ndarray, direct_c: np.ndarray,
             centroids_r: np.ndarray, normals_r: np.ndarray, samples_n: int,
-            intensity: float) -> np.ndarray:
+            intensity: float, bvh=None) -> np.ndarray:
     """Pure core of one-bounce GI hemisphere sampling -- no cache, no
     `self`. Extracted verbatim from `GITracer.compute` (see
     `_point_shadow_math`'s docstring for why); `tri_face_id`/`albedo_c`/
@@ -196,7 +234,7 @@ def _gi_math(occ, tri_face_id: np.ndarray, albedo_c: np.ndarray, direct_c: np.nd
     accum = np.zeros((offset, 3), dtype=np.float64)
     for lx, ly, lz in local:
         dirs = tangent * lx + bitangent * ly + normals_r * lz
-        hit_face = _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id)
+        hit_face = _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id, bvh=bvh)
         valid = hit_face >= 0
         if valid.any():
             hf = hit_face[valid]
@@ -204,9 +242,14 @@ def _gi_math(occ, tri_face_id: np.ndarray, albedo_c: np.ndarray, direct_c: np.nd
     return (intensity * accum / max(samples_n, 1)).astype(np.float32)
 
 
-def _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id, max_t=200.0):
-    """Nearest-hit face id per ray (mapped through `tri_face_id`), or -1."""
+def _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id, max_t=200.0, bvh=None):
+    """Nearest-hit face id per ray (mapped through `tri_face_id`), or -1.
+
+    `bvh`/byte-identical-when-None contract mirrors `_intersect_any` above."""
     n = len(origins)
+    if bvh is not None:
+        tri_idx, _t = _bvh_nearest(bvh, origins, dirs, max_t)
+        return np.where(tri_idx >= 0, tri_face_id[np.maximum(tri_idx, 0)], -1)
     out = np.full(n, -1, dtype=np.int64)
     if len(v0) == 0:
         return out
@@ -229,6 +272,17 @@ def _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id, max_t=200.0):
         valid = np.isfinite(t_masked[np.arange(len(o)), j])
         out[i:i + _RAY_CHUNK] = np.where(valid, tri_face_id[j], -1)
     return out
+
+
+def build_bvh_for_occ(occ):
+    """Build (or skip) a BVH for the `occ` = (v0, e1, e2, centroids) soup,
+    gated on BVH_THRESHOLD: low-poly soups return None so every caller's
+    `bvh=None` byte-identical brute-force path stays in effect and no build
+    cost is ever paid for scenes that don't need one."""
+    v0, e1, e2, _centroids = occ
+    if len(v0) <= BVH_THRESHOLD:
+        return None
+    return build_bvh(v0, e1, e2)
 
 
 def _world_triangles(entity, mesh=None):
@@ -260,6 +314,7 @@ class ShadowTracer:
     def __init__(self):
         self.frame = 0
         self._occ = None            # (v0, e1, e2, centroids) world-space soup
+        self._occ_bvh = None        # BVH over _occ, or None at/below BVH_THRESHOLD
         self._occ_face_ids = None   # per-triangle -> global caster-face id (for GI)
         self._caster_mats = {}      # id(entity) -> matrix bytes
         self._world_version = -1
@@ -314,6 +369,7 @@ class ShadowTracer:
             occ_face_ids = np.zeros((0,), dtype=np.int64)
         centroids = v0 + (e1 + e2) / 3.0
         self._occ = (v0, e1, e2, centroids)
+        self._occ_bvh = build_bvh_for_occ(self._occ)  # built once per soup version
         self._occ_face_ids = occ_face_ids
         self._caster_mats = mats
         self._world_version += 1
@@ -368,7 +424,8 @@ class ShadowTracer:
             return cached["factors"] if cached is not None else np.ones(len(centroids))
 
         factors = _point_shadow_math(self._occ, light_pos, light.radius, light.range,
-                                     light.shadow_samples, centroids, normals, active)
+                                     light.shadow_samples, centroids, normals, active,
+                                     bvh=self._occ_bvh)
 
         self._cache[key] = {"factors": factors, "world": self._world_version,
                             "m": mkey, "l": lkey, "frame": self.frame}
@@ -405,7 +462,8 @@ class ShadowTracer:
             return cached["factors"] if cached is not None else np.ones(len(centroids))
 
         factors = _directional_shadow_math(self._occ, direction, softness_deg, samples,
-                                           centroids, normals, active, max_t)
+                                           centroids, normals, active, max_t,
+                                           bvh=self._occ_bvh)
 
         self._cache[key] = {"factors": factors, "world": self._world_version,
                             "m": mkey, "l": lkey, "frame": self.frame}
@@ -522,7 +580,8 @@ class GITracer:
         centroids_r, normals_r = receiver_fn(receivers)
 
         self._result = _gi_math(tracer._occ, tracer._occ_face_ids, albedo_c, direct_c,
-                                centroids_r, normals_r, samples, intensity)
+                                centroids_r, normals_r, samples, intensity,
+                                bvh=tracer._occ_bvh)
         self._entity_ranges = ranges
         self._caster_list = casters
         self._world_version = tracer._world_version
