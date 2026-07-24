@@ -114,6 +114,96 @@ def _intersect_nearest(origin, direction, v0, e1, e2) -> float | None:
     return float(t[hit].min())
 
 
+def _point_shadow_math(occ, light_pos: np.ndarray, radius: float, rng: float,
+                       samples_n: int, centroids: np.ndarray, normals: np.ndarray,
+                       active: np.ndarray) -> np.ndarray:
+    """Pure core of point/spot soft-shadow tracing -- no cache, no `self`.
+    `occ` is the (v0, e1, e2, centroids) occluder soup. Extracted verbatim
+    from `ShadowTracer.shadow_factors` so that method's cache wrapper and
+    `lighting_bake.bake`'s whole-scene, off-render-loop pass share one
+    implementation (see lighting_bake.py's module docstring)."""
+    factors = np.ones(len(centroids))
+    idx = np.nonzero(active)[0]
+    v0, e1, e2, occ_c = occ
+    if len(idx) == 0 or len(v0) == 0:
+        return factors
+    reach = rng + radius + 1.0
+    near = np.linalg.norm(occ_c - light_pos, axis=1) < reach
+    ov0, oe1, oe2 = v0[near], e1[near], e2[near]
+    if len(ov0) == 0:
+        return factors
+    origins = centroids[idx] + normals[idx] * _ORIGIN_OFFSET
+    samples = light_pos + sphere_samples(samples_n) * radius
+    hits = np.zeros(len(idx))
+    for s in samples:
+        d = s - origins
+        dist = np.linalg.norm(d, axis=1)
+        dist = np.maximum(dist, 1e-9)
+        blocked = _intersect_any(origins, d / dist[:, None], dist - 0.05, ov0, oe1, oe2)
+        hits += blocked
+    factors[idx] = 1.0 - hits / len(samples)
+    return factors
+
+
+def _directional_shadow_math(occ, direction: np.ndarray, softness_deg: float, samples_n: int,
+                             centroids: np.ndarray, normals: np.ndarray, active: np.ndarray,
+                             max_t: float = 500.0) -> np.ndarray:
+    """Pure core of directional (sun) soft-shadow tracing -- no cache, no
+    `self`. Extracted verbatim from `ShadowTracer.directional_shadow_factors`
+    (see `_point_shadow_math`'s docstring for why)."""
+    factors = np.ones(len(centroids))
+    idx = np.nonzero(active)[0]
+    v0, e1, e2, _occ_c = occ
+    if len(idx) == 0 or len(v0) == 0:
+        return factors
+    to_light = -direction / max(np.linalg.norm(direction), 1e-12)
+    up = np.array([0.0, 1.0, 0.0]) if abs(to_light[1]) < 0.99 else np.array([1.0, 0.0, 0.0])
+    tx = np.cross(up, to_light)
+    tx /= max(np.linalg.norm(tx), 1e-12)
+    ty = np.cross(to_light, tx)
+    radius = math.tan(math.radians(max(softness_deg, 0.0)))
+    origins = centroids[idx] + normals[idx] * _ORIGIN_OFFSET
+    disk = disk_samples(max(samples_n, 1))
+    hits = np.zeros(len(idx))
+    max_t_arr = np.full(len(idx), max_t)
+    for ox, oy in disk:
+        d = to_light + tx * (ox * radius) + ty * (oy * radius)
+        d = d / max(np.linalg.norm(d), 1e-12)
+        d_b = np.broadcast_to(d, (len(idx), 3))
+        blocked = _intersect_any(origins, d_b, max_t_arr, v0, e1, e2)
+        hits += blocked
+    factors[idx] = 1.0 - hits / max(samples_n, 1)
+    return factors
+
+
+def _gi_math(occ, tri_face_id: np.ndarray, albedo_c: np.ndarray, direct_c: np.ndarray,
+            centroids_r: np.ndarray, normals_r: np.ndarray, samples_n: int,
+            intensity: float) -> np.ndarray:
+    """Pure core of one-bounce GI hemisphere sampling -- no cache, no
+    `self`. Extracted verbatim from `GITracer.compute` (see
+    `_point_shadow_math`'s docstring for why); `tri_face_id`/`albedo_c`/
+    `direct_c` describe the bounce-source (caster) soup, `centroids_r`/
+    `normals_r` the receivers being lit. Returns (R, 3) float32."""
+    offset = len(centroids_r)
+    v0, e1, e2, _occ_c = occ
+    local = hemisphere_samples(max(samples_n, 1))
+    up = np.where(np.abs(normals_r[:, 1:2]) < 0.99,
+                 np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
+    tangent = np.cross(up, normals_r)
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-12)
+    bitangent = np.cross(normals_r, tangent)
+    origins = centroids_r + normals_r * _ORIGIN_OFFSET
+    accum = np.zeros((offset, 3), dtype=np.float64)
+    for lx, ly, lz in local:
+        dirs = tangent * lx + bitangent * ly + normals_r * lz
+        hit_face = _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id)
+        valid = hit_face >= 0
+        if valid.any():
+            hf = hit_face[valid]
+            accum[valid] += (albedo_c[hf] / 255.0) * direct_c[hf]
+    return (intensity * accum / max(samples_n, 1)).astype(np.float32)
+
+
 def _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id, max_t=200.0):
     """Nearest-hit face id per ray (mapped through `tri_face_id`), or -1."""
     n = len(origins)
@@ -174,6 +264,10 @@ class ShadowTracer:
         self._caster_mats = {}      # id(entity) -> matrix bytes
         self._world_version = -1
         self._cache = {}            # (entity, light) -> cache dict
+        self._bake_pending = False  # True while LightingBakeManager has an async
+                                    # bake for the CURRENT world in flight -- see
+                                    # shadow_factors'/directional_shadow_factors'
+                                    # guard against tracing (and stalling) again
 
     def refresh(self, scene) -> bool:
         """Rebuild the world-space occluder soup if any shadow caster moved.
@@ -262,26 +356,19 @@ class ShadowTracer:
             if light.shadow_interval > 1 and age < light.shadow_interval:
                 return cached["factors"]
 
-        factors = np.ones(len(centroids))
-        idx = np.nonzero(active)[0]
-        v0, e1, e2, occ_c = self._occ
-        if len(idx) > 0 and len(v0) > 0:
-            # only occluders near the light can block its rays
-            reach = light.range + light.radius + 1.0
-            near = np.linalg.norm(occ_c - light_pos, axis=1) < reach
-            ov0, oe1, oe2 = v0[near], e1[near], e2[near]
-            if len(ov0) > 0:
-                origins = centroids[idx] + normals[idx] * _ORIGIN_OFFSET
-                samples = light_pos + sphere_samples(light.shadow_samples) * light.radius
-                hits = np.zeros(len(idx))
-                for s in samples:
-                    d = s - origins
-                    dist = np.linalg.norm(d, axis=1)
-                    dist = np.maximum(dist, 1e-9)
-                    blocked = _intersect_any(origins, d / dist[:, None],
-                                             dist - 0.05, ov0, oe1, oe2)
-                    hits += blocked
-                factors[idx] = 1.0 - hits / len(samples)
+        if self._bake_pending:
+            # a whole-scene bake for the CURRENT world is already computing
+            # off-thread (LightingBakeManager, engine/lighting_bake.py) --
+            # don't trace here too (that would be exactly the stall async
+            # mode exists to avoid). Serve the best data on hand and let
+            # the manager's eventual install_bake() refresh this entry;
+            # this can only under-shadow a BRAND NEW (entity, light) pair
+            # that has never been cached at all (falls back to fully lit
+            # until the next bake covers it).
+            return cached["factors"] if cached is not None else np.ones(len(centroids))
+
+        factors = _point_shadow_math(self._occ, light_pos, light.radius, light.range,
+                                     light.shadow_samples, centroids, normals, active)
 
         self._cache[key] = {"factors": factors, "world": self._world_version,
                             "m": mkey, "l": lkey, "frame": self.frame}
@@ -313,31 +400,42 @@ class ShadowTracer:
                     and age < _RECEIVER_INTERVAL:
                 return cached["factors"]
 
-        factors = np.ones(len(centroids))
-        idx = np.nonzero(active)[0]
-        v0, e1, e2, _occ_c = self._occ
-        if len(idx) > 0 and len(v0) > 0:
-            to_light = -direction / max(np.linalg.norm(direction), 1e-12)
-            up = np.array([0.0, 1.0, 0.0]) if abs(to_light[1]) < 0.99 else np.array([1.0, 0.0, 0.0])
-            tx = np.cross(up, to_light)
-            tx /= max(np.linalg.norm(tx), 1e-12)
-            ty = np.cross(to_light, tx)
-            radius = math.tan(math.radians(max(softness_deg, 0.0)))
-            origins = centroids[idx] + normals[idx] * _ORIGIN_OFFSET
-            disk = disk_samples(max(samples, 1))
-            hits = np.zeros(len(idx))
-            max_t_arr = np.full(len(idx), max_t)
-            for ox, oy in disk:
-                d = to_light + tx * (ox * radius) + ty * (oy * radius)
-                d = d / max(np.linalg.norm(d), 1e-12)
-                d_b = np.broadcast_to(d, (len(idx), 3))
-                blocked = _intersect_any(origins, d_b, max_t_arr, v0, e1, e2)
-                hits += blocked
-            factors[idx] = 1.0 - hits / max(samples, 1)
+        if self._bake_pending:
+            # see the identical guard in shadow_factors() above
+            return cached["factors"] if cached is not None else np.ones(len(centroids))
+
+        factors = _directional_shadow_math(self._occ, direction, softness_deg, samples,
+                                           centroids, normals, active, max_t)
 
         self._cache[key] = {"factors": factors, "world": self._world_version,
                             "m": mkey, "l": lkey, "frame": self.frame}
         return factors
+
+    def install_bake(self, result: "BakeResult") -> None:
+        """Seed `self._cache` with a whole-scene bake result (see
+        engine/lighting_bake.py's `bake`) so the very next `shadow_factors`/
+        `directional_shadow_factors` call for each (entity, light) pair in
+        the result finds a warm, matching cache entry and returns instantly
+        instead of tracing itself -- exactly as if that pair had just been
+        lazily computed and cached, only eagerly, for the whole scene at
+        once. Pairs NOT in the result (e.g. an entity added after this bake
+        was dispatched) are left alone -- their next lazy call is a normal
+        cache miss, bounded to just that one pair (see raytrace.py's
+        module docstring on cache invalidation).
+
+        Only ever called from the main thread (mutates `self._cache`); a
+        background bake worker (Milestone 2) computes `result` purely and
+        hands it back for THIS call to install at a safe point."""
+        frame = self.frame
+        world = self._world_version
+        for entity, factors in result.sun_factors.items():
+            self._cache[(entity, "sun")] = {"factors": factors, "world": world,
+                                            "m": result.mkeys.get(entity),
+                                            "l": result.sun_lkey, "frame": frame}
+        for (entity, light), factors in result.light_factors.items():
+            self._cache[(entity, light)] = {"factors": factors, "world": world,
+                                            "m": result.mkeys.get(entity),
+                                            "l": result.light_lkeys.get(light), "frame": frame}
 
 
 class GITracer:
@@ -393,6 +491,18 @@ class GITracer:
                 and self._world_version == tracer._world_version and self._key == key):
             return self._to_dict()
 
+        if tracer._bake_pending:
+            # a whole-scene bake for the CURRENT world is already computing
+            # off-thread (LightingBakeManager) -- don't recompute GI here
+            # too (the receivers/casters-list change above would otherwise
+            # force exactly the synchronous stall async mode exists to
+            # avoid, e.g. when a caster is freshly added). Serve whatever
+            # was last installed -- entities added/removed since simply
+            # won't appear in `_to_dict()`'s output (renderer treats a
+            # missing entry as "no GI yet", see `_gi_contrib`) until the
+            # in-flight bake's `install_bake()` lands.
+            return self._to_dict() if self._result is not None else {}
+
         ranges = []
         offset = 0
         for e in receivers:
@@ -410,27 +520,9 @@ class GITracer:
 
         albedo_c, direct_c = direct_fn(casters)[2:]
         centroids_r, normals_r = receiver_fn(receivers)
-        v0, e1, e2, _occ_c = tracer._occ
-        tri_face_id = tracer._occ_face_ids
 
-        local = hemisphere_samples(max(samples, 1))
-        up = np.where(np.abs(normals_r[:, 1:2]) < 0.99,
-                     np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
-        tangent = np.cross(up, normals_r)
-        tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-12)
-        bitangent = np.cross(normals_r, tangent)
-        origins = centroids_r + normals_r * _ORIGIN_OFFSET
-
-        accum = np.zeros((offset, 3), dtype=np.float64)
-        for lx, ly, lz in local:
-            dirs = tangent * lx + bitangent * ly + normals_r * lz
-            hit_face = _nearest_hit_faces(origins, dirs, v0, e1, e2, tri_face_id)
-            valid = hit_face >= 0
-            if valid.any():
-                hf = hit_face[valid]
-                accum[valid] += (albedo_c[hf] / 255.0) * direct_c[hf]
-
-        self._result = (intensity * accum / max(samples, 1)).astype(np.float32)
+        self._result = _gi_math(tracer._occ, tracer._occ_face_ids, albedo_c, direct_c,
+                                centroids_r, normals_r, samples, intensity)
         self._entity_ranges = ranges
         self._caster_list = casters
         self._world_version = tracer._world_version
@@ -440,3 +532,20 @@ class GITracer:
     def _to_dict(self) -> dict:
         return {id(e): self._result[start:start + m]
                for e, start, m in self._entity_ranges}
+
+    def install_bake(self, result: "BakeResult") -> None:
+        """Seed this GI cache with a whole-scene bake result (see
+        engine/lighting_bake.py) -- mirrors exactly what a successful
+        `compute()` assigns at its own tail, so the very next `compute()`
+        call (from whichever renderer backend owns this GITracer instance)
+        finds a warm, matching cache and returns instantly instead of
+        recomputing. A no-op when the bake ran with GI disabled (leaves any
+        prior GI cache untouched, matching `compute()` never being called
+        at all while `scene.gi["enabled"]` is False)."""
+        if result.gi_key is None:
+            return
+        self._result = result.gi_concat
+        self._entity_ranges = result.gi_entity_ranges
+        self._caster_list = result.gi_caster_list
+        self._world_version = result.geom_version
+        self._key = result.gi_key

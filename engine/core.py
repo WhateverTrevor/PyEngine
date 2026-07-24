@@ -24,6 +24,7 @@ import pygame
 
 from . import console_log
 from .input import InputManager
+from .lighting_bake import LightingBakeManager
 from .lod import update_scene_lods
 from .raytrace import ShadowTracer
 from .renderer import Renderer
@@ -119,6 +120,7 @@ class Engine:
         self._gl_ctx = None
         self._ui_prog = self._ui_vbo = self._ui_vao = self._ui_tex = None
         self.tracer = ShadowTracer()
+        self.bake_manager = LightingBakeManager()  # see lighting_bake.py
         self.max_fps = max_fps  # 0 == uncapped, see class docstring above
         self.fixed_dt = fixed_dt
         self.fps_smoother = FpsSmoother()  # smoothed HUD readout, see run()
@@ -334,7 +336,8 @@ class Engine:
         self._rebuild_window(size, enabled)
 
     def run(self, scene, camera, max_frames: int | None = None,
-            screenshot_path: str | None = None, overlay=None) -> None:
+            screenshot_path: str | None = None, overlay=None,
+            synchronous: bool = False) -> None:
         """Run the game loop until quit.
 
         Updates run on a fixed timestep (deterministic behaviors); rendering
@@ -346,7 +349,17 @@ class Engine:
         iteration in that mode (see `frame_dt` below), regardless of the
         real wall-clock time a headless iteration takes or of `max_fps`, so
         a benchmark run's scene.update sequence is bit-for-bit deterministic.
+
+        The lighting bake (`self.bake_manager`, see lighting_bake.py) is
+        also forced synchronous (blocking, no background thread) whenever
+        `max_frames is not None` OR `synchronous=True` -- benchmark/test
+        runs need every frame's lighting to be exactly what that frame's
+        world state produces, not "whatever finished baking by then."
+        Interactive play (`max_frames is None` and `synchronous=False`,
+        the default) bakes on a background thread instead -- see
+        `LightingBakeManager.update`.
         """
+        force_sync = max_frames is not None or synchronous
         self._end_splash()
         self.scene = scene  # behaviors (e.g. collision) may query the live scene
         clock = pygame.time.Clock()
@@ -406,21 +419,27 @@ class Engine:
                 self.input.consume_edges()
 
             tracer = None
-            baking = False
             if scene.enable_shadows:
-                if self.tracer.refresh(scene):
-                    # a rebuild happened -- the expensive part is NOT this
-                    # call (cheap occluder-soup rebuild) but the per-pixel
-                    # shadow_factors/GI recompute the render() call below
-                    # triggers once per light/entity whose cache just went
-                    # stale; bracket that so the console shows the hitch
-                    # (this can be several seconds for a big import) while
-                    # it's happening, not just after the fact.
+                self.tracer.refresh(scene)
+                # the expensive part is NOT refresh() (a cheap occluder-soup
+                # rebuild) but the per-face shadow/GI factor recompute a
+                # world/GI change now requires -- LightingBakeManager runs
+                # that, right here, instead of letting it happen lazily
+                # (and per-entity-fragmented) inside render() below (see
+                # lighting_bake.py). `force_sync` (benchmarks/tests) blocks
+                # exactly like the lazy path this replaced; interactive
+                # play dispatches a background thread instead, so a big
+                # scene change no longer stalls this frame -- the console
+                # messages below can now land several frames apart.
+                status = self.bake_manager.update(scene, self.tracer,
+                                                  self._active_gi_tracer(), force_sync)
+                if status["dispatched"]:
                     console_log.log_info(
                         f"Baking lighting ({self.tracer.occluder_triangle_count()} "
                         f"occluder triangles)...")
-                    bake_t0 = time.perf_counter()
-                    baking = True
+                if status["installed"] is not None:
+                    console_log.log_info(
+                        f"Lighting baked in {status['installed'].bake_seconds:.1f}s")
                 tracer = self.tracer
 
             # Distance-based LOD selection: once per rendered frame (not
@@ -462,9 +481,6 @@ class Engine:
                     self._draw_hud(hud_fps, scene)
                 if overlay is not None:
                     overlay(self)
-            if baking:
-                console_log.log_info(
-                    f"Lighting baked in {time.perf_counter() - bake_t0:.1f}s")
             pygame.display.flip()
             # Clock.tick(0) (pygame's own default) applies no delay at all --
             # that's "uncapped" -- so self.max_fps == 0 falls straight into
@@ -494,6 +510,18 @@ class Engine:
         if self.wgpu_renderer is not None:
             return self.wgpu_renderer.stats
         return self.renderer.stats
+
+    def _active_gi_tracer(self):
+        """The currently-active renderer backend's own `GITracer` instance.
+        Each backend (renderer/gl_renderer/wgpu_renderer) owns an
+        independent `GITracer`, unlike `self.tracer` (one shared
+        `ShadowTracer`) -- `LightingBakeManager.run_bake` installs into
+        whichever one is actually live."""
+        if self.gl_renderer is not None:
+            return self.gl_renderer._gi
+        if self.wgpu_renderer is not None:
+            return self.wgpu_renderer._gi
+        return self.renderer._gi
 
     def _save_screenshot(self, path: str) -> None:
         if self.gl_renderer is None:

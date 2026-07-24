@@ -6000,19 +6000,24 @@ def main() -> None:
     scene.add(engine.Entity("__camera").add_behavior(fly))
     scene.add(engine.Entity("__editor").add_behavior(EditorBehavior(editor)))
 
-    # trace the static lights' shadows now so the first frame doesn't hitch
+    # trace the static lights' shadows now so the first frame doesn't hitch --
+    # routed through the SAME LightingBakeManager engine/core.py's run loop
+    # uses (synchronous here: this is a one-shot loading-screen step, not
+    # the interactive loop, so blocking is fine and desired) so its `_last_*`
+    # change-detection stamps stay in sync -- run() must not see this as a
+    # "new" change and immediately dispatch a redundant bake on frame 1.
+    # Also warms whichever backend's GITracer will actually be live (GL/
+    # wgpu/CPU), not just the CPU renderer's own -- no render() call needed.
     eng.loading_step("pre-tracing shadows", 0.8)
-    import time as _time
-    _rebuilt = eng.tracer.refresh(scene)
-    if _rebuilt:
+    eng.tracer.refresh(scene)
+    _status = eng.bake_manager.update(scene, eng.tracer, eng._active_gi_tracer(), synchronous=True)
+    if _status["dispatched"]:
         engine.console_log.log_info(
             f"Baking lighting ({eng.tracer.occluder_triangle_count()} "
             f"occluder triangles)...")
-        _t0 = _time.perf_counter()
-    eng.renderer.render(pygame.Surface((320, 180)), scene, camera, eng.tracer)
-    if _rebuilt:
+    if _status["installed"] is not None:
         engine.console_log.log_info(
-            f"Lighting baked in {_time.perf_counter() - _t0:.1f}s")
+            f"Lighting baked in {_status['installed'].bake_seconds:.1f}s")
 
     eng.loading_step("opening world", 0.95)
     eng.esc_handler = editor.handle_escape
