@@ -348,6 +348,11 @@ class Editor:
                                      # 0 == pinned to the bottom (auto-scroll
                                      # follows new entries only while pinned)
         self.drag_asset = None
+        self.blueprint_press_pos = None  # mp at press-down for a blueprint tile
+                                     # (drag_asset is a BlueprintAsset) -- click
+                                     # vs place-drag is decided at release, see
+                                     # _route_panel_click / the drag_asset release
+                                     # handler in update()
         self.selected_asset = None  # AssetDef of the last-clicked grid tile, for Export
         # ---- content-browser folder tree ----
         self.selected_folder = None   # folder id, or None == root
@@ -2522,19 +2527,26 @@ class Editor:
         moves the copies, so they must start exactly where the originals
         were. The duplicates become the new selection; the duplicate of the
         previous ACTIVE element becomes the new active element (falls back
-        to the last duplicate if the previous active had no asset_name and
-        was skipped). Single-selection callers get exactly the old
-        one-entity behavior.
+        to the last duplicate if the previous active had no asset_name/
+        blueprint_name and was skipped -- including a blueprint instance
+        whose source blueprint was since deleted from the library).
+        Single-selection callers get exactly the old one-entity behavior.
         """
         Vec3 = self.engine_mod.Vec3
         nudge = 0.8 if offset else 0.0
-        srcs = [e for e in self.selection if e.asset_name is not None]
+        srcs = [e for e in self.selection if e.is_placed()]
         if not srcs:
             return
         prev_active = self.selected
         dups, active_dup = [], None
         for src in srcs:
-            dup = self.lib.instantiate(src.asset_name)
+            if src.asset_name is not None:
+                dup = self.lib.instantiate(src.asset_name)
+            else:
+                bp = self.lib.blueprint_by_name.get(src.blueprint_name)
+                if bp is None:  # source blueprint deleted since placement
+                    continue
+                dup = bp.instantiate(self.lib)
             t, s = dup.transform, src.transform
             t.position = Vec3(s.position.x + nudge, s.position.y, s.position.z + nudge)
             t.rotation = Vec3(s.rotation.x, s.rotation.y, s.rotation.z)
@@ -2548,7 +2560,7 @@ class Editor:
         self.dirty = True
 
     def _delete_selected(self) -> None:
-        targets = [e for e in self.selection if e.asset_name is not None]
+        targets = [e for e in self.selection if e.is_placed()]
         if not targets:
             return
         remaining = [e for e in self.selection if e not in targets]
@@ -2578,9 +2590,10 @@ class Editor:
         and behaviors/renderer iterate that exact object, so New/Open Scene
         can't just rebind self.scene — the entity list has to be cleared and
         refilled, and the editor-owned entities (flashlight, __camera,
-        __editor — identified by asset_name is None) carried over untouched.
+        __editor — identified by not e.is_placed(), i.e. neither asset_name
+        nor blueprint_name set) carried over untouched.
         """
-        editor_owned = [e for e in self.scene.entities if e.asset_name is None]
+        editor_owned = [e for e in self.scene.entities if not e.is_placed()]
         self.scene.entities.clear()
         self.scene.entities.extend(new_scene.entities)
         self.scene.entities.extend(editor_owned)
@@ -3364,10 +3377,21 @@ class Editor:
                 self.active_slider = None
 
         if self.drag_asset is not None and inp.mouse_button_released(1):
-            if not self._try_drop_material_slot(mp, layout):
+            is_bp_drag = (self.blueprint_press_pos is not None
+                         and isinstance(self.drag_asset, self.engine_mod.BlueprintAsset))
+            if is_bp_drag and math.hypot(mp[0] - self.blueprint_press_pos[0],
+                                         mp[1] - self.blueprint_press_pos[1]) < MARQUEE_THRESHOLD:
+                # never moved past the threshold -- plain click, open the editor
+                bp = self.drag_asset
+                if self.script_ui is None or self.script_ui.blueprint is not bp:
+                    if self.script_ui is not None:
+                        self.script_ui._save()  # persist any pending edits before switching
+                    self.script_ui = ScriptEditorUI(self, bp)
+            elif not self._try_drop_material_slot(mp, layout):
                 if not self.over_ui(mp):
                     self._place_asset(self.drag_asset, mp, w, h)
             self.drag_asset = None
+            self.blueprint_press_pos = None
 
         if inp.pressed(pygame.K_F2) and self.selected_folder is not None:
             self._begin_rename(self.selected_folder)
@@ -3494,14 +3518,18 @@ class Editor:
                     is_mat = isinstance(asset, self.engine_mod.MaterialAsset)
                     is_bp = isinstance(asset, self.engine_mod.BlueprintAsset)
                     if is_bp:
-                        # no double-click in this codebase -- a single click
-                        # both selects the tile AND opens the script editor
-                        # (mirrors the M-key-opens-material-editor precedent)
-                        if self.script_ui is None or self.script_ui.blueprint is not asset:
-                            if self.script_ui is not None:
-                                self.script_ui._save()  # persist any pending
-                                                         # edits before switching
-                            self.script_ui = ScriptEditorUI(self, asset)
+                        # No double-click in this codebase, but a blueprint
+                        # tile needs BOTH a plain-click action (open the
+                        # script editor) and a placeable drag -- so the
+                        # decision is deferred to release, same idiom as
+                        # marquee/_finish_marquee: press always sets
+                        # drag_asset (so a ghost icon follows the cursor and
+                        # release-over-viewport CAN place), but a release
+                        # that never moved past MARQUEE_THRESHOLD is treated
+                        # as the plain click and opens ScriptEditorUI
+                        # instead of placing (see the release handler).
+                        self.drag_asset = asset
+                        self.blueprint_press_pos = mp
                     elif is_mat or "texture" not in asset.data:  # textures aren't placeable
                         self.drag_asset = asset
 
@@ -3738,7 +3766,10 @@ class Editor:
             # mesh entity's Details material slot instead.
             return
         _, point = self._mouse_hit(mp, w, h)
-        entity = asset.instantiate()
+        # BlueprintAsset.instantiate needs the library to resolve its own
+        # components (unlike AssetDef.instantiate, which is self-contained).
+        is_bp = isinstance(asset, self.engine_mod.BlueprintAsset)
+        entity = asset.instantiate(self.lib) if is_bp else asset.instantiate()
         entity.transform.position = self.engine_mod.Vec3(
             float(point[0]), float(point[1]) + base_height(entity), float(point[2]))
         self.scene.add(entity)
@@ -3855,7 +3886,9 @@ class Editor:
 
         if self.drag_asset is not None:
             is_mat = isinstance(self.drag_asset, self.engine_mod.MaterialAsset)
-            icon = (self.mat_icons if is_mat else self.icons).get(self.drag_asset.name)
+            is_bp = isinstance(self.drag_asset, self.engine_mod.BlueprintAsset)
+            icon_src = self.mat_icons if is_mat else self.bp_icons if is_bp else self.icons
+            icon = icon_src.get(self.drag_asset.name)
             if icon is not None:
                 ghost = icon.copy()
                 ghost.set_alpha(150)
@@ -4451,7 +4484,8 @@ class Editor:
             surf.blit(self.font_small.render("select an entity", True, TEXT_DIM),
                       (rect.x + 10, rect.y + 8))
             return
-        head = f"{e.name}" + (f"  ({e.asset_name})" if e.asset_name else "")
+        tag_name = e.asset_name or e.blueprint_name
+        head = f"{e.name}" + (f"  ({tag_name})" if tag_name else "")
         avail = rect.width - 20
         tag = None
         if len(self.selection) > 1:
@@ -5498,6 +5532,11 @@ class ScriptEditorUI:
     STATUS_H = 40
     TAB_SPACES = "    "
 
+    # ---- Components tab layout ----
+    CARD_H = 92          # one component's card: header + 3 transform rows + padding
+    CARD_HEADER_H = 20
+    ADD_BTN_H = 26
+
     def __init__(self, editor: Editor, blueprint):
         self.editor = editor
         self.blueprint = blueprint
@@ -5514,8 +5553,21 @@ class ScriptEditorUI:
         self.error_line = (self.compile_result.get("line")
                            if self.compile_result and not self.compile_result.get("ok")
                            else None)
+        # ---- Components tab: posed-mesh composition (see class docstring) ----
+        self.tab = "script"           # "script" | "components"
+        self.comp_scroll = 0          # component index scrolled past (top of the list)
+        self.editing_comp_field = None  # (component_index, row_label, axis_index) or None
+        self.comp_edit_buffer = ""
+        self.add_picker_open = False  # "+ Add Component" asset-picker dropdown
+
+    def _set_tab(self, name: str) -> None:
+        if self.tab == "components":
+            self._commit_edit_comp_field()
+        self.tab = name
+        self.add_picker_open = False
 
     def close(self) -> None:
+        self._commit_edit_comp_field()
         self._save()
         self.editor.script_ui = None
 
@@ -5595,6 +5647,16 @@ class ScriptEditorUI:
         tb = self._toolbar_rect(w, h)
         cb = self._compile_btn_rect(w, h)
         return pygame.Rect(cb.right + 6, tb.y + 3, 60, 20)
+
+    def _script_tab_rect(self, w, h):
+        import pygame
+        tb = self._toolbar_rect(w, h)
+        return pygame.Rect(tb.right - 172, tb.y + 3, 70, 20)
+
+    def _components_tab_rect(self, w, h):
+        import pygame
+        tb = self._toolbar_rect(w, h)
+        return pygame.Rect(tb.right - 98, tb.y + 3, 92, 20)
 
     # ---- buffer editing ----
     def _clamp_caret(self) -> None:
@@ -5730,6 +5792,168 @@ class ScriptEditorUI:
             loc = ""
         return f"{r['stage']} error{loc}: {r['message']}", (230, 140, 140)
 
+    # ---- Components tab: list + add/remove/pose (see class docstring) ----
+    def _pickable_assets(self):
+        """Mesh-carrying AssetDefs -- the only things placeable as a posed
+        component this run (see BlueprintAsset.instantiate: mesh-only)."""
+        return [a for a in self.editor.lib.assets if "mesh" in a.data]
+
+    def _add_component(self, asset) -> None:
+        self.blueprint.components.append(
+            {"asset_name": asset.name, "position": [0.0, 0.0, 0.0],
+             "rotation": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]})
+        self.blueprint.save()
+
+    def _remove_component(self, index: int) -> None:
+        if 0 <= index < len(self.blueprint.components):
+            if (self.editing_comp_field is not None
+                    and self.editing_comp_field[0] == index):
+                self.editing_comp_field = None
+            del self.blueprint.components[index]
+            self.blueprint.save()
+
+    def _component_transform_rows(self, comp: dict):
+        """[{"label", "fields": [{"get","set"}, ...3]}, ...] for one
+        component dict's Position/Rotation(deg)/Scale -- same shape as
+        Editor._transform_rows (see that method's docstring), just sourced
+        from a plain JSON-ready list instead of a Transform's Vec3
+        attributes, since a blueprint component is stored as data, not a
+        live Transform. Rebuilt fresh on every call, same reason as
+        Editor._transform_rows: never goes stale across edits."""
+        def block(label, key, default, to_ui=lambda v: v, from_ui=lambda v: v):
+            fields = []
+            for i in range(3):
+                def get(key=key, i=i, default=default, to_ui=to_ui):
+                    return to_ui((comp.get(key) or default)[i])
+
+                def set_(v, key=key, i=i, default=default, from_ui=from_ui):
+                    vals = list(comp.get(key) or default)
+                    vals[i] = from_ui(v)
+                    comp[key] = vals
+                fields.append({"get": get, "set": set_})
+            return {"label": label, "fields": fields}
+
+        return [block("Position", "position", (0.0, 0.0, 0.0)),
+                block("Rotation", "rotation", (0.0, 0.0, 0.0), math.degrees, math.radians),
+                block("Scale", "scale", (1.0, 1.0, 1.0))]
+
+    def _add_component_btn_rect(self, w, h):
+        import pygame
+        area = self._text_area_rect(w, h)
+        return pygame.Rect(area.x + 6, area.y + 3, 150, self.ADD_BTN_H - 6)
+
+    def _component_list_rect(self, w, h):
+        import pygame
+        area = self._text_area_rect(w, h)
+        return pygame.Rect(area.x, area.y + self.ADD_BTN_H, area.width,
+                           max(0, area.height - self.ADD_BTN_H))
+
+    def _component_card_rect(self, w, h, row_index: int):
+        """`row_index` is the ON-SCREEN row (already scroll-adjusted) --
+        shared by draw + hit-test, same convention as
+        Editor._transform_field_rects."""
+        import pygame
+        list_rect = self._component_list_rect(w, h)
+        return pygame.Rect(list_rect.x + 4, list_rect.y + 4 + row_index * self.CARD_H,
+                           list_rect.width - 8, self.CARD_H - 6)
+
+    def _component_remove_btn_rect(self, card_rect):
+        import pygame
+        return pygame.Rect(card_rect.right - 20, card_rect.y + 2, 16, 16)
+
+    def _component_field_row_rect(self, card_rect, row_i: int):
+        import pygame
+        return pygame.Rect(card_rect.x + 4, card_rect.y + self.CARD_HEADER_H + row_i * 20,
+                           card_rect.width - 8, 18)
+
+    def _visible_component_cards(self, w, h):
+        """[(component_index, card_rect), ...] currently on screen --
+        single source of truth for both drawing and click hit-testing."""
+        list_rect = self._component_list_rect(w, h)
+        comps = self.blueprint.components
+        visible_n = max(1, list_rect.height // self.CARD_H)
+        self.comp_scroll = max(0, min(self.comp_scroll, max(0, len(comps) - 1)))
+        end = min(len(comps), self.comp_scroll + visible_n + 1)
+        return [(idx, self._component_card_rect(w, h, row_index))
+               for row_index, idx in enumerate(range(self.comp_scroll, end))]
+
+    def _add_picker_rect(self, w, h):
+        import pygame
+        btn = self._add_component_btn_rect(w, h)
+        n = len(self._pickable_assets())
+        item_h = 20
+        height = min(200, 6 + max(1, n) * item_h)
+        return pygame.Rect(btn.x, btn.bottom + 2, 240, height)
+
+    def _add_picker_item_rects(self, w, h):
+        import pygame
+        rect = self._add_picker_rect(w, h)
+        item_h = 20
+        assets = self._pickable_assets()
+        return [(a, pygame.Rect(rect.x + 2, rect.y + 3 + i * item_h, rect.width - 4, item_h))
+               for i, a in enumerate(assets)]
+
+    def _begin_edit_comp_field(self, key, value) -> None:
+        self._commit_edit_comp_field()
+        self.editing_comp_field = key
+        self.comp_edit_buffer = Editor._fmt_num(value)
+
+    def _commit_edit_comp_field(self) -> None:
+        if self.editing_comp_field is None:
+            return
+        index, label, axis_i = self.editing_comp_field
+        buf = self.comp_edit_buffer
+        self.editing_comp_field = None
+        if not (0 <= index < len(self.blueprint.components)):
+            return
+        try:
+            value = float(buf)
+        except ValueError:
+            return
+        comp = self.blueprint.components[index]
+        for row in self._component_transform_rows(comp):
+            if row["label"] == label:
+                row["fields"][axis_i]["set"](value)
+                self.blueprint.save()
+                return
+
+    def _update_edit_comp_field(self, inp) -> None:
+        import pygame
+        for ch in inp.take_text():
+            if ch.isdigit() or ch in "-.":
+                self.comp_edit_buffer += ch
+        if inp.pressed(pygame.K_BACKSPACE):
+            self.comp_edit_buffer = self.comp_edit_buffer[:-1]
+        if inp.pressed(pygame.K_RETURN) or inp.pressed(pygame.K_KP_ENTER) \
+                or inp.pressed(pygame.K_TAB):
+            self._commit_edit_comp_field()
+
+    def _click_components_area(self, mp, w, h) -> None:
+        add_btn = self._add_component_btn_rect(w, h)
+        if add_btn.collidepoint(mp):
+            self.add_picker_open = not self.add_picker_open
+            return
+        if self.add_picker_open:
+            for asset, r in self._add_picker_item_rects(w, h):
+                if r.collidepoint(mp):
+                    self._add_component(asset)
+                    self.add_picker_open = False
+                    return
+            self.add_picker_open = False  # click elsewhere dismisses it
+            return
+        for index, card_rect in self._visible_component_cards(w, h):
+            if self._component_remove_btn_rect(card_rect).collidepoint(mp):
+                self._remove_component(index)
+                return
+            comp = self.blueprint.components[index]
+            for row_i, row in enumerate(self._component_transform_rows(comp)):
+                row_rect = self._component_field_row_rect(card_rect, row_i)
+                for j, fr in enumerate(Editor._transform_field_rects(row_rect)):
+                    if fr.collidepoint(mp):
+                        self._begin_edit_comp_field((index, row["label"], j),
+                                                    row["fields"][j]["get"]())
+                        return
+
     # ---- interaction ----
     def update(self, engine, dt: float) -> None:
         import pygame
@@ -5761,10 +5985,17 @@ class ScriptEditorUI:
                     self._compile()
                 elif self._save_btn_rect(w, h).collidepoint(mp):
                     self._save()
+                elif self._script_tab_rect(w, h).collidepoint(mp):
+                    self._set_tab("script")
+                elif self._components_tab_rect(w, h).collidepoint(mp):
+                    self._set_tab("components")
                 elif title_bar.collidepoint(mp):
                     self.drag_title = (mp[0] - outer.x, mp[1] - outer.y)
-                elif self._code_rect(w, h).collidepoint(mp):
+                elif self.tab == "script" and self._code_rect(w, h).collidepoint(mp):
                     self._caret_from_mouse(mp, w, h)
+                elif (self.tab == "components"
+                     and self._text_area_rect(w, h).collidepoint(mp)):
+                    self._click_components_area(mp, w, h)
 
         if inp.mouse_held(1):
             if self.drag_title is not None:
@@ -5774,6 +6005,15 @@ class ScriptEditorUI:
             self.drag_title = None
 
         if self.minimized:
+            return
+
+        if self.tab == "components":
+            if self.editing_comp_field is not None:
+                self._update_edit_comp_field(inp)
+            if inp.wheel and self._component_list_rect(w, h).collidepoint(mp):
+                max_scroll = max(0, len(self.blueprint.components) - 1)
+                self.comp_scroll = max(0, min(
+                    self.comp_scroll - int(inp.wheel), max_scroll))
             return
 
         for ch in inp.take_text():
@@ -5850,6 +6090,33 @@ class ScriptEditorUI:
         slab = self.editor.font_small.render("Save", True, ACCENT)
         surf.blit(slab, (sb.x + (sb.width - slab.get_width()) // 2, sb.y + 4))
 
+        for name, rect in (("script", self._script_tab_rect(w, h)),
+                           ("components", self._components_tab_rect(w, h))):
+            active = self.tab == name
+            bg = (46, 50, 60) if active else (HOVER_BG if rect.collidepoint(mp) else (30, 32, 39))
+            pygame.draw.rect(surf, bg, rect, border_radius=4)
+            pygame.draw.rect(surf, ACCENT if active else PANEL_EDGE, rect, 1, border_radius=4)
+            lab = self.editor.font_small.render(name.capitalize(), True,
+                                                TEXT if active else TEXT_DIM)
+            surf.blit(lab, (rect.x + (rect.width - lab.get_width()) // 2, rect.y + 4))
+
+        if self.tab == "script":
+            self._draw_script(surf, w, h)
+        else:
+            self._draw_components(surf, w, h)
+
+        sr = self._status_rect(w, h)
+        pygame.draw.rect(surf, (22, 24, 29), sr)
+        pygame.draw.line(surf, PANEL_EDGE, (sr.x, sr.y), (sr.right, sr.y))
+        msg, color = self._status_text()
+        msg_surf = self.editor.font_small.render(msg[:120], True, color)
+        surf.blit(msg_surf, (sr.x + 8, sr.y + 6))
+        if self.dirty:
+            edited = self.editor.font_small.render("(edited since last save)", True, TEXT_DIM)
+            surf.blit(edited, (sr.right - edited.get_width() - 8, sr.y + 6))
+
+    def _draw_script(self, surf, w, h) -> None:
+        import pygame
         gutter = self._gutter_rect(w, h)
         code = self._code_rect(w, h)
         pygame.draw.rect(surf, (24, 26, 31), gutter)
@@ -5880,15 +6147,72 @@ class ScriptEditorUI:
             cx = code.x + 4 + self._char_w() * self.caret_col
             pygame.draw.line(surf, ACCENT, (cx, cy + 1), (cx, cy + line_h - 3), 2)
 
-        sr = self._status_rect(w, h)
-        pygame.draw.rect(surf, (22, 24, 29), sr)
-        pygame.draw.line(surf, PANEL_EDGE, (sr.x, sr.y), (sr.right, sr.y))
-        msg, color = self._status_text()
-        msg_surf = self.editor.font_small.render(msg[:120], True, color)
-        surf.blit(msg_surf, (sr.x + 8, sr.y + 6))
-        if self.dirty:
-            edited = self.editor.font_small.render("(edited since last save)", True, TEXT_DIM)
-            surf.blit(edited, (sr.right - edited.get_width() - 8, sr.y + 6))
+    def _draw_components(self, surf, w, h) -> None:
+        """Blueprint composition: the components list + each one's editable
+        Position/Rotation/Scale fields, laid out with the same field-rect
+        helper the Details panel uses (Editor._transform_field_rects) so
+        the two look and behave identically -- see class docstring."""
+        import pygame
+        mp = pygame.mouse.get_pos()
+        add_btn = self._add_component_btn_rect(w, h)
+        pygame.draw.rect(surf, HOVER_BG if add_btn.collidepoint(mp) else (33, 46, 36),
+                         add_btn, border_radius=4)
+        pygame.draw.rect(surf, BLUEPRINT_TILE_EDGE, add_btn, 1, border_radius=4)
+        alab = self.editor.font_small.render("+ Add Component", True, (150, 220, 165))
+        surf.blit(alab, (add_btn.x + (add_btn.width - alab.get_width()) // 2, add_btn.y + 4))
+
+        list_rect = self._component_list_rect(w, h)
+        clip = surf.get_clip()
+        surf.set_clip(list_rect)
+        if not self.blueprint.components:
+            empty = self.editor.font_small.render(
+                "no components -- Add Component to pose a mesh", True, TEXT_DIM)
+            surf.blit(empty, (list_rect.x + 8, list_rect.y + 8))
+        axis_labels = ("X", "Y", "Z")
+        for index, card_rect in self._visible_component_cards(w, h):
+            comp = self.blueprint.components[index]
+            pygame.draw.rect(surf, (26, 28, 34), card_rect, border_radius=3)
+            pygame.draw.rect(surf, PANEL_EDGE, card_rect, 1, border_radius=3)
+            name = str(comp.get("asset_name", "?"))
+            missing = comp.get("asset_name") not in self.editor.lib.by_name
+            name_color = (230, 140, 140) if missing else TEXT
+            label = self.editor.font_small.render(
+                f"{index + 1}. {name}" + ("  (missing!)" if missing else ""),
+                True, name_color)
+            surf.blit(label, (card_rect.x + 4, card_rect.y + 3))
+            rm = self._component_remove_btn_rect(card_rect)
+            pygame.draw.rect(surf, (60, 34, 34), rm, border_radius=3)
+            x_lab = self.editor.font_small.render("x", True, (230, 160, 160))
+            surf.blit(x_lab, (rm.x + 5, rm.y))
+            for row_i, row in enumerate(self._component_transform_rows(comp)):
+                row_rect = self._component_field_row_rect(card_rect, row_i)
+                rlab = self.editor.font_small.render(row["label"][:3], True, TEXT_DIM)
+                surf.blit(rlab, (row_rect.x, row_rect.y + 3))
+                for j, fr in enumerate(Editor._transform_field_rects(row_rect)):
+                    editing = self.editing_comp_field == (index, row["label"], j)
+                    bg = (16, 17, 21) if editing else (30, 32, 39)
+                    pygame.draw.rect(surf, bg, fr, border_radius=2)
+                    pygame.draw.rect(surf, ACCENT if editing else PANEL_EDGE, fr, 1,
+                                     border_radius=2)
+                    text = (self.comp_edit_buffer if editing
+                           else Editor._fmt_num(row["fields"][j]["get"]()))
+                    glyph = self.editor.font_small.render(f"{axis_labels[j]} {text}", True, TEXT)
+                    surf.blit(glyph, (fr.x + 3, fr.y + (fr.height - glyph.get_height()) // 2))
+        surf.set_clip(clip)
+
+        if self.add_picker_open:
+            rect = self._add_picker_rect(w, h)
+            pygame.draw.rect(surf, (26, 28, 34), rect, border_radius=4)
+            pygame.draw.rect(surf, PANEL_EDGE, rect, 1, border_radius=4)
+            items = self._add_picker_item_rects(w, h)
+            if not items:
+                empty = self.editor.font_small.render("no mesh assets available", True, TEXT_DIM)
+                surf.blit(empty, (rect.x + 6, rect.y + 4))
+            for asset, r in items:
+                if r.collidepoint(mp):
+                    pygame.draw.rect(surf, HOVER_BG, r)
+                lab = self.editor.font_small.render(asset.name[:28], True, TEXT)
+                surf.blit(lab, (r.x + 4, r.y + 3))
 
 
 class EditorBehavior:

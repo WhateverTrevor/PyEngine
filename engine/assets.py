@@ -30,7 +30,8 @@ from .environment import Environment, load_hdr
 from .lighting import DirectionalLight, Fog, FogVolume, PointLight, SpotLight, SunDisc
 from .materials import MaterialGraph
 from .math3d import Vec3
-from .scene import Entity, Scene
+from .mesh import merge_meshes
+from .scene import Entity, Scene, Transform
 
 _MESH_FACTORIES = {
     "cube": mesh_mod.cube,
@@ -166,20 +167,29 @@ class MaterialAsset:
 
 
 class BlueprintAsset:
-    """A Python-scriptable asset: pairs posed-mesh components (run 2 --
-    empty this run) with a script that defines a Behavior subclass, saved
-    to assets/blueprints/<name>.json. Created/opened from the content
-    browser's "+ Blueprint" button / tile click (editor.py's
-    ScriptEditorUI); compiled + bug-checked in-engine via
+    """A Python-scriptable asset: pairs posed-mesh components with a script
+    that defines a Behavior subclass, saved to assets/blueprints/<name>.json.
+    Created/opened from the content browser's "+ Blueprint" button / tile
+    click (editor.py's ScriptEditorUI); compiled + bug-checked in-engine via
     `engine.blueprint.compile_blueprint`, whose last result is persisted
     as `compile_result` so the browser tile / editor status strip can show
     ok/error without recompiling on load.
 
-    Schema (run 1; `components` stays [] until run 2 adds posed meshes --
-    {"asset_name", "position", "rotation", "scale"} per entry, additive,
-    no format change needed here):
-        {"name": str, "category": "blueprints", "components": [],
+    Schema:
+        {"name": str, "category": "blueprints",
+         "components": [{"asset_name": str, "position": [x, y, z],
+                          "rotation": [x, y, z], "scale": [x, y, z]}, ...],
          "script": "<python source>", "compile_result": dict | None}
+    `rotation` is Euler radians, same convention as `Transform.rotation`.
+
+    `instantiate()` resolves each component's `asset_name` through the
+    library, merges the posed meshes into ONE composite entity (see
+    `instantiate`'s own docstring for why one entity, not N) -- this run is
+    MESH-ONLY: a component asset's light/sun/fog_volume/environment aspects
+    are ignored entirely, only its LOD0 `.mesh` is used. Attaching the
+    compiled script's Behavior to the instantiated entity, and guarding
+    against infinite loops in that Behavior's update, are run 2b's job
+    (engine/blueprint.py's compile_blueprint), not this one's.
     """
 
     def __init__(self, data: dict, path: str):
@@ -198,6 +208,43 @@ class BlueprintAsset:
     def save(self) -> None:
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
+
+    def instantiate(self, library: "AssetLibrary", name: str | None = None) -> Entity:
+        """Resolve every component through `library.by_name`, pose + merge
+        their LOD0 meshes into one composite Mesh (see `merge_meshes` in
+        engine/mesh.py), and return a single Entity carrying it.
+
+        One entity, not N: engine/scene.py's Entity has no parent/child
+        hierarchy, so N loose entities would break the gizmo, selection,
+        save/load, and would leave run 2b's Behavior attach without a
+        single owner to attach to. A component naming a missing asset is
+        skipped (logged, never raised) so one bad component can't break
+        the whole blueprint. A blueprint with zero (usable) components
+        returns an entity with mesh=None -- callers (render_mesh,
+        base_height, etc.) already handle that for light-only/pseudo
+        entities, so this is not a new case for them.
+        """
+        entity = Entity(name or self.name)
+        entity.blueprint_name = self.name
+        parts = []
+        for comp in self.components:
+            asset_name = comp.get("asset_name")
+            asset = library.by_name.get(asset_name)
+            if asset is None:
+                from . import console_log
+                console_log.log_warn(
+                    f"blueprint '{self.name}': component asset "
+                    f"'{asset_name}' not found, skipping")
+                continue
+            comp_mesh = asset.instantiate().mesh
+            if comp_mesh is None:
+                continue
+            t = Transform(Vec3(*comp.get("position", (0.0, 0.0, 0.0))),
+                         Vec3(*comp.get("rotation", (0.0, 0.0, 0.0))),
+                         Vec3(*comp.get("scale", (1.0, 1.0, 1.0))))
+            parts.append((comp_mesh, t.matrix()))
+        entity.mesh = merge_meshes(parts)
+        return entity
 
 
 class AssetLibrary:
@@ -386,7 +433,7 @@ def _vec(v: Vec3) -> list[float]:
 
 
 def _entity_dict(e: Entity) -> dict:
-    d = {"asset": e.asset_name, "name": e.name,
+    d = {"asset": e.asset_name, "blueprint": e.blueprint_name, "name": e.name,
          "position": _vec(e.transform.position),
          "rotation": _vec(e.transform.rotation),
          "scale": _vec(e.transform.scale)}
@@ -425,8 +472,7 @@ def save_scene(scene: Scene, camera: Camera, path: str) -> None:
         "background": list(scene.background),
         "enable_shadows": scene.enable_shadows,
         "gi": dict(scene.gi),
-        "entities": [_entity_dict(e) for e in scene.entities
-                     if e.asset_name is not None],
+        "entities": [_entity_dict(e) for e in scene.entities if e.is_placed()],
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -454,7 +500,21 @@ def load_scene(path: str, library: AssetLibrary,
     )
     scene.gi = dict(data.get("gi", scene.gi))
     for spec in data.get("entities", []):
-        entity = library.instantiate(spec["asset"], spec.get("name"))
+        bp_name = spec.get("blueprint")
+        if bp_name is not None:
+            # blueprint instances live in library.blueprint_by_name, a
+            # separate lookup from library.by_name (plain AssetDefs) --
+            # BlueprintAsset.instantiate needs the library itself to
+            # resolve its own components, unlike AssetDef.instantiate.
+            bp = library.blueprint_by_name.get(bp_name)
+            if bp is None:
+                from . import console_log
+                console_log.log_warn(
+                    f"scene references missing blueprint '{bp_name}', skipping")
+                continue
+            entity = bp.instantiate(library, spec.get("name"))
+        else:
+            entity = library.instantiate(spec["asset"], spec.get("name"))
         t = entity.transform
         t.position = Vec3(*spec.get("position", [0, 0, 0]))
         t.rotation = Vec3(*spec.get("rotation", [0, 0, 0]))

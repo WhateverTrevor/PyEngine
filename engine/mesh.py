@@ -91,6 +91,81 @@ class Mesh:
         return self
 
 
+def merge_meshes(parts) -> "Mesh | None":
+    """Merge posed mesh parts into one composite Mesh.
+
+    `parts` is a list of (Mesh, 4x4 world matrix) pairs, matrix in the same
+    row-vector convention as everywhere else in the engine (`v @ M[:3,:3].T
+    + M[:3,3]`, see e.g. renderer.py's `_world_face_geometry`) -- pass
+    identity for "no additional pose". Returns None for an empty list.
+
+    Lives here (not engine/blueprint.py) because it's a general mesh
+    operation like the primitive builders above it, independently testable
+    and reusable outside the blueprint feature; engine/blueprint.py stays
+    focused on script compiling. Used by BlueprintAsset.instantiate
+    (engine/assets.py) to fold a blueprint's posed components into the
+    single entity the engine expects -- see that method's docstring for why
+    one entity, not N.
+
+    Every part Mesh already carries fully-materialized per-face arrays
+    (face_colors/face_uvs/face_roughness/face_metallic/face_emissive/
+    face_opacity) -- Mesh.__init__ always fills in its backward-compat
+    defaults at construction time, so there's never a "None" array to worry
+    about here; concatenating each part's already-realized arrays in the
+    same order as its (offset) faces keeps everything aligned by
+    construction. face_uvs is taken as-is (not recomputed) so each part
+    keeps its own box-projection/import UVs instead of one computed over
+    the composite's combined bounding box.
+
+    lod_meshes are intentionally NOT merged -- the composite always gets
+    lod_meshes=[] and relies on Entity.shadow_mesh()'s on-demand coarse-
+    proxy decimation (see scene.py) for high-poly shadow/GI occlusion.
+    Don't "fix" this by merging per-component LODs: the levels wouldn't
+    correspond face-for-face across differently posed parts.
+
+    A part matrix with a negative determinant (an odd number of negative
+    scale axes) mirrors the geometry, which flips the mathematical winding
+    of every face; such a part's faces are reversed here (both the padded-
+    quad and padded-triangle cases, distinctly) so the merged mesh's
+    normals still point outward everywhere -- Mesh._build() derives normals
+    from winding + transformed positions, not from a transformed normal
+    array, so this is the only correction negative scale needs.
+    """
+    if not parts:
+        return None
+    verts_out, faces_out = [], []
+    colors_out, uvs_out = [], []
+    rough_out, metal_out, emis_out, opac_out = [], [], [], []
+    vcount = 0
+    for part_mesh, matrix in parts:
+        verts_world = part_mesh.vertices @ matrix[:3, :3].T + matrix[:3, 3]
+        faces = part_mesh.faces.astype(np.int64) + vcount
+        if np.linalg.det(matrix[:3, :3]) < 0.0:
+            is_tri = faces[:, 2] == faces[:, 3]           # padding convention (see _build)
+            quad_rev = faces[:, [0, 3, 2, 1]]              # reverse a real quad's cycle
+            tri_rev = faces[:, [0, 2, 1, 1]]                # reverse + re-pad a triangle
+            faces = np.where(is_tri[:, None], tri_rev, quad_rev)
+        verts_out.append(verts_world)
+        faces_out.append(faces)
+        colors_out.append(part_mesh.face_colors)
+        uvs_out.append(part_mesh.face_uvs)
+        rough_out.append(part_mesh.face_roughness)
+        metal_out.append(part_mesh.face_metallic)
+        emis_out.append(part_mesh.face_emissive)
+        opac_out.append(part_mesh.face_opacity)
+        vcount += len(part_mesh.vertices)
+
+    vertices = np.concatenate(verts_out, axis=0)
+    faces = np.concatenate(faces_out, axis=0)
+    return Mesh(vertices, [tuple(int(i) for i in f) for f in faces],
+               face_colors=np.concatenate(colors_out, axis=0),
+               face_uvs=np.concatenate(uvs_out, axis=0),
+               face_roughness=np.concatenate(rough_out, axis=0),
+               face_metallic=np.concatenate(metal_out, axis=0),
+               face_emissive=np.concatenate(emis_out, axis=0),
+               face_opacity=np.concatenate(opac_out, axis=0))
+
+
 _UV_AXIS_PAIRS = {0: (1, 2), 1: (0, 2), 2: (0, 1)}  # dominant normal axis -> (u axis, v axis)
 
 

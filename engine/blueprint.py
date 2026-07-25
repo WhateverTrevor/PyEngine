@@ -1,8 +1,11 @@
 """Blueprint script compile + in-engine bug check.
 
 A Blueprint asset (`engine.assets.BlueprintAsset`) pairs posed-mesh
-components (run 2 -- empty this run) with a Python script that defines a
-`Behavior` subclass (see engine/scene.py). `compile_blueprint` is the
+components ({"asset_name", "position", "rotation", "scale"} per entry,
+merged into one composite entity by `BlueprintAsset.instantiate` -- see
+engine/mesh.py's `merge_meshes` and assets.py's BlueprintAsset docstring)
+with a Python script that defines a `Behavior` subclass (see
+engine/scene.py). `compile_blueprint` is the
 headline feature: it runs the script IN THIS PROCESS -- that's the intended
 design, this is the user's own engine -- but every stage is exception-
 isolated so a broken script can never crash or hang the editor. It's a

@@ -39,14 +39,21 @@ survival horror game. Repo: https://github.com/WhateverTrevor/PyEngine.
 
 ## Verification (run these as judge; all must pass before merging)
 
-The battery is now **25 suites** (`py tests\<name>.py`, each ends with an
-"ALL ... PASSED"/"JUDGE ... PASSED" line + exit 0). Name ALL of them in
+The battery is now **26 suites** (`py tests\<name>.py`). Name ALL of them in
 every engine-coder brief and run every one before merging:
 smoke_test, gl_checks, wgpu_checks, env_checks, window_checks, browser_checks,
 toolbar_checks, texture_checks, material_checks, mat_ui_checks, pbr_checks,
 transparency_checks, snap_checks, multiselect_checks, pivot_checks,
 marquee_checks, cursor_checks, docktab_checks, import_checks, lod_checks,
-blueprint_checks, console_checks, fps_checks, async_bake_checks, bvh_checks.
+blueprint_checks, console_checks, fps_checks, async_bake_checks, bvh_checks,
+bp_component_checks.
+
+- **Exit code is the pass signal.** Most suites also print an
+  "ALL ... PASSED"/"JUDGE ... PASSED" line, but `window_checks`,
+  `browser_checks` and `import_checks` print NO such line — they end on a
+  no-pollution guard / cleanup and signal success purely via exit 0. A
+  battery runner that greps for "PASSED" will report those three as false
+  failures (this bit one supervisor run).
 
 - UI/interaction tests MUST drive the real event path (pygame event
   injection through eng.input.process + editor.update), NOT direct handler
@@ -67,13 +74,19 @@ blueprint_checks, console_checks, fps_checks, async_bake_checks, bvh_checks.
 
 ## Known gaps / natural backlog
 
-- Blueprint POSED MESHES (run 2 of the blueprint feature): the
-  BlueprintAsset schema already has an (empty) `components` list; fill it
-  with {asset_name, position, rotation, scale} posed meshes + UI to compose
-  them, and instantiate a blueprint into the world with its compiled
-  Behavior attached and running (catch per-frame update errors). Also: NO
-  infinite-loop guard on script exec — a `while True:` hangs the editor
-  (worker-thread timeout is the fix).
+- Blueprint RUNTIME (run 2b, the remaining half of the blueprint feature):
+  posed-mesh `components` + composite instantiation + the compose UI
+  shipped in run 2a. Still TODO: attach the compiled Behavior to an
+  instantiated blueprint entity and run it per-frame with per-entity error
+  isolation (catch update errors, log once, disable a repeatedly-failing
+  behavior rather than spamming). Also: NO infinite-loop guard on script
+  exec — a `while True:` hangs the editor (worker-thread timeout is the
+  fix). Smaller follow-ups from 2a's review: blueprint instantiation is
+  MESH-ONLY (a component asset's light/sun/fog_volume/environment aspects
+  are ignored); an already-placed instance does not auto-update when its
+  blueprint changes; and `bp_component_checks` drives Ctrl+D/Del by
+  calling `_duplicate_selected`/`_delete_selected` directly instead of
+  through the real key path.
 - wgpu directional (sun) shadow attenuation on mesh faces (GL's dlShadowTex)
   — the last wgpu visual gap.
 - Per-pixel texturing (materials bake per-face; would unlock texture-mapped

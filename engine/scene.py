@@ -59,7 +59,10 @@ class Entity:
         self.material_asset = None       # name of the MaterialAsset this material was assigned from, or None
         self.sun = None                  # SunDisc: sky-disc + shadow tuning (see lighting.py)
         self.fog_volume = None           # FogVolume: local volumetric fog box (see lighting.py)
-        self.asset_name: str | None = None  # set when spawned from an asset file
+        self.asset_name: str | None = None  # set when spawned from an AssetDef
+        self.blueprint_name: str | None = None  # set when spawned from a BlueprintAsset
+                                          # (mutually exclusive with asset_name -- see
+                                          # BlueprintAsset.instantiate in engine/assets.py)
         # distance-based LOD (see engine/lod.py): `mesh` is always LOD0 --
         # collision, ray-traced shadows/GI, and gizmo/AABB math all keep
         # reading `.mesh` unchanged. `lod_meshes` are LOD1, LOD2, ... in
@@ -75,6 +78,16 @@ class Entity:
     def add_behavior(self, behavior: Behavior) -> "Entity":
         self.behaviors.append(behavior)
         return self
+
+    def is_placed(self) -> bool:
+        """True for a scene entity spawned from an AssetDef or a
+        BlueprintAsset, as opposed to an editor/behavior-internal entity
+        like __camera or the flashlight (asset_name AND blueprint_name both
+        None). Scene save/load, duplicate, delete, and New/Open Scene's
+        editor-owned-entity carryover all key off this distinction -- see
+        editor.py's _duplicate_selected/_delete_selected/
+        _replace_scene_content and assets.py's save_scene."""
+        return self.asset_name is not None or self.blueprint_name is not None
 
     def render_mesh(self) -> Mesh | None:
         """The mesh the rasterizer should draw this frame: `mesh` (LOD0)
