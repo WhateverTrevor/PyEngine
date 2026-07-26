@@ -8,9 +8,22 @@ smooth, image-based ambient light.
 """
 from __future__ import annotations
 
+import itertools
 import os
 
 import numpy as np
+
+# Monotonically increasing serial, bumped every time an Environment's
+# rendered `image` is (re)assigned -- see `Environment.__init__`/`set_image`.
+# The GPU backends' `_get_env_tex`/`_get_env_view` key their texture cache on
+# `env._image_id` instead of `id(env.image)`: CPython recycles freed array
+# addresses, so two `set_image` calls with no render in between (the sky
+# MaterialGraph's draft-then-release re-bake, see materials.py `apply`) can
+# land the second array on the first one's address, and an id()-keyed cache
+# would then treat the change as a no-op and keep showing the stale image.
+# A serial can never collide, so a version change is never missed. Mirrors
+# `mesh._mesh_id_counter` / `scene._entity_id_counter`.
+_env_image_id_counter = itertools.count()
 
 
 def load_hdr(path: str) -> np.ndarray:
@@ -133,6 +146,8 @@ class Environment:
 
     def __init__(self, image: np.ndarray, strength: float = 1.0):
         self.image = np.asarray(image, dtype=np.float32)
+        # GPU texture-cache identity -- see `_env_image_id_counter` above.
+        self._image_id = next(_env_image_id_counter)
         self.source = self.image.copy()
         self.strength = strength
         self._build_ambient_cube()
@@ -140,6 +155,7 @@ class Environment:
     def set_image(self, image: np.ndarray) -> None:
         """Swap the rendered equirect image and rebuild the ambient cube."""
         self.image = np.asarray(image, dtype=np.float32)
+        self._image_id = next(_env_image_id_counter)
         self._build_ambient_cube()
 
     def _build_ambient_cube(self) -> None:

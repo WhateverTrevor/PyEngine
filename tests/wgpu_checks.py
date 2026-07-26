@@ -589,4 +589,87 @@ print(f"12. cache identity regression OK: address recycling confirmed over 40 it
      f"small-cube red px range [{min(_cr_small)}, {max(_cr_small)}], large-cube range "
      f"[{min(_cr_large)}, {max(_cr_large)}] -- no false cache hit smeared sizes together")
 
+# 13. VERSION-STAMP REGRESSION: `_get_geo_cache`'s cache-HIT branch decides
+# whether to re-upload the color/pbr/opacity buffers by comparing a per-array
+# stamp against the mesh's CURRENT arrays. The stamp is now `mesh.
+# _color_version` (a monotonic counter bumped by the `face_colors` property
+# setter, see engine/mesh.py), not `id(mesh.face_colors)`. This is a
+# DIFFERENT hazard than #12's cache-KEY fix: here it's the SAME live mesh,
+# replaced TWICE with no render between (mesh.face_colors = B, then = C --
+# mirrors MaterialGraph.apply being called twice in a row while dragging a
+# material slider, materials.py `apply`/editor.py's MaterialEditorUI.update,
+# if the fixed-step accumulator fires update() twice before the next
+# render -- see core.py's `while accumulator >= self.fixed_dt`). The first
+# replacement (B) frees the array the cache last stamped (A); the second
+# (C) can then be allocated at A's now-freed address, so an id()-keyed
+# stamp would false-match "unchanged" and skip the buffer rebuild --
+# SILENTLY leaving the GPU showing A's stale colour, no exception at all
+# (inverted vs #12: a false MATCH, not a false HIT). This drives exactly
+# that shape and asserts the RENDERED colour reflects the latest
+# assignment, not that a version field merely exists. Verified against
+# pre-fix code (a `git worktree` of main @ 5d68517) during implementation:
+# this exact loop hit the false match at iteration 2 and rendered the STALE
+# red colour. Mirrors gl_checks.py's check #12.
+_VS_W, _VS_H = 160, 120
+_vs_cam = engine.Camera(position=engine.Vec3(0, 0, 4.5), yaw=0.0, pitch=0.0)
+_vs_sc = engine.Scene(light=engine.DirectionalLight(engine.Vec3(0, -1, 0),
+                                                    ambient=1.0, intensity=0.0))
+_vs_ent = engine.Entity("cube", mesh=engine.cube(2.0))
+_vs_sc.add(_vs_ent)
+_vs_mesh = _vs_ent.mesh
+_vs_n = len(_vs_mesh.faces)
+_VS_RED = (220.0, 20.0, 20.0)
+_VS_GREEN = (20.0, 220.0, 20.0)
+
+
+def _vs_paint(rgb):
+    return np.tile(np.array(rgb), (_vs_n, 1))
+
+
+def _vs_frame():
+    wr.render(_vs_sc, _vs_cam, (_VS_W, _VS_H))
+    return np.frombuffer(wr.read_frame(), np.uint8).reshape(
+        _VS_H, _VS_W, 4)[..., :3].astype(np.int64)
+
+
+def _vs_lit_mean(img):
+    lit = img[img.sum(axis=2) > 30]
+    return lit.mean(axis=0) if len(lit) else np.zeros(3)
+
+
+_vs_mesh.face_colors = _vs_paint(_VS_RED)
+_vs_frame()                                  # establishes the cache's stamp for the
+                                              # array now in mesh.face_colors (A)
+_vs_target_id = id(_vs_mesh.face_colors)     # A's id -- what the cache is now stamped with
+# Tight loop, NO render (and so no GPU-pipeline allocation churn) between attempts --
+# by test #13's point in this file, 12 earlier sections' allocation history has grown
+# CPython's free lists deep enough that a render-per-attempt design (gl_checks.py's
+# check #12 does this safely because it runs in isolation) takes far more than a few
+# attempts to land a NEW array back on A's specific freed address here. Holding the
+# render off entirely between attempts removes that noise and reliably converges much
+# faster, since each attempt's own alloc/free pair dominates recent free-list traffic.
+_vs_recycled = False
+_vs_attempts = 0
+for _vs_i in range(20000):
+    _vs_attempts += 1
+    _vs_mesh.face_colors = _vs_paint(_VS_GREEN)   # replacement 1: frees the live array
+    _vs_mesh.face_colors = _vs_paint(_VS_GREEN)   # replacement 2: may reuse a freed slot
+    if id(_vs_mesh.face_colors) == _vs_target_id:
+        _vs_recycled = True
+        break
+
+assert _vs_recycled, (
+    f"address recycling onto the cache-stamped array's original address never occurred "
+    f"in {_vs_attempts} no-render replacement attempts -- this run cannot validate the "
+    f"fix; re-run or raise the iteration count")
+_vs_m = _vs_lit_mean(_vs_frame())
+assert _vs_m[1] > _vs_m[0], (
+    f"VERSION-STAMP REGRESSION: after {_vs_attempts} no-render replacements, the current "
+    f"face_colors array landed back on the address the cache had stamped for the "
+    f"ORIGINAL (red) array, and the colour buffer was NOT rebuilt -- rendered mean RGB "
+    f"{_vs_m.round(1)} is still RED (stale), not the GREEN just assigned")
+print(f"13. version-stamp regression OK: address recycling onto the cache-stamped "
+     f"array's original address confirmed after {_vs_attempts} no-render replacement "
+     f"attempts; colour buffer correctly rebuilt (no stale render)")
+
 print("JUDGE DX12 CHECKS PASSED")

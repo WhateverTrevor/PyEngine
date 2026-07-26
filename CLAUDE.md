@@ -103,16 +103,20 @@ bp_component_checks, bp_runtime_checks.
   EXACT in wgpu_checks (both backends index the same per-face
   `directional_shadow_factors` output — no per-pixel resampling, so no
   float-divergence source). **wgpu is now at full visual parity with GL.**
-- GPU cache identity: `_geo_cache`/`_entity_uniform_cache` are FIXED (keyed
-  on a monotonic `Mesh._cache_id`/`Entity._cache_id`, not `id()`), with
-  regression tests in gl_checks #11 / wgpu_checks #12 that were proven to
-  fail against pre-fix code. **Still outstanding, same bug class on
-  arrays:** the `color_id`/`pbr_id`/`opacity_id` version stamps inside
-  `_get_geo_cache`'s cache-hit branch, and `_get_env_tex`'s
-  `id(env.image)`. The stamps' failure mode is INVERTED — a false match
-  means "unchanged, skip the rebuild", so a material change silently fails
-  to appear — and it is reachable because `MaterialGraph.apply` assigns new
-  arrays onto a surviving mesh.
+- GPU cache identity: FULLY FIXED, both levels. Cache KEYS use monotonic
+  `Mesh._cache_id`/`Entity._cache_id`; per-array VERSION STAMPS use
+  `Mesh._color_version`/`_pbr_version`/`_opacity_version` (bumped by
+  property setters on the five per-face arrays) and `Environment._image_id`.
+  Regression tests: gl_checks #11/#12, wgpu_checks #12/#13, all four proven
+  to fail against their pre-fix commits.
+  **Do not "simplify" any of these back to `id()`** — CPython recycles
+  addresses, and both failure modes were reproduced on both backends: a
+  false KEY hit crashes or renders wrong geometry, a false STAMP match
+  silently skips the rebuild (dragging a material slider could leave the
+  change not showing). Note the per-face arrays are PROPERTIES now: an
+  in-place write (`face_colors[:] = ...`) bypasses the setter and will NOT
+  bump the version. Nothing in engine/editor does that today (only test
+  setup) — keep it that way, or bump the counter explicitly.
 - Per-pixel texturing — PRE-SPLIT INTO 4 RUNS, run 1/4 DONE:
   1. [done] Per-corner UV foundation. `Mesh.corner_uvs` (M,4,2) parallel to
      `faces`; FBX import now preserves the per-polygon-vertex UVs it used

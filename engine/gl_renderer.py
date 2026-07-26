@@ -919,31 +919,43 @@ class GLRenderer:
                 (vbo_opacity, "1f", "in_opacity"),
                 (vbo_uv, "2f", "in_uv"),
             ])
+            # color/pbr/opacity_version stamp the mesh's own monotonic
+            # `_color_version`/`_pbr_version`/`_opacity_version` counters
+            # (see mesh.py's property setters), not id(mesh.face_colors) et
+            # al. id() alone is unsafe here the same way it was for the
+            # cache KEY (see `key` above): a replace-then-replace-again with
+            # no render between (e.g. MaterialGraph.apply called twice while
+            # dragging a material slider, if the fixed-step accumulator
+            # fires update() twice before the next render) frees the first
+            # array and can land the second allocation on its address, so an
+            # id()-keyed stamp would false-match and skip the rebuild --
+            # silently leaving the GPU buffer stale. A monotonic counter
+            # bumped on every replace-assignment can never collide, so a
+            # missed change is impossible regardless of what the allocator
+            # does with freed memory.
             cache = {"vbo_geom": vbo_geom, "vbo_color": vbo_color,
                      "vbo_pbr": vbo_pbr, "vbo_opacity": vbo_opacity,
                      "vbo_uv": vbo_uv, "vao": vao,
                      "count": pos.shape[0], "num_faces": m,
-                     "face_id_tri": face_id_tri, "color_id": id(mesh.face_colors),
-                     "pbr_id": (id(mesh.face_roughness), id(mesh.face_metallic),
-                                id(mesh.face_emissive)),
-                     "opacity_id": id(mesh.face_opacity)}
+                     "face_id_tri": face_id_tri,
+                     "color_version": mesh._color_version,
+                     "pbr_version": mesh._pbr_version,
+                     "opacity_version": mesh._opacity_version}
             self._geo_cache[key] = cache
         else:
-            if cache["color_id"] != id(mesh.face_colors):
+            if cache["color_version"] != mesh._color_version:
                 color = _build_color(mesh, cache["face_id_tri"])
                 cache["vbo_color"].write(color.tobytes())
-                cache["color_id"] = id(mesh.face_colors)
-            pbr_id = (id(mesh.face_roughness), id(mesh.face_metallic),
-                     id(mesh.face_emissive))
-            if cache["pbr_id"] != pbr_id:
+                cache["color_version"] = mesh._color_version
+            if cache["pbr_version"] != mesh._pbr_version:
                 rm, emissive = _build_pbr(mesh, cache["face_id_tri"])
                 pbr = np.concatenate([rm, emissive], axis=1)
                 cache["vbo_pbr"].write(np.ascontiguousarray(pbr).tobytes())
-                cache["pbr_id"] = pbr_id
-            if cache["opacity_id"] != id(mesh.face_opacity):
+                cache["pbr_version"] = mesh._pbr_version
+            if cache["opacity_version"] != mesh._opacity_version:
                 opacity = _build_opacity(mesh, cache["face_id_tri"])
                 cache["vbo_opacity"].write(np.ascontiguousarray(opacity).tobytes())
-                cache["opacity_id"] = id(mesh.face_opacity)
+                cache["opacity_version"] = mesh._opacity_version
         return cache
 
     def _prune_geo_cache(self, live_entities) -> None:
@@ -968,7 +980,13 @@ class GLRenderer:
             c["vbo_uv"].release()
 
     def _get_env_tex(self, env) -> "moderngl.Texture":
-        key = id(env.image)
+        # env._image_id, not id(env.image) -- same recycled-address hazard as
+        # the geometry cache's per-array stamps above: a sky MaterialGraph
+        # can call Environment.set_image twice with no render between (draft
+        # bake while dragging, full-res bake on release), and the second
+        # array can land on the first one's freed address. See
+        # environment.py's `_env_image_id_counter` for the monotonic fix.
+        key = env._image_id
         tex = self._env_tex_cache.get(key)
         if tex is None:
             for old in self._env_tex_cache.values():

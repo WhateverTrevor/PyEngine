@@ -45,6 +45,22 @@ class Mesh:
         # saved, or round-tripped through npz/pickling, so it has no effect
         # on equality assumptions or serialization elsewhere in the engine.
         self._cache_id = next(_mesh_id_counter)
+        # Per-array content versions -- see the `face_colors` etc. property
+        # setters below for why these exist instead of the GPU backends
+        # stamping `id(mesh.face_colors)` directly: an id() stamp compares
+        # sound only as long as CPython can't recycle a freed array's
+        # address onto an unrelated new array, which it can (two replace-
+        # ments with no render between, e.g. MaterialGraph.apply called
+        # twice while dragging a material slider). A monotonic counter can
+        # never collide, so it stays sound regardless of what the allocator
+        # does with freed memory. Zero-initialized here so the properties'
+        # setters (invoked below, during this same __init__) have somewhere
+        # to increment into.
+        self._color_version = 0
+        self._pbr_version = 0     # shared by roughness/metallic/emissive,
+                                   # matching the GPU caches' single combined
+                                   # "pbr" VBO/buffer for the three
+        self._opacity_version = 0
         self.vertices = np.asarray(vertices, dtype=np.float64)   # (N, 3)
         self._polys = [tuple(int(i) for i in f) for f in faces]
         if face_colors is None:
@@ -81,6 +97,62 @@ class Mesh:
         self._user_corner_uvs = (np.asarray(corner_uvs, dtype=np.float64)
                                  if corner_uvs is not None else None)
         self._build()
+
+    # face_colors/face_roughness/face_metallic/face_emissive/face_opacity are
+    # properties (not plain attributes) purely so a replace-assignment bumps
+    # the matching `_*_version` counter above -- every writer already uses
+    # plain `mesh.face_colors = new_array` (materials.py's MaterialGraph.
+    # apply, editor.py's icon-preview spheres, lod.py, assets.py's loader),
+    # so this is transparent to all of them. Reads are unaffected: `mesh.
+    # face_colors` still just returns the array. An IN-PLACE write (`mesh.
+    # face_colors[:] = ...`, which no engine/editor code path does -- only
+    # test setup, before any render/cache populates) bypasses the setter and
+    # so does not bump the version, same as it would not have changed
+    # id(mesh.face_colors) either -- not a regression versus the old scheme.
+    @property
+    def face_colors(self) -> np.ndarray:
+        return self._face_colors
+
+    @face_colors.setter
+    def face_colors(self, value) -> None:
+        self._face_colors = np.asarray(value, dtype=np.float64)
+        self._color_version += 1
+
+    @property
+    def face_roughness(self) -> np.ndarray:
+        return self._face_roughness
+
+    @face_roughness.setter
+    def face_roughness(self, value) -> None:
+        self._face_roughness = np.asarray(value, dtype=np.float64)
+        self._pbr_version += 1
+
+    @property
+    def face_metallic(self) -> np.ndarray:
+        return self._face_metallic
+
+    @face_metallic.setter
+    def face_metallic(self, value) -> None:
+        self._face_metallic = np.asarray(value, dtype=np.float64)
+        self._pbr_version += 1
+
+    @property
+    def face_emissive(self) -> np.ndarray:
+        return self._face_emissive
+
+    @face_emissive.setter
+    def face_emissive(self, value) -> None:
+        self._face_emissive = np.asarray(value, dtype=np.float64)
+        self._pbr_version += 1
+
+    @property
+    def face_opacity(self) -> np.ndarray:
+        return self._face_opacity
+
+    @face_opacity.setter
+    def face_opacity(self, value) -> None:
+        self._face_opacity = np.asarray(value, dtype=np.float64)
+        self._opacity_version += 1
 
     def _build(self) -> None:
         padded, tris = [], []
