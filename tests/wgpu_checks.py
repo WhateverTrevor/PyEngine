@@ -1,5 +1,15 @@
 """Judge checks for the wgpu backend: DX12 parity vs GL/CPU + correctness.
 
+The directional (sun) shadow attenuation check (right after "dx12 sun disc
+OK") renders a Sun entity WITH a tracer -- the sun disc check above it
+never does, so it only exercises the sky disc, not `dl_shadow_tex`. Parity
+vs GL is asserted exact (not toleranced): both backends index the same
+`tracer.directional_shadow_factors` output at face granularity, with no
+per-pixel resampling to introduce float divergence. Non-vacuous by
+construction: forcing `shadow_depth` to 0 on the same scene/tracer must
+make the wall's shadow disappear, or the exact-parity assertion would pass
+trivially on a scene that doesn't actually shadow anything.
+
 Sections 8-11 cover per-pixel texturing run 4/4 (wgpu/dx12), mirroring
 gl_checks.py's sections 7-10 (its run 3/4 equivalent): a byte-identical-
 with-main regression gate for untextured scenes (engine/wgpu_renderer.py's
@@ -153,6 +163,61 @@ img_sun_dx2 = np.frombuffer(wr.read_frame(), np.uint8).reshape(H, W, 4)[..., :3]
 xb_dx, _ = bright_x(img_sun_dx2)
 assert abs(xa_dx - xb_dx) > 25, f"dx12 sun disc did not track rotation ({xa_dx} -> {xb_dx})"
 print(f"dx12 sun disc OK: peak {la_dx:.0f} (gl {la_gl:.0f}), moved x {xa_dx} -> {xb_dx}")
+
+# ---------------------------------------------------------------------
+# directional (sun) SHADOW ATTENUATION (dl_shadow_tex): the sun disc test
+# above renders with NO tracer, so it exercises the sky disc only -- this
+# is the first check that renders a Sun entity WITH a tracer, i.e. the
+# actual dl_shadow_tex path added to WgpuRenderer. Floor + wall occluder +
+# a low sun, same scene/camera used to independently measure the fix (a
+# `git worktree` of main @29c5ab0 gave GL-vs-dx12 mean=1.628/4.16% px
+# differing here, pre-fix; this branch gives byte-identical).
+# ---------------------------------------------------------------------
+sun_shadow_sc = engine.Scene(light=engine.DirectionalLight(engine.Vec3(0.6, -1.0, 0.0),
+                                                            ambient=0.12))
+sun_ent = lib.instantiate("Sun")
+sun_ent.transform.rotation = engine.Vec3(-0.7, 1.6, 0.0)
+sun_shadow_sc.add(sun_ent)
+sun_floor = engine.Entity("floor", mesh=engine.checkerboard(16, 0.5))
+sun_floor.casts_shadow = False
+sun_shadow_sc.add(sun_floor)
+sun_shadow_sc.add(engine.Entity("wall", mesh=engine.box(0.4, 2.5, 4.0),
+                                position=engine.Vec3(0, 1.25, 0)))
+sun_shadow_sc.update(1 / 60, _EngStub(sun_shadow_sc))  # sync scene.light.direction from the Sun entity
+cam_sunshadow = engine.Camera(position=engine.Vec3(0, 4.0, 6.5), pitch=-0.55)
+sun_tracer = engine.ShadowTracer()
+sun_tracer.refresh(sun_shadow_sc)
+
+wr.render(sun_shadow_sc, cam_sunshadow, (W, H), sun_tracer)
+img_sunshadow_dx = np.frombuffer(wr.read_frame(), np.uint8).reshape(H, W, 4)[..., :3].astype(float)
+gl.render(sun_shadow_sc, cam_sunshadow, (W, H), sun_tracer)
+img_sunshadow_gl = np.frombuffer(gl.target.read(components=3), np.uint8).reshape(H, W, 3)[::-1].astype(float)
+
+# both backends index the SAME tracer.directional_shadow_factors output at
+# face granularity (no per-pixel resampling, unlike textured sampling) --
+# there is no float-divergence source, so parity is exact, not toleranced.
+d_sunshadow = np.abs(img_sunshadow_dx - img_sunshadow_gl)
+assert d_sunshadow.max() == 0.0, (
+    f"dx12 sun-shadow render is not byte-identical to GL: max diff "
+    f"{d_sunshadow.max():.1f}, mean {d_sunshadow.mean():.4f} -- dl_shadow_tex "
+    f"regression")
+
+# non-vacuous: shadow_depth only scales the tracer's raw factors inside
+# WgpuRenderer.render()/GLRenderer.render() (the tracer itself is untouched
+# by it, so no re-refresh is needed) -- forcing it to 0 must make the wall's
+# shadow disappear. Without this, the byte-identical assertion above would
+# pass trivially if a future change silently disabled sun shadows on BOTH
+# backends at once.
+sun_ent.sun.shadow_depth = 0.0
+wr.render(sun_shadow_sc, cam_sunshadow, (W, H), sun_tracer)
+img_noshadow_dx = np.frombuffer(wr.read_frame(), np.uint8).reshape(H, W, 4)[..., :3].astype(float)
+d_effect = np.abs(img_sunshadow_dx - img_noshadow_dx)
+shadow_px = int((d_effect.max(axis=-1) > 5).sum())
+assert d_effect.mean() > 1.0 and shadow_px > 3000, (
+    f"sun-shadow test scene doesn't exercise a visible shadow: mean diff "
+    f"{d_effect.mean():.3f}, {shadow_px} of {W * H} px changed (want > 3000)")
+print(f"dx12 sun SHADOW ATTENUATION OK: byte-identical to GL (0 px differ), "
+      f"shadow covers {shadow_px}/{W * H} px ({100 * shadow_px / (W * H):.1f}%) vs shadow_depth=0")
 
 # ---------------------------------------------------------------------
 # GI: red wall bleeds red light onto a neighboring white floor, 3-way parity

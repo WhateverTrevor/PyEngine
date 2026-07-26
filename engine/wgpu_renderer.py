@@ -43,7 +43,14 @@ metallic-roughness Cook-Torrance/GGX specular identical to the CPU/GL model
 (total_faces, MAX_LIGHTS) float32 shadow-factor layout produced by
 `raytrace.ShadowTracer` -- uploaded here as an r32float texture and sampled
 with `textureLoad` (no sampler -- an exact texel fetch, like GL's
-`texelFetch`).
+`texelFetch`). Directional (sun) shadow attenuation mirrors GL's
+`dlShadowTex` exactly: a reserved single-column (1, total_faces) r32float
+texture (`dl_shadow_tex`, modeled on `gi_tex`'s lifecycle) holds
+`1 - shadow_depth*(1 - raw)` from `raytrace.ShadowTracer.
+directional_shadow_factors`, gathered onto the render mesh via
+`_lod_gather` exactly like GI/point-light shadows; the fragment shader
+multiplies it into `lambert` at its point of computation (before both the
+diffuse and specular uses), same as GL's `lambert *= dlShadow`.
 
 wgpu/WebGPU gotchas handled here (each also called out at its call site):
   - `queue.read_texture()` already pads/strips the 256-byte copy-row
@@ -144,7 +151,7 @@ from .math3d import rotation_x, rotation_y
 from .raytrace import GITracer
 from .renderer import (_face_light_strength, _fog_volumes, _gather_lights,
                        _gi_direct_lighting, _gi_receiver_geometry, _is_translucent,
-                       _sun_sky_info)
+                       _scene_sun, _sun_sky_info)
 
 _MAX_LIGHTS = 16
 _MAX_FOG_VOL = 4
@@ -210,6 +217,7 @@ struct EntityUniforms {{
 @group(0) @binding(2) var shadow_tex: texture_2d<f32>;
 @group(0) @binding(3) var ies_tex: texture_2d<f32>;
 @group(0) @binding(4) var gi_tex: texture_2d<f32>;
+@group(0) @binding(5) var dl_shadow_tex: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> entity: EntityUniforms;
 // Per-pixel texturing: 4 fixed texture slots (base_color/roughness/
 // metallic/emissive -- "opacity" is excluded, see module docstring), always
@@ -396,7 +404,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 
     let n = normalize(in.normal);
     let to_light = normalize(-frame.dl_dir.xyz);
-    let lambert = clamp(dot(n, to_light), 0.0, 1.0);
+    let dl_shadow = textureLoad(
+        dl_shadow_tex, vec2<i32>(0, i32(entity.face_offset.x + 0.5) + in.face_id), 0).r;
+    let lambert = clamp(dot(n, to_light), 0.0, 1.0) * dl_shadow;
     var lum: vec3<f32>;
     if (frame.flags.x > 0.5) {{
         lum = eval_ambient_cube(n) + frame.dl_color_ambient.xyz * lambert;
@@ -851,6 +861,16 @@ class WgpuRenderer:
             usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
         self._gi_view = self._gi_tex.create_view()
 
+        # directional (sun) shadow -- reserved single-column r32float
+        # texture, same (1, total_faces) layout as gi_tex above, indexed
+        # like shadowTex but with a fixed light index of 0. Mirrors
+        # GLRenderer's dlShadowTex exactly (see module docstring).
+        self._dl_shadow_tex_size = (1, 1)
+        self._dl_shadow_tex = device.create_texture(
+            size=(1, 1, 1), format="r32float",
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        self._dl_shadow_view = self._dl_shadow_tex.create_view()
+
         # Per-pixel texturing (run 4/4): 1x1 opaque-white dummy, always
         # bound to whichever of the 4 channel slots (group 2) a material
         # doesn't directly bind a texture to -- mirrors GLRenderer's
@@ -878,6 +898,7 @@ class WgpuRenderer:
             {"binding": 2, "resource": self._shadow_view},
             {"binding": 3, "resource": self._ies_view},
             {"binding": 4, "resource": self._gi_view},
+            {"binding": 5, "resource": self._dl_shadow_view},
         ])
 
     def _make_sky_bind_group(self, env_view):
@@ -948,6 +969,27 @@ class WgpuRenderer:
         self.device.queue.write_texture(
             {"texture": self._gi_tex}, data.tobytes(),
             {"bytes_per_row": w_s * 16, "rows_per_image": h_s}, (w_s, h_s, 1))
+
+    def _upload_dl_shadow_tex(self, data: np.ndarray, total_faces: int) -> None:
+        """Reserved single-column texture for the directional (sun) shadow
+        factor, same (1, total_faces) layout as `_upload_gi_tex`, indexed
+        like `shadowTex` but with a fixed light index of 0. Mirrors
+        GLRenderer's `_upload_dl_shadow_tex` exactly."""
+        wgpu = self._wgpu
+        size = (1, max(total_faces, 1))
+        if self._dl_shadow_tex_size != size:
+            self._dl_shadow_tex.destroy()
+            self._dl_shadow_tex = self.device.create_texture(
+                size=(size[0], size[1], 1), format="r32float",
+                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+            self._dl_shadow_view = self._dl_shadow_tex.create_view()
+            self._dl_shadow_tex_size = size
+            self._frame_bind_group = self._make_frame_bind_group()  # view changed
+        w_s, h_s = size
+        buf = np.ascontiguousarray(data, dtype=np.float32)
+        self.device.queue.write_texture(
+            {"texture": self._dl_shadow_tex}, buf.tobytes(),
+            {"bytes_per_row": w_s * 4, "rows_per_image": h_s}, (w_s, h_s, 1))
 
     def _get_env_view(self, env):
         wgpu = self._wgpu
@@ -1325,6 +1367,25 @@ class WgpuRenderer:
                     shadow_data[off:off + m, li_idx] = _lod_gather(entity, rmesh, factors)
         self._upload_shadow_tex(shadow_data, total_faces)
 
+        # directional (sun) shadow -- reserved single-column texture, same
+        # face-id indexing as shadowTex above (mirrors GLRenderer.render()'s
+        # dl_shadow_data block exactly).
+        sun = _scene_sun(scene)
+        dl_shadow_data = np.ones((max(total_faces, 1), 1), dtype=np.float32)
+        if tracer is not None and sun is not None and sun.shadow_depth > 1e-6 and total_faces > 0:
+            dl_dir = scene.light.direction.to_array()
+            to_light = -dl_dir / max(np.linalg.norm(dl_dir), 1e-12)
+            for entity, rmesh, off, m in zip(live, render_meshes, offsets, face_counts):
+                centroids_w, normals_w = _entity_world_faces(entity)
+                lambert = np.clip(normals_w @ to_light, 0.0, 1.0)
+                active = lambert > 1e-3
+                raw = tracer.directional_shadow_factors(
+                    entity, dl_dir, sun.shadow_softness, sun.shadow_samples,
+                    centroids_w, normals_w, active)
+                dshadow = 1.0 - sun.shadow_depth * (1.0 - raw)
+                dl_shadow_data[off:off + m, 0] = _lod_gather(entity, rmesh, dshadow)
+        self._upload_dl_shadow_tex(dl_shadow_data, total_faces)
+
         # one-bounce GI -- baked/cached by GITracer, zero per-frame cost once
         # static (mirrors GLRenderer.render()'s GI block exactly).
         gi_data = np.zeros((max(total_faces, 1), 3), dtype=np.float32)
@@ -1465,6 +1526,7 @@ class WgpuRenderer:
             self._depth_tex.destroy()
         self._shadow_tex.destroy()
         self._gi_tex.destroy()
+        self._dl_shadow_tex.destroy()
         self._ies_tex.destroy()
         self._dummy_env_tex.destroy()
         self._dummy_tex.destroy()

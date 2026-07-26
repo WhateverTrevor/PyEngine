@@ -98,12 +98,11 @@ bp_component_checks, bp_runtime_checks.
     actually light anything.
   - An already-placed instance does not auto-update when its blueprint
     changes; re-placing picks up edits (matches every other asset type).
-- **wgpu directional (sun) shadow attenuation on mesh faces (GL's
-  dlShadowTex) — the last wgpu visual gap, and the ONLY item left from the
-  user's own stated priority list.** They ranked it above per-pixel
-  texturing; it was skipped only because they said "go ahead" on the
-  texturing split. Do this next unless told otherwise. Single-backend, so
-  it does NOT need pre-splitting.
+- wgpu directional (sun) shadow attenuation: DONE. `dl_shadow_tex` in
+  `wgpu_renderer.py` mirrors GL's `dlShadowTex`; parity vs GL is asserted
+  EXACT in wgpu_checks (both backends index the same per-face
+  `directional_shadow_factors` output — no per-pixel resampling, so no
+  float-divergence source). **wgpu is now at full visual parity with GL.**
 - GPU cache identity: `_geo_cache`/`_entity_uniform_cache` are FIXED (keyed
   on a monotonic `Mesh._cache_id`/`Entity._cache_id`, not `id()`), with
   regression tests in gl_checks #11 / wgpu_checks #12 that were proven to
