@@ -19,8 +19,16 @@ Two evaluation *contexts* share one node graph:
 
 We match Unreal's *core* node vocabulary (the handful of ops that show up in
 almost every graph), not its full node library.
+
+`direct_texture_bindings` reports, per Output channel, when a `tex_sample`
+node feeds that channel with nothing in between -- small renderer-agnostic
+metadata the CPU/GL/wgpu backends use to sample per pixel in ADDITION to
+the per-face bake above (which keeps happening, unconditionally, for every
+material -- see that method's docstring for the exact rule and rationale).
 """
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import numpy as np
 
@@ -124,6 +132,23 @@ PARAM_RANGES = {"r": (0.0, 1.0), "g": (0.0, 1.0), "b": (0.0, 1.0), "a": (0.0, 1.
                 "index": (0.0, 0.0), "u_tiling": (0.1, 8.0), "v_tiling": (0.1, 8.0)}
 
 
+class TextureBinding(NamedTuple):
+    """A texture that feeds one Output channel DIRECTLY -- see
+    `MaterialGraph.direct_texture_bindings`. Small and renderer-agnostic:
+    the CPU deferred pass (run 2), OpenGL (run 3) and wgpu (run 4) backends
+    all consume the same tuple to decide what to sample per pixel instead
+    of relying on the per-face bake for that one channel.
+
+    `port` is the `tex_sample` output pin wired to the channel (one of
+    NODE_OUTPUTS["tex_sample"] = RGB/R/G/B/A); `u_tiling`/`v_tiling` are
+    the static per-material tiling scalars (1.0/1.0 for the implicit
+    unconnected-uv TexCoord(0) default, matching `_evaluate_common`)."""
+    texture: str
+    port: str
+    u_tiling: float
+    v_tiling: float
+
+
 def _hash_noise(cells: np.ndarray) -> np.ndarray:
     """Deterministic pseudo-random 0..1 per integer cell (M, 3) -> (M,)."""
     h = (cells[:, 0] * 374761393 + cells[:, 1] * 668265263
@@ -223,6 +248,62 @@ class MaterialGraph:
             if n["type"] == "output":
                 return nid
         return self.add("output", (560.0, 180.0))
+
+    def direct_texture_bindings(self) -> dict[str, TextureBinding]:
+        """Per-Output-channel direct texture bindings, for per-pixel
+        sampling (CPU/GL/wgpu renderers) alongside the existing per-face
+        bake, which keeps happening for every material unchanged (this is
+        additive read-only metadata -- see class docstring's "Two
+        evaluation contexts", still exactly two, still per-face/per-sky).
+
+        "Directly feeds" -- the precise, deliberately strict rule, chosen
+        to keep this decidable from the graph's own topology (no
+        evaluation needed) and this run small: a channel is bound only
+        when the Output pin's link SOURCE is itself a `tex_sample` node --
+        a bare wire, nothing in between -- AND that tex_sample's own `uv`
+        input is either unconnected (implicit TexCoord(0), tiling 1x1,
+        exactly like `_evaluate_common`'s tex_sample branch) or fed by a
+        single `tex_coord` node (a static tiling scalar we can read once,
+        off the hot path). Everything else -- a tex_sample multiplied,
+        added, clamped, or otherwise processed before reaching Output; a
+        tex_sample whose UV comes from a procedural/dynamic node (noise,
+        another texture, an animated pan) -- keeps baking per-face only,
+        the same as before this run. Per-pixel evaluation of arbitrary
+        graph math is out of scope (see CLAUDE.md's architectural note on
+        why the graph stays per-face: ~285x more samples/frame otherwise).
+
+        Returns {channel: TextureBinding}, channel one of "base_color",
+        "roughness", "metallic", "emissive", "opacity" -- only for channels
+        that resolve to a bound texture with a non-empty path (an empty/
+        unassigned tex_sample already bakes to flat neutral gray
+        identically whether sampled per-face or per-pixel, so it's not
+        worth reporting as a binding a renderer would have to special-case).
+        """
+        out_id = self.output_id()
+        bindings: dict[str, TextureBinding] = {}
+        for channel in ("base_color", "roughness", "metallic", "emissive", "opacity"):
+            link = self.link_into(out_id, channel)
+            if link is None:
+                continue
+            src, port = link
+            src_node = self.nodes.get(src)
+            if src_node is None or src_node["type"] != "tex_sample":
+                continue
+            texture = src_node.get("texture", "")
+            if not texture:
+                continue
+            u_tiling = v_tiling = 1.0
+            uv_link = self.link_into(src, "uv")
+            if uv_link is not None:
+                uv_src, _uv_port = uv_link
+                uv_node = self.nodes.get(uv_src)
+                if uv_node is None or uv_node["type"] != "tex_coord":
+                    continue  # procedural/dynamic UV -- not a static per-pixel binding
+                u_tiling = float(uv_node["params"].get("u_tiling", 1.0))
+                v_tiling = float(uv_node["params"].get("v_tiling", 1.0))
+            bindings[channel] = TextureBinding(texture=texture, port=port,
+                                               u_tiling=u_tiling, v_tiling=v_tiling)
+        return bindings
 
     # ---- evaluation ----
     def _evaluate_common(self, m: int, sample_pts: np.ndarray, pos01: np.ndarray,

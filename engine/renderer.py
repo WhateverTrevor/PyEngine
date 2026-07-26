@@ -8,7 +8,21 @@ falloff, smooth spotlight penumbras, IES angular profiles, per-pixel fog.
 Ray-traced shadow factors stay per-face (the tracer's granularity) and
 modulate the per-pixel light. The result is upscaled to the window.
 
+Per-pixel texturing (run 2/4 of the per-pixel texturing slate) rides the
+same face-ID buffer: for any Output channel a material's `tex_sample` node
+feeds DIRECTLY (`MaterialGraph.direct_texture_bindings`, engine/materials.py),
+`_pixel_uv` barycentric-interpolates the hit face's `corner_uvs` at the
+already-reconstructed world position and `texture.sample_texture` reads the
+image per pixel, overriding just that channel's per-face-baked value for
+just those pixels. Everything else (channels with no direct binding, the
+graph's own math) keeps reading the per-face bake exactly as before —
+additive, gated on the frame actually containing bound textures so an
+untextured frame pays nothing extra. See `_pixel_uv` / `_extract_channel`
+and the `tex_entities` block in `_render_deferred`.
+
 Flat (F2): the classic one-color-per-face path — faster, chunkier lighting.
+Translucent objects also stay per-face-centroid (`_render_translucent`) —
+neither picks up per-pixel texturing this run (see HANDOFF).
 
 Shared pipeline per frame: transform to world/camera space (numpy matmuls),
 backface-cull, near-plane clip (Sutherland-Hodgman), painter's depth sort.
@@ -20,6 +34,7 @@ import math
 import numpy as np
 import pygame
 
+from . import texture as texture_mod
 from .gpu_geometry import _lod_gather
 from .lighting import SpotLight, ies_curve
 from .math3d import rotation_x, rotation_y
@@ -109,6 +124,83 @@ def _face_light_strength(info: _LightInfo, normals: np.ndarray,
             ang = np.degrees(np.arccos(np.clip(cos_ang, -1.0, 1.0)))
             strength = strength * info.curve[ang.astype(np.int32)]
     return strength
+
+
+def _pixel_uv(pos: np.ndarray, fid: np.ndarray, corner_world: np.ndarray,
+             corner_uv: np.ndarray, is_tri: np.ndarray) -> np.ndarray:
+    """Per-pixel UV: barycentric-interpolate the hit face's `corner_uvs` at
+    `pos` (S, 3) world-space points already known to lie on that face's
+    plane (the deferred pass's existing ray-plane hit). `fid` (S,) indexes
+    the GLOBAL per-face arrays `corner_world` (Mtotal, 4, 3)/`corner_uv`
+    (Mtotal, 4, 2)/`is_tri` (Mtotal,) -- same padded-triangle convention as
+    `Mesh.faces` (see mesh.py).
+
+    TRAP this exists to handle: the face-ID buffer identifies a whole face,
+    not a triangle, and `Mesh._build` splits a real quad into two triangles
+    (f0,f1,f2) and (f0,f2,f3) sharing the f0-f2 diagonal -- so a quad's two
+    halves need DIFFERENT barycentric weights. We compute both triangles'
+    weights and pick per-pixel by which one is actually valid (all three
+    weights >= 0, i.e. `pos` really is inside that triangle); a padded
+    triangle (`is_tri`, corner 3 == corner 2) always takes the first
+    triangle, since the second is degenerate. Continuity across the split
+    is exact: both triangles share corners 0 and 2 (with the same UV), so
+    there's no seam at the diagonal.
+
+    All-float32, sized to the caller's pixel subset `S` (never the full
+    visible-pixel set unless the caller passes it that way) -- see the
+    PERFORMANCE RULE in CLAUDE.md.
+    """
+    cw = corner_world[fid]      # (S, 4, 3)
+    cuv = corner_uv[fid]        # (S, 4, 2)
+    istri = is_tri[fid]         # (S,)
+    A, B, C, D = cw[:, 0], cw[:, 1], cw[:, 2], cw[:, 3]
+    uvA, uvB, uvC, uvD = cuv[:, 0], cuv[:, 1], cuv[:, 2], cuv[:, 3]
+
+    def bary(P, P0, P1, P2):
+        """Weights (w0, w1, w2) s.t. P ~= w0*P0 + w1*P1 + w2*P2 (Ericson's
+        Real-Time Collision Detection formula, works for coplanar 3D
+        points -- no separate 2D projection needed)."""
+        v0, v1, v2 = P1 - P0, P2 - P0, P - P0
+        d00 = np.einsum("ij,ij->i", v0, v0)
+        d01 = np.einsum("ij,ij->i", v0, v1)
+        d11 = np.einsum("ij,ij->i", v1, v1)
+        d20 = np.einsum("ij,ij->i", v2, v0)
+        d21 = np.einsum("ij,ij->i", v2, v1)
+        denom = d00 * d11 - d01 * d01
+        denom = np.where(np.abs(denom) < 1e-12, np.float32(1e-12), denom)
+        w1 = (d11 * d20 - d01 * d21) / denom
+        w2 = (d00 * d21 - d01 * d20) / denom
+        w0 = 1.0 - w1 - w2
+        return w0, w1, w2
+
+    w0a, w1a, w2a = bary(pos, A, B, C)          # triangle (f0, f1, f2)
+    in_tri1 = (w0a >= -1e-4) & (w1a >= -1e-4) & (w2a >= -1e-4)
+    use_tri1 = istri | in_tri1
+    uv1 = w0a[:, None] * uvA + w1a[:, None] * uvB + w2a[:, None] * uvC
+
+    w0b, w1b, w2b = bary(pos, A, C, D)          # triangle (f0, f2, f3)
+    uv2 = w0b[:, None] * uvA + w1b[:, None] * uvC + w2b[:, None] * uvD
+
+    return np.where(use_tri1[:, None], uv1, uv2).astype(np.float32)
+
+
+def _extract_channel(rgb: np.ndarray, a: np.ndarray, port: str, want_vector: bool) -> np.ndarray:
+    """Coerce a `sample_texture` result (rgb (S, 3), a (S,), both 0..1) to
+    the shape the target Output channel wants, per the tex_sample output
+    `port` (RGB/R/G/B/A) that fed it -- mirrors materials.py's own
+    conventions: a vector channel (base_color/emissive) gets a scalar port
+    replicated across R=G=B (same as `_evaluate_common`'s tex_sample dict);
+    a scalar channel (roughness/metallic) gets a vector port reduced via
+    mean (same as `evaluate_pbr`'s `.mean(axis=1)` on the Output pin)."""
+    if port == "A":
+        v = a
+    elif port == "RGB":
+        v = rgb
+    else:
+        v = rgb[:, {"R": 0, "G": 1, "B": 2}[port]]
+    if want_vector:
+        return v if v.ndim == 2 else np.repeat(v[:, None], 3, axis=1)
+    return v if v.ndim == 1 else v.mean(axis=1)
 
 
 def _ggx_specular(n: np.ndarray, v: np.ndarray, l: np.ndarray,
@@ -352,7 +444,15 @@ class Renderer:
                 pts.append((int(x), int(y)))
             clipped.append((int(i), pts))
 
-        return {"normals": normals_world, "centroids": verts_world[mesh.faces].mean(axis=1),
+        # corner_world (M, 4, 3): world-space position of each face's 4
+        # (padded-triangle) corners -- the same fancy-index this method
+        # already needed for `centroids` below, just also returned so the
+        # per-pixel texturing path (`_render_deferred`'s `tex_entities`
+        # block) can barycentric-interpolate `corner_uvs` at a reconstructed
+        # pixel position without recomputing it -- zero extra cost.
+        corner_world = verts_world[mesh.faces]
+        return {"normals": normals_world, "centroids": corner_world.mean(axis=1),
+                "corner_world": corner_world,
                 "depth": depth, "fast_idx": fast_idx, "fast_pts": fast_pts,
                 "clipped": clipped}
 
@@ -659,8 +759,15 @@ class Renderer:
         # --- collect geometry + per-face attributes across all entities ---
         f_normals, f_centroids, f_albedo, f_base = [], [], [], []
         f_roughness, f_metallic, f_emissive, f_sun_lambert = [], [], [], []
+        f_corner_world, f_corner_uv, f_is_tri = [], [], []
         f_shadow = [[] for _ in lights]
         polys = []  # (depth, global_face_id, points)
+        # tex_entities: [(offset, m_faces, {channel: TextureBinding}), ...] --
+        # only entities whose material directly binds >=1 channel (see
+        # materials.py's MaterialGraph.direct_texture_bindings), so the
+        # per-pixel texturing pass below can skip entirely on an untextured
+        # frame (the byte-identical gate this run is judged on).
+        tex_entities = []
         offset = 0
         for entity in scene.entities:
             if entity.mesh is None or not entity.visible or _is_translucent(entity):
@@ -678,6 +785,14 @@ class Renderer:
             f_roughness.append(render_mesh.face_roughness)
             f_metallic.append(render_mesh.face_metallic)
             f_emissive.append(render_mesh.face_emissive)
+            f_corner_world.append(geo["corner_world"])
+            f_corner_uv.append(render_mesh.corner_uvs)
+            f_is_tri.append(render_mesh.is_tri)
+            material = getattr(entity, "material", None)
+            if material is not None:
+                bindings = material.direct_texture_bindings()
+                if bindings:
+                    tex_entities.append((offset, m_faces, bindings))
             base, sun_lambert = self._directional_base(scene, entity, render_mesh, normals,
                                                         centroids, env, tracer)
             gi = gi_map.get(id(entity))
@@ -741,6 +856,14 @@ class Renderer:
         emissive = np.concatenate(f_emissive).astype(np.float32)
         sun_lambert = np.concatenate(f_sun_lambert).astype(np.float32)
         shadows = [np.concatenate(s).astype(np.float32) for s in f_shadow]
+        # Only concatenated when >=1 entity actually has a direct texture
+        # binding -- an untextured frame skips this (and the whole
+        # `tex_entities` block below) entirely, at zero extra cost.
+        corner_world_all = corner_uv_all = is_tri_all = None
+        if tex_entities:
+            corner_world_all = np.concatenate(f_corner_world).astype(np.float32)
+            corner_uv_all = np.concatenate(f_corner_uv).astype(np.float32)
+            is_tri_all = np.concatenate(f_is_tri)
 
         # --- per-pixel pass, run only on visible (non-sky) pixels ---
         img = pygame.surfarray.array3d(small).astype(np.int32)
@@ -825,16 +948,55 @@ class Renderer:
         n = normals[fid]                       # (V, 3)
         pos = cam[None, :] + dirs * t[:, None]
 
+        # --- per-pixel texturing: sample any DIRECTLY bound channel, per
+        # entity, restricted to that entity's own visible-pixel subset (not
+        # the full `vis` set -- see the PERFORMANCE RULE in CLAUDE.md).
+        # `channel_overrides[channel]` collects (indices-into-`fid`/`pos`-
+        # space, sampled-value) pairs; each is applied at the point that
+        # channel's per-pixel array already exists below, so an untextured
+        # frame (`tex_entities` empty) skips this block entirely -- the
+        # byte-identical gate this run is judged on.
+        channel_overrides: dict[str, list] = {}
+        if tex_entities:
+            for offset_e, m_faces_e, bindings in tex_entities:
+                sel = np.flatnonzero((fid >= offset_e) & (fid < offset_e + m_faces_e))
+                if sel.size == 0:
+                    continue
+                uv_sel = _pixel_uv(pos[sel], fid[sel], corner_world_all,
+                                   corner_uv_all, is_tri_all)
+                for channel, binding in bindings.items():
+                    if channel == "opacity":
+                        continue  # translucent entities never reach this pass (see module docstring)
+                    img = texture_mod.load_texture_rel(binding.texture)
+                    if img is None:
+                        continue  # texture missing at render time -- fall back to the per-face bake
+                    tiling = np.array([binding.u_tiling, binding.v_tiling], dtype=np.float32)
+                    rgb, a = texture_mod.sample_texture(img, uv_sel * tiling)
+                    want_vector = channel in ("base_color", "emissive")
+                    val = _extract_channel(rgb, a, binding.port, want_vector).astype(np.float32)
+                    channel_overrides.setdefault(channel, []).append((sel, val))
+
         # Fast-path gate: skip all PBR per-pixel work when every face in the
         # frame is at the default params (roughness=1, metallic=0) -- the
         # common case, and the whole point of the backward-compat contract.
         # `pbr_active`/`has_emissive` are cheap checks over the small
-        # per-face arrays, done once for the whole frame.
-        pbr_active = bool(np.any(metallic > 1e-6) or np.any(roughness < 1.0 - 1e-6))
-        has_emissive = bool(np.any(emissive > 1e-6))
+        # per-face arrays, done once for the whole frame; a directly-bound
+        # roughness/metallic/emissive texture forces the gate open even if
+        # every face happened to bake to the default value (a real per-pixel
+        # texture essentially never does, but correctness shouldn't lean on
+        # that coincidence).
+        pbr_active = bool(np.any(metallic > 1e-6) or np.any(roughness < 1.0 - 1e-6)
+                          or "roughness" in channel_overrides or "metallic" in channel_overrides)
+        has_emissive = bool(np.any(emissive > 1e-6) or "emissive" in channel_overrides)
 
         lum = base[fid].copy()          # diffuse-ish (ambient+directional+GI), already *(1-metallic)
         spec = None                     # additive specular, NOT multiplied by albedo
+
+        albedo_px = albedo[fid]
+        if "base_color" in channel_overrides:
+            albedo_px = albedo_px.copy()
+            for sel, val in channel_overrides["base_color"]:
+                albedo_px[sel] = val * 255.0
 
         if pbr_active:
             # PBR per-pixel params, gathered once for the whole visible set.
@@ -843,7 +1005,15 @@ class Renderer:
             # contribution even inside an otherwise-PBR frame.
             rough_px = roughness[fid]
             metal_px = metallic[fid]
-            albedo01 = albedo[fid] / 255.0
+            if "roughness" in channel_overrides:
+                rough_px = rough_px.copy()
+                for sel, val in channel_overrides["roughness"]:
+                    rough_px[sel] = val
+            if "metallic" in channel_overrides:
+                metal_px = metal_px.copy()
+                for sel, val in channel_overrides["metallic"]:
+                    metal_px[sel] = val
+            albedo01 = albedo_px / 255.0
             alpha_px = np.clip(rough_px, 0.02, 1.0) ** 2
             f0_px = 0.04 * (1.0 - metal_px)[:, None] + albedo01 * metal_px[:, None]
             spec_scale_px = 1.0 - rough_px * (1.0 - metal_px)
@@ -912,7 +1082,7 @@ class Renderer:
                                     * spec_scale_px[s])
                     spec[s] += info.colorf.astype(np.float32)[None, :] * brdf * spec_strength[:, None]
 
-        out = albedo[fid] * lum
+        out = albedo_px * lum
         if spec is not None:
             out += spec * 255.0
         if vols:
@@ -921,7 +1091,12 @@ class Renderer:
         if fog is not None:
             self._apply_atmosphere(out, scene, dirs, t, pos, fog)
         if has_emissive:
-            out += emissive[fid]         # emissive is unconditional -- visible even unlit/in shadow
+            emissive_px = emissive[fid]
+            if "emissive" in channel_overrides:
+                emissive_px = emissive_px.copy()
+                for sel, val in channel_overrides["emissive"]:
+                    emissive_px[sel] = val * 255.0
+            out += emissive_px           # emissive is unconditional -- visible even unlit/in shadow
         np.clip(out, 0.0, 255.0, out=out)
         frame.reshape(-1, 3)[vis] = out.astype(np.uint8)
 

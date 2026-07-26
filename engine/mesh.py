@@ -77,6 +77,12 @@ class Mesh:
                 tris.append(t)
         self.faces = np.asarray(padded, dtype=np.int32)      # (M, 4), tris padded
         self.tri_faces = np.asarray(tris, dtype=np.int32)    # (T, 3) for ray tracing
+        # (M,) bool: True where a face is a padded triangle (corner 3
+        # repeats corner 2, see the loop above) -- precomputed once here
+        # (not per-frame) since `faces` only changes on a rebuild; the
+        # per-pixel texturing pass (renderer.py's `_pixel_uv`) needs this to
+        # know a real quad's second half-triangle is degenerate for a tri.
+        self.is_tri = self.faces[:, 2] == self.faces[:, 3]
         self.normals = self._face_normals()
         self.aabb_min = self.vertices.min(axis=0)
         self.aabb_max = self.vertices.max(axis=0)

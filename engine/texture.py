@@ -15,9 +15,22 @@ Two entry points:
   file is missing -- `TextureSample` treats None as "no texture assigned"
   and falls back to neutral gray.
 
-Sampling is nearest-neighbor (no filtering, no mipmaps) -- this engine bakes
-materials to per-face colors, one sample per face centroid, so there is no
-per-pixel footprint to filter against.
+Sampling is nearest-neighbor (no filtering, no mipmaps). Originally this was
+because materials baked to one color per face centroid -- no per-pixel
+footprint to filter against at all. That's no longer true: per-pixel
+texturing (run 2/4 of the per-pixel texturing slate, see renderer.py's
+`_pixel_uv` / `_render_deferred`'s `tex_entities` block) samples a directly-
+bound channel once per VISIBLE PIXEL, so there genuinely is a footprint now.
+Nearest-neighbor stays anyway, as a deliberate scope decision, not an
+oversight: magnification aliasing (a coarse texture stretched over many
+pixels, this engine's common case for hand-authored game textures) reads as
+blockiness either way without mipmaps, and minification aliasing (many
+texels per pixel, where bilinear alone -- without mip selection -- barely
+helps) doesn't yet have anywhere to fall back to, since there's no mip chain
+built at import time. Real filtering means both bilinear AND mip generation
+together, which is a bigger, separable piece of work than this run's per-
+pixel-vs-per-face plumbing change; revisit if visible texture aliasing turns
+out to matter in practice (see HANDOFF).
 """
 from __future__ import annotations
 

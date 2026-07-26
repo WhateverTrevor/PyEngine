@@ -104,11 +104,30 @@ bp_component_checks, bp_runtime_checks.
   1. [done] Per-corner UV foundation. `Mesh.corner_uvs` (M,4,2) parallel to
      `faces`; FBX import now preserves the per-polygon-vertex UVs it used
      to discard. No rendering change.
-  2. [next] CPU renderer: per-pixel barycentric UV from the face-ID buffer
-     + reconstructed world position, then sample the texture per pixel.
-  3. OpenGL parity (textures + UV attributes + GLSL sampling).
+  2. [done] CPU renderer per-pixel sampling. `MaterialGraph.
+     direct_texture_bindings()` reports which output channels a texture
+     feeds directly; `renderer._pixel_uv` interpolates `corner_uvs` at the
+     already-reconstructed world position. Byte-identical gate for
+     untextured scenes lives in `tests/fixtures/perpixel_starter_golden.npy`
+     (captured from main @76cb82b — supervisor re-verified it against a real
+     main render, 0 px, so it is NOT circular; keep it that way if you
+     regenerate it).
+  3. [next] OpenGL parity (textures + UV attributes + GLSL sampling).
   4. wgpu parity (same in WGSL). Keep 3 and 4 separate — the PBR slate
      split them that way and produced the two best-behaved runs (135k/140k).
+  Consequences of runs 1-2 now live, NOT yet addressed:
+  - **LOD swim**: decimated levels get a fresh box projection, so a textured
+    mesh's pattern visibly JUMPS at the LOD switch distance. The most
+    user-visible loose end of the slate.
+  - GI/shadow bounce colour still reads per-face albedo, not the per-pixel
+    texture (different cost shape: per bounce-source face, not per visible
+    pixel).
+  - Translucent entities never enter the deferred face-ID buffer, so
+    `opacity` texture bindings are structurally unreachable in the CPU path.
+  - Sampling is nearest-neighbour; real filtering needs bilinear AND mip
+    generation together to help.
+  - Worst-case cost is ~2x per-call when a textured surface fills the frame
+    (scales with textured visible-pixel count). Untextured is unchanged.
   **Architectural decision already made for runs 2-4:** the material graph
   KEEPS baking per-face. Only a texture feeding a channel directly goes
   per-pixel — one array index per pixel per channel, which maps 1:1 onto

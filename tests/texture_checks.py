@@ -6,6 +6,13 @@ LOD's drop-and-regenerate decision -- see engine/mesh.py's `_build_uvs` and
 engine/lod.py's module docstring for the design). Headless; PYENGINE_
 SETTINGS points at a temp path so this never touches the user's real
 settings.json.
+
+Sections 14+ cover per-pixel texturing run 2/4 (CPU renderer): materials.py's
+`MaterialGraph.direct_texture_bindings` ("directly feeds" rule + fallback
+cases), renderer.py's `_pixel_uv` (quad two-triangle barycentric UV) /
+`_extract_channel` (tex_sample port -> Output channel shape), the
+byte-identical-with-main gate on the starter scene, real per-pixel variation
+within a single face (not vacuous), tiling, and the LOD-swim consequence.
 """
 import os
 import struct
@@ -26,7 +33,8 @@ from engine import fbx as fbx_mod
 from engine import lod as lod_mod
 from engine import mesh as mesh_mod
 from engine import texture as texture_mod
-from editor import ICON, make_icon
+from engine.renderer import Renderer, _extract_channel, _pixel_uv
+from editor import ICON, build_starter_scene, make_icon
 
 pygame.init()
 
@@ -348,6 +356,301 @@ for i, lm in enumerate(lods[1:], start=1):
         f"LOD{i}: corner_uvs must be freshly box-projected (varying), not flat/carried-over"
 print(f"13. LOD corner-UV decision OK: {len(lods) - 1} decimated level(s) each get a fresh, "
      "genuinely-varying box-projected corner_uvs (not carried from the source mesh)")
+
+# ============================================================================
+# per-pixel texturing run 2/4 (CPU renderer) -- MaterialGraph.direct_texture_
+# bindings, renderer._pixel_uv / _extract_channel, byte-identical gate, real
+# per-pixel variation, tiling, LOD-swim consequence.
+# ============================================================================
+
+# ---- 14. direct_texture_bindings(): the "directly feeds" rule and its
+#          fallback cases (a tex_sample wired straight to an Output pin is
+#          bound; multiplied/clamped/etc first, or fed by a procedural UV,
+#          falls back to the per-face bake and is NOT reported here) ----
+g14 = engine.MaterialGraph()
+ts14 = g14.add("tex_sample", (0, 0))
+g14.nodes[ts14]["texture"] = "textures/foo.png"
+assert g14.connect(ts14, g14.output_id(), "base_color", "RGB")
+b14 = g14.direct_texture_bindings()
+assert set(b14.keys()) == {"base_color"}, b14
+assert b14["base_color"] == engine.materials.TextureBinding("textures/foo.png", "RGB", 1.0, 1.0)
+
+# a lone TexCoord feeding uv reports its tiling
+g14b = engine.MaterialGraph()
+ts14b = g14b.add("tex_sample", (0, 0))
+g14b.nodes[ts14b]["texture"] = "textures/rough.png"
+tc14b = g14b.add("tex_coord", (0, 0))
+g14b.nodes[tc14b]["params"]["u_tiling"] = 2.0
+g14b.nodes[tc14b]["params"]["v_tiling"] = 3.0
+assert g14b.connect(tc14b, ts14b, "uv")
+assert g14b.connect(ts14b, g14b.output_id(), "roughness", "R")
+b14b = g14b.direct_texture_bindings()
+assert b14b == {"roughness": engine.materials.TextureBinding("textures/rough.png", "R", 2.0, 3.0)}, b14b
+
+# multiple channels bound at once, others left alone (channel selectivity)
+g14c = engine.MaterialGraph()
+ts_bc = g14c.add("tex_sample", (0, 0))
+g14c.nodes[ts_bc]["texture"] = "textures/albedo.png"
+assert g14c.connect(ts_bc, g14c.output_id(), "base_color", "RGB")
+ts_em = g14c.add("tex_sample", (0, 0))
+g14c.nodes[ts_em]["texture"] = "textures/glow.png"
+assert g14c.connect(ts_em, g14c.output_id(), "emissive", "RGB")
+const_rough = g14c.add("constant", (0, 0))
+assert g14c.connect(const_rough, g14c.output_id(), "roughness")  # NOT a texture -- not reported
+b14c = g14c.direct_texture_bindings()
+assert set(b14c.keys()) == {"base_color", "emissive"}, \
+    f"channel selectivity broken: {b14c} (roughness is a constant, not a texture)"
+
+# fallback: tex_sample multiplied by a constant before Output -- ambiguous,
+# NOT direct (this run's scope-limiting rule)
+g14d = engine.MaterialGraph()
+ts14d = g14d.add("tex_sample", (0, 0))
+g14d.nodes[ts14d]["texture"] = "textures/foo.png"
+mul14d = g14d.add("multiply", (0, 0))
+one14d = g14d.add("constant3vector", (0, 0))
+assert g14d.connect(ts14d, mul14d, "a", "RGB")
+assert g14d.connect(one14d, mul14d, "b")
+assert g14d.connect(mul14d, g14d.output_id(), "base_color")
+assert g14d.direct_texture_bindings() == {}, "multiply-wrapped tex_sample must fall back"
+
+# fallback: tex_sample.uv fed by a procedural node (not a lone TexCoord)
+g14e = engine.MaterialGraph()
+ts14e = g14e.add("tex_sample", (0, 0))
+g14e.nodes[ts14e]["texture"] = "textures/foo.png"
+noise14e = g14e.add("noise", (0, 0))
+assert g14e.connect(noise14e, ts14e, "uv")
+assert g14e.connect(ts14e, g14e.output_id(), "base_color", "RGB")
+assert g14e.direct_texture_bindings() == {}, "procedural-UV tex_sample must fall back"
+
+# fallback: empty texture path, and a bare graph -- both {}
+g14f = engine.MaterialGraph()
+ts14f = g14f.add("tex_sample", (0, 0))
+assert g14f.connect(ts14f, g14f.output_id(), "base_color", "RGB")
+assert g14f.direct_texture_bindings() == {}, "unset texture path must not be reported"
+assert engine.MaterialGraph().direct_texture_bindings() == {}
+
+# additive metadata only -- evaluate()/evaluate_pbr() bake exactly as before
+_cube14 = mesh_mod.cube(2.0)
+_ = g14.evaluate(_cube14)
+_ = g14.evaluate_pbr(_cube14)
+print("14. direct_texture_bindings() OK: direct/tiling/channel-selectivity/"
+     "multiply-fallback/procedural-uv-fallback/empty-texture-fallback all correct; "
+     "evaluate()/evaluate_pbr() still bake (additive metadata only)")
+
+# ---- 15. _pixel_uv: the quad two-triangle TRAP. Mesh._build splits a real
+#          quad into (f0,f1,f2) and (f0,f2,f3); the face-ID buffer only
+#          identifies the FACE, not which triangle a pixel landed in. Uses a
+#          deliberately NON-AFFINE ("twisted") corner-UV assignment: a plain
+#          box-projected quad is a globally affine map (u=x,v=y-ish), so even
+#          a BROKEN "always extrapolate triangle1, never check triangle2"
+#          implementation would coincidentally give the right answer there --
+#          this twisted case has the two triangles genuinely disagree outside
+#          their own footprint, so only correctly SELECTING the triangle the
+#          point actually landed in gives the right UV. ----
+_corner_world15 = np.array([[[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]], dtype=np.float32)
+_corner_uv15 = np.array([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]], dtype=np.float32)
+_is_tri15 = np.array([False], dtype=bool)
+_fid15 = np.zeros(1, dtype=np.int64)
+
+# triangle2 (f0,f2,f3) centroid: correct UV is the exact average of THAT
+# triangle's own corners (0,0)/(0,1)/(1,1) = (1/3, 2/3); a naive unclamped
+# extrapolation of triangle1's plane gives (-1/3, 2/3) instead -- different.
+_p_tri2 = np.array([[1 / 3, 2 / 3, 0.0]], dtype=np.float32)
+_uv_tri2 = _pixel_uv(_p_tri2, _fid15, _corner_world15, _corner_uv15, _is_tri15)
+assert np.allclose(_uv_tri2, [[1 / 3, 2 / 3]], atol=1e-4), \
+    f"triangle2 UV wrong: {_uv_tri2} (expected (1/3, 2/3), the correct triangle2-local answer)"
+assert not np.allclose(_uv_tri2, [[-1 / 3, 2 / 3]], atol=1e-2), \
+    "matches the naive always-triangle1-extrapolation bug's WRONG answer -- triangle selection is broken"
+
+# triangle1 (f0,f1,f2) centroid: average of ITS OWN corners (0,0)/(1,0)/(0,1) = (1/3, 1/3)
+_p_tri1 = np.array([[2 / 3, 1 / 3, 0.0]], dtype=np.float32)
+_uv_tri1 = _pixel_uv(_p_tri1, _fid15, _corner_world15, _corner_uv15, _is_tri15)
+assert np.allclose(_uv_tri1, [[1 / 3, 1 / 3]], atol=1e-4), f"triangle1 UV wrong: {_uv_tri1}"
+
+# continuity: the shared f0-f2 diagonal must agree from either triangle (no seam)
+_uv_c0 = _pixel_uv(np.array([[0.0, 0.0, 0.0]], dtype=np.float32), _fid15,
+                   _corner_world15, _corner_uv15, _is_tri15)
+_uv_c2 = _pixel_uv(np.array([[1.0, 1.0, 0.0]], dtype=np.float32), _fid15,
+                   _corner_world15, _corner_uv15, _is_tri15)
+assert np.allclose(_uv_c0, [[0.0, 0.0]], atol=1e-4) and np.allclose(_uv_c2, [[0.0, 1.0]], atol=1e-4)
+print("15a. _pixel_uv quad two-triangle OK (non-affine control proves real triangle "
+     "selection, not lucky extrapolation); diagonal continuity confirmed")
+
+# a padded triangle (corner 3 repeats corner 2, faces.is_tri) always uses the
+# first triangle -- the second is degenerate
+_tri_cw = np.array([[[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 1, 0]]], dtype=np.float32)
+_tri_cuv = np.array([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]], dtype=np.float32)
+_tri_is_tri = np.array([True], dtype=bool)
+_tri_uv = _pixel_uv(np.array([[1 / 3, 1 / 3, 0.0]], dtype=np.float32), np.zeros(1, dtype=np.int64),
+                    _tri_cw, _tri_cuv, _tri_is_tri)
+assert np.allclose(_tri_uv, [[1 / 3, 1 / 3]], atol=1e-4), _tri_uv
+print("15b. padded-triangle case OK: always resolves via the first (only real) triangle")
+
+# _extract_channel: port -> channel-shape coercion (mirrors materials.py's
+# own R/G/B/A replication and evaluate_pbr's mean-reduction conventions)
+_rgb15 = np.array([[0.2, 0.4, 0.6], [1.0, 0.5, 0.0]], dtype=np.float64)
+_a15 = np.array([0.9, 0.1], dtype=np.float64)
+assert np.allclose(_extract_channel(_rgb15, _a15, "RGB", True), _rgb15)
+assert np.allclose(_extract_channel(_rgb15, _a15, "RGB", False), _rgb15.mean(axis=1))
+assert np.allclose(_extract_channel(_rgb15, _a15, "R", True), np.repeat(_rgb15[:, 0:1], 3, axis=1))
+assert np.allclose(_extract_channel(_rgb15, _a15, "R", False), _rgb15[:, 0])
+assert np.allclose(_extract_channel(_rgb15, _a15, "A", True), np.repeat(_a15[:, None], 3, axis=1))
+assert np.allclose(_extract_channel(_rgb15, _a15, "A", False), _a15)
+print("15c. _extract_channel port->shape coercion OK (RGB/R/A x vector/scalar)")
+
+# ---- 16. THE GATE: an untextured material renders BYTE-IDENTICAL to main
+#          (pre-run2) on the starter scene. `tests/fixtures/perpixel_starter_
+#          golden.npy` was captured from a `git worktree add ... main` at the
+#          commit this run branched from (76cb82b), rendering the exact same
+#          scene/camera below -- confirmed reproducible (render it twice in
+#          one process, 0 diff) before capture, since the starter scene's
+#          Torch/Flicker behavior seeds `random.uniform` at construction but
+#          only CONSUMES it in `update()`, which a bare `Renderer().render()`
+#          (no `scene.update()` step) never calls. ----
+_golden_path = os.path.join(REPO, "tests", "fixtures", "perpixel_starter_golden.npy")
+assert os.path.exists(_golden_path), f"no golden at {_golden_path}"
+_golden = np.load(_golden_path)
+_gate_lib = engine.AssetLibrary(os.path.join(REPO, "assets"))
+_gate_scene = build_starter_scene(engine, _gate_lib)
+_gate_camera = engine.Camera(position=engine.Vec3(6.0, 2.6, 9.0), yaw=0.45, pitch=-0.08)
+_gate_surf = pygame.Surface((320, 200))
+Renderer().render(_gate_surf, _gate_scene, _gate_camera)
+_gate_current = pygame.surfarray.array3d(_gate_surf).astype(np.int32)
+_gate_diff = np.abs(_gate_current - _golden)
+_gate_ndiff = int((_gate_diff.sum(axis=2) > 0).sum())
+assert _gate_diff.mean() == 0.0 and _gate_diff.max() == 0.0, (
+    f"BYTE-IDENTICAL GATE FAILED: {_gate_ndiff} of {_golden.shape[0] * _golden.shape[1]} "
+    f"pixels differ vs main (mean={_gate_diff.mean()}, max={_gate_diff.max()})")
+print(f"16. byte-identical gate OK: 0 of {_golden.shape[0] * _golden.shape[1]} pixels differ "
+     "vs a pre-run2 `main` render of the starter scene (mean/max diff 0)")
+
+# ---- 17. per-pixel texturing is NOT vacuous: a directly-bound base_color
+#          texture shows real per-pixel variation across a single face's
+#          pixels; the SAME graph with the tex_sample multiply-wrapped (falls
+#          back to the per-face bake, check #14) gives exactly ONE color --
+#          same render pipeline, only the binding differs, isolating the
+#          per-pixel path as the cause of the variation. Lighting is pure
+#          flat ambient (ambient=1.0, no directional/point lights) so the
+#          ONLY source of per-pixel variation possible is the texture itself
+#          (a plain per-pixel-lit flat-albedo face would ALSO vary slightly
+#          from lighting falloff, which would make the "1 color" control
+#          meaningless). ----
+_tex_tmp = os.path.join(TMP, "judge_perpixel_run2_assets")
+_tex_dir17 = os.path.join(_tex_tmp, "textures")
+os.makedirs(_tex_dir17, exist_ok=True)
+_tex_path17 = os.path.join(_tex_dir17, "grad.png")
+_surf17 = pygame.Surface((8, 8))
+for _yy in range(8):
+    for _xx in range(8):
+        _surf17.set_at((_xx, _yy), (_xx * 32 % 256, _yy * 32 % 256, (_xx * 7 + _yy * 13) % 256))
+pygame.image.save(_surf17, _tex_path17)
+texture_mod.set_texture_root(_tex_tmp)
+texture_mod.clear_cache()
+
+_quad_verts = [(-2, -2, -5), (2, -2, -5), (2, 2, -5), (-2, 2, -5)]  # box-projected UVs vary 0..1 across it
+_quad_camera = engine.Camera(position=engine.Vec3(0.0, 0.0, 0.0), yaw=0.0, pitch=0.0)
+
+
+def _build_quad_scene(direct_bind: bool, u_tiling: float = 1.0, v_tiling: float = 1.0):
+    scene17 = engine.Scene(light=engine.DirectionalLight(
+        engine.Vec3(0, -1, 0), ambient=1.0, color=(255, 255, 255), intensity=0.0))
+    ent17 = engine.Entity("quad", mesh=mesh_mod.Mesh(_quad_verts, [(0, 1, 2, 3)]))
+    g17 = engine.MaterialGraph()
+    ts17 = g17.add("tex_sample", (0, 0))
+    g17.nodes[ts17]["texture"] = "textures/grad.png"
+    if direct_bind:
+        if u_tiling != 1.0 or v_tiling != 1.0:
+            tc17 = g17.add("tex_coord", (0, 0))
+            g17.nodes[tc17]["params"]["u_tiling"] = u_tiling
+            g17.nodes[tc17]["params"]["v_tiling"] = v_tiling
+            assert g17.connect(tc17, ts17, "uv")
+        assert g17.connect(ts17, g17.output_id(), "base_color", "RGB")
+    else:
+        mul17 = g17.add("multiply", (0, 0))
+        one17 = g17.add("constant3vector", (0, 0))
+        assert g17.connect(ts17, mul17, "a", "RGB")
+        assert g17.connect(one17, mul17, "b")
+        assert g17.connect(mul17, g17.output_id(), "base_color")
+    ent17.material = g17
+    g17.apply(ent17)
+    scene17.add(ent17)
+    return scene17
+
+
+def _render_quad(scene17):
+    surf17 = pygame.Surface((200, 150))
+    Renderer().render(surf17, scene17, _quad_camera)
+    return pygame.surfarray.array3d(surf17).astype(np.int32)
+
+
+_bg17 = np.asarray(engine.Scene().background)
+_img_direct = _render_quad(_build_quad_scene(direct_bind=True))
+_mask_direct = ~np.all(_img_direct == _bg17[None, None, :], axis=2)
+_distinct_direct = len(np.unique(_img_direct[_mask_direct].reshape(-1, 3), axis=0))
+
+_img_fallback = _render_quad(_build_quad_scene(direct_bind=False))
+_mask_fallback = ~np.all(_img_fallback == _bg17[None, None, :], axis=2)
+_distinct_fallback = len(np.unique(_img_fallback[_mask_fallback].reshape(-1, 3), axis=0))
+
+assert _mask_direct.sum() > 1000, "quad should cover a substantial part of the frame"
+assert _distinct_direct > 50, f"expected many distinct colors from per-pixel sampling, got {_distinct_direct}"
+assert _distinct_fallback == 1, f"expected exactly 1 color from the per-face bake control, got {_distinct_fallback}"
+print(f"17. per-pixel variation OK: direct-bind base_color shows {_distinct_direct} distinct "
+     f"colors across {int(_mask_direct.sum())} pixels of ONE face; multiply-wrapped fallback "
+     f"(same graph, same face) gives exactly 1 -- confirms the per-pixel path, not lighting, "
+     "is the source of variation")
+
+# ---- 18. tiling: u_tiling/v_tiling actually reach the sampler. Cross-check
+#          the renderer's own formula (uv * [u_tiling, v_tiling] -> sample_
+#          texture) directly against an independent `sample_texture` call at
+#          a few known UV points, AND confirm a tiled render still samples
+#          the same 8x8 palette (the texture repeats; it doesn't go out of
+#          range or distort) while visibly differing from the untiled render. ----
+_tex_img18 = texture_mod.load_texture(_tex_path17)
+for _uv_point, _tile in ((np.array([[0.2, 0.7]], dtype=np.float32), (1.0, 1.0)),
+                         (np.array([[0.2, 0.7]], dtype=np.float32), (3.0, 2.0)),
+                         (np.array([[0.9, 0.05]], dtype=np.float32), (2.5, 4.0))):
+    _tiling_arr = np.array(_tile, dtype=np.float32)
+    _renderer_rgb, _ = texture_mod.sample_texture(_tex_img18, _uv_point * _tiling_arr)
+    _expected_rgb, _ = texture_mod.sample_texture(
+        _tex_img18, np.array([[_uv_point[0, 0] * _tile[0], _uv_point[0, 1] * _tile[1]]], dtype=np.float32))
+    assert np.array_equal(_renderer_rgb, _expected_rgb)
+print("18a. tiling formula OK: renderer's uv*[u_tiling,v_tiling] matches independent sample_texture math")
+
+_img_tiled = _render_quad(_build_quad_scene(direct_bind=True, u_tiling=3.0, v_tiling=3.0))
+_mask_tiled = ~np.all(_img_tiled == _bg17[None, None, :], axis=2)
+_distinct_tiled = len(np.unique(_img_tiled[_mask_tiled].reshape(-1, 3), axis=0))
+assert _distinct_tiled > 50, f"tiled render should still sample the full palette, got {_distinct_tiled}"
+assert not np.array_equal(_img_tiled, _img_direct), "tiling=3 must render differently than tiling=1"
+print(f"18b. tiled render OK: {_distinct_tiled} distinct colors (still the full palette, repeated), "
+     "differs from the untiled render")
+
+# ---- 19. LOD-swim consequence (documented, not fixed this run): LOD levels
+#          get a FRESH box projection (run 1's decision, see check #13), not
+#          the source mesh's corner_uvs -- so a textured mesh's per-pixel UV
+#          genuinely changes at the LOD switch distance. Confirm it happens
+#          and quantify it (do not address it -- see HANDOFF). ----
+_hp19 = mesh_mod.icosphere(radius=1.0, subdivisions=3)
+_lods19 = lod_mod.generate_lods(_hp19)
+assert len(_lods19) > 1
+_lod0_corner_uv_range = (_lods19[0].corner_uvs.min(), _lods19[0].corner_uvs.max())
+_lod1_corner_uv_range = (_lods19[1].corner_uvs.min(), _lods19[1].corner_uvs.max())
+# different face counts -> corner_uvs isn't even the same shape, let alone
+# the same values, so a texture sampled per-pixel WILL show a different
+# pattern (a visible "swim") the instant the LOD switches
+assert _lods19[0].corner_uvs.shape != _lods19[1].corner_uvs.shape, (
+    "LOD0 and LOD1 unexpectedly share a corner_uvs shape -- swim claim needs re-checking")
+print(f"19. LOD-swim confirmed OK: LOD0 has {len(_lods19[0].faces)} faces "
+     f"(corner_uvs {_lods19[0].corner_uvs.shape}), LOD1 has {len(_lods19[1].faces)} faces "
+     f"(corner_uvs {_lods19[1].corner_uvs.shape}) -- different face topology and freshly "
+     "box-projected UVs means a per-pixel-textured mesh's sampled pattern WILL jump at the "
+     "LOD switch distance (documented limitation, not addressed this run -- see HANDOFF)")
+
+# ---- cleanup: temp texture assets for sections 17/18 ----
+texture_mod.clear_cache()
+texture_mod.set_texture_root(os.path.join(REPO, "assets"))
+import shutil as _shutil17
+_shutil17.rmtree(_tex_tmp, ignore_errors=True)
 
 # ---- cleanup: don't leave judge artifacts in the real assets/ tree ----
 os.remove(tex_asset.path)
