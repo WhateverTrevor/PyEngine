@@ -456,4 +456,72 @@ texture_mod.set_texture_root(os.path.join(REPO, "assets"))
 import shutil as _shutil10
 _shutil10.rmtree(_tex_tmp, ignore_errors=True)
 
+# 12. CACHE IDENTITY REGRESSION: `_get_geo_cache`/`_get_entity_uniforms` key
+# off `mesh._cache_id`/`entity._cache_id` (monotonic per-instance serials,
+# see engine/mesh.py and engine/scene.py), not `id(mesh)`/`id(entity)`. The
+# `_geo_cache`/`_entity_uniform_cache` dicts hold no strong reference to what
+# they cache (only derived GPU buffers/ids), so once a scene is dropped and
+# gc'd, CPython is free to reuse a dead Mesh/Entity's address for a
+# brand-new, unrelated one. An id()-keyed cache would then return the OLD
+# entry on lookup -- IndexError if face counts differ (covered live by
+# repro_cache.py during development, ~1 iteration on this backend), or,
+# worse, SILENTLY WRONG geometry if they coincide, since a cache HIT never
+# rebuilds the geometry buffer (only color/pbr/opacity get a per-hit
+# staleness check). This mirrors gl_checks.py's check #11, reproducing
+# exactly the silent case: two 6-quad cubes of the SAME topology but wildly
+# different SIZE, so a false hit renders the WRONG (stale) size with no
+# exception at all -- the case the bug report says matters more than the
+# crash. Verified against pre-fix code (a `git worktree` of main @ c46d706)
+# during implementation: this exact loop measured min-large-count ==
+# max-small-count (a "small" iteration rendering fully as the LARGE cube's
+# stale geometry), so it is a real regression gate, not a vacuous one.
+import gc as _gc12
+
+_CR_W, _CR_H = 160, 120
+_cr_cam = engine.Camera(position=engine.Vec3(0, 0, 6), yaw=0.0, pitch=0.0)
+
+
+def _cr_scene(size):
+    sc = engine.Scene(light=engine.DirectionalLight(engine.Vec3(-0.3, -1, -0.2), ambient=0.6))
+    sc.add(engine.Entity("cube", mesh=engine.cube(size, color=(255, 40, 40))))
+    return sc
+
+
+def _cr_frame(scene):
+    wr.render(scene, _cr_cam, (_CR_W, _CR_H))
+    return np.frombuffer(wr.read_frame(), np.uint8).reshape(_CR_H, _CR_W, 4)[..., :3]
+
+
+def _cr_red_count(img):
+    r, g = img[..., 0].astype(int), img[..., 1].astype(int)
+    return int(((r > 100) & (r > 2 * g)).sum())
+
+
+_cr_addrs_seen, _cr_recycled = {}, False
+_cr_small, _cr_large = [], []
+for _cr_i in range(40):
+    _cr_size = 0.6 if _cr_i % 2 == 0 else 3.2
+    _cr_sc = _cr_scene(_cr_size)
+    _cr_mesh = _cr_sc.entities[0].mesh
+    _cr_key = id(_cr_mesh)  # raw address, purely to detect recycling for the assert below
+    _cr_prev = _cr_addrs_seen.get(_cr_key)
+    if _cr_prev is not None and _cr_prev != _cr_size:
+        _cr_recycled = True
+    _cr_addrs_seen[_cr_key] = _cr_size
+    _cr_count = _cr_red_count(_cr_frame(_cr_sc))
+    (_cr_small if _cr_size < 1.0 else _cr_large).append(_cr_count)
+    del _cr_sc, _cr_mesh
+    _gc12.collect()
+
+assert _cr_recycled, ("address recycling never occurred in 40 iterations -- "
+                      "this run cannot validate the fix; re-run or raise the iteration count")
+_cr_min_large, _cr_max_small = min(_cr_large), max(_cr_small)
+assert _cr_min_large > _cr_max_small * 3, (
+    f"CACHE IDENTITY REGRESSION: a false cache hit rendered a stale (wrong-size) mesh -- "
+    f"min large-cube red px={_cr_min_large}, max small-cube red px={_cr_max_small} "
+    "(expected the large cube to always dominate)")
+print(f"12. cache identity regression OK: address recycling confirmed over 40 iterations; "
+     f"small-cube red px range [{min(_cr_small)}, {max(_cr_small)}], large-cube range "
+     f"[{min(_cr_large)}, {max(_cr_large)}] -- no false cache hit smeared sizes together")
+
 print("JUDGE DX12 CHECKS PASSED")

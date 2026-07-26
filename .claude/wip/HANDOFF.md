@@ -1,35 +1,34 @@
-# No task in flight — per-pixel texturing slate COMPLETE 2026-07-26
+# No task in flight — GPU cache-identity fix merged 2026-07-26
 
-All four runs (per-corner UV foundation, CPU sampling, OpenGL parity,
-wgpu/DX12 parity) are judged, squash-merged to main and pushed. Working
-tree clean, all wip branches deleted. Per-pixel texturing works on all
-three backends.
+The `id()`-keyed geometry/uniform cache bug is fixed on both GPU backends,
+judged, squash-merged and pushed. Working tree clean, `wip/cache-identity`
+deleted.
 
 Read `CLAUDE.md` first — "Verification" (27 suites) and "Known gaps /
-natural backlog", which now carries the cross-backend parity facts and the
-remaining work.
+natural backlog".
 
 ## Next task: wgpu directional sun-shadow attenuation
 
-**This is the only item left from the user's own stated priority list.**
-They ranked it second, above per-pixel texturing; it was skipped only
-because they said "go ahead" on the texturing split. Do it next unless
-told otherwise.
+**Still the only item left from the user's own stated priority list.** They
+ranked it second (above per-pixel texturing, which is now complete); it has
+been deferred twice by their own "go ahead" instructions on other work. Do
+it next unless told otherwise.
 
 GL has `dlShadowTex`; wgpu lacks directional (sun) shadow attenuation on
-mesh faces — the last wgpu visual gap. It is single-backend, so unlike the
+mesh faces — the last wgpu visual gap. Single-backend, so unlike the
 texturing slate it does NOT need pre-splitting; budget one run.
 
-Useful precedent now on disk: the texturing slate established a working
-pattern for wgpu visual work — an untextured/unaffected golden regression
-gate captured from a real main worktree, plus a dx12-vs-CPU (or vs-GL)
-parity gate with a tolerance justified by measured numbers AND a
-discrimination check. Reuse it.
+Reusable pattern now well established for wgpu visual work: an
+unaffected-scene golden regression gate captured from a real main worktree,
+plus a dx12-vs-CPU (or vs-GL) parity gate whose tolerance is justified by
+measured numbers AND a discrimination check showing what the failure
+actually measures.
 
-After that, from the backlog: LOD swim (the most user-visible loose end of
-the texturing slate — a textured pattern jumps at the LOD switch distance,
-because decimated levels get a fresh box projection), the id()-keyed cache
-trap, per-pixel GI bounce colour, bilinear/mipmap filtering.
+Then, from the backlog: the remaining id()-as-version-stamp risks
+(`color_id`/`pbr_id`/`opacity_id`, `_get_env_tex`) — same bug class as the
+one just fixed but with an inverted, silent failure mode; LOD swim (the
+most user-visible loose end of the texturing slate); per-pixel GI bounce
+colour; bilinear/mipmap filtering.
 
 ## If you are the next supervisor, know these six things
 
@@ -41,47 +40,51 @@ trap, per-pixel GI bounce colour, bilinear/mipmap filtering.
    directly. Held modifiers need OS-boundary patching — see marquee_checks
    or `ctrl_key()` in bp_component_checks.
 3. **FPS numbers here are untrustworthy**: 2-10x slow, high variance, and
-   they DRIFT over a long session (the same demo measured 14 FPS early and
-   9 FPS late on identical code). Interleaved same-environment A/B against
+   they DRIFT over a long session. Interleaved same-environment A/B against
    a `git worktree` of main is the only meaningful form; remove the
    worktree before merging, since one holding `main` blocks
    `git checkout main`. Where a byte-identical gate exists it is STRONGER
-   evidence than any FPS number that a code path is untouched.
-4. **Agents stop at "waiting for the battery"** — three of the seven runs
-   this session did, twice leaving files uncommitted. The last four
+   evidence than any FPS number that a code path is untouched — there are
+   now four such gates (three per-pixel goldens + the CPU starter golden).
+4. **Agents stop at "waiting for the battery"** — three of the eight runs
+   this session did, twice leaving files uncommitted. The last five
    complied when told explicitly; keep the instruction, budget for doing it
    yourself anyway.
-5. **STEP 0 works.** A pushed branch + HANDOFF skeleton before any code
-   turned a zero-output usage-limit death into a recoverable run. It is now
-   in every brief.
+5. **STEP 0 works** and is now in every brief: push a branch + HANDOFF
+   skeleton before writing any code.
 6. **Never touch the user's untracked asset data**: assets/gat.json,
    assets/models/gat.npz, assets/folders.json, assets/blueprints/.
 
-## Verification habits that earned their keep
+## The single highest-leverage supervisor habit
 
-Seven runs merged this session. Every one passed its own tests AND the full
+**Reproduce the bug yourself before briefing it.** The cache-identity run
+was the cheapest of the session (176k, no send-back) precisely because the
+brief carried a real traceback and a working repro script. It also changed
+the DESIGN: reproducing it showed the defect was silent corruption rather
+than a crash, which ruled out the count-sidecar fix that would otherwise
+have looked reasonable. The ledger shows the same pattern on the
+text-input and ctx-menu bugs.
+
+## Verification habits that keep finding real things
+
+Eight runs merged this session. Every one passed its own tests AND the full
 battery; several still had defects or unproven claims found only by
 independent checks:
 - **Never trust a golden fixture's provenance.** All three per-pixel
-  goldens would have proven nothing if captured from their own branch.
-  Re-render from a real main worktree and diff. All three came back 0 px —
-  the check has never failed, which is exactly why it stays cheap to run
-  and worth running.
+  goldens would have proven nothing if captured from their own branch;
+  re-render from a real main worktree and diff. All came back 0 px.
+- **Never trust "this test would have caught it."** Run the new test
+  against pre-fix code in a worktree and confirm it FAILS. Done for the
+  cache fix; both suites failed pre-fix with an exact signature.
 - **Test the tolerance, not just the value.** A parity gate is only a gate
-  if a real bug exceeds it. Measure the failure mode's magnitude: a silent
-  flat-per-face fallback is mean ~13.3 / ~25% differing against a 3.0 / 3%
-  gate and 0.266 / 0.58% actual.
+  if a real bug exceeds it — measure the failure mode's magnitude.
 - **Prove the feature isn't vacuous.** Corner UVs all equal, or a texture
-  rendering one flat colour, would pass most assertions. Count distinct
-  colours within a single face; measure UV spread.
+  rendering one flat colour, would pass most assertions.
 - **Find the case where a wrong implementation coincidentally passes.** A
   box-projected quad is globally affine, so an always-use-triangle-1
   barycentric bug looks correct until you build a non-affine quad.
 - **Check the invalidation KEY, not the obvious field.** Run 2b warned on
   position changes; ShadowTracer keys on the full transform matrix.
-- **Measure what the brief said to measure**, and probe next to it — run
-  2b's shadow measurement validated its design, and probing the adjacent
-  cost found unbounded thread accumulation no test covered.
 
 When a task IS in flight, this file holds its resume state per the
 checkpoint protocol in `CLAUDE.md` and `.claude/agents/engine-coder.md`.

@@ -11,14 +11,17 @@ global face id (`entity's face offset in the scene + local face index`).
 
 Geometry is a per-entity, non-indexed "vertex soup" in LOCAL space (position,
 flat-shaded face normal, face color, local face index), cached by
-`id(mesh)` -- `mesh` being whichever LOD `entity.render_mesh()` selects this
-frame (see engine/lod.py), NOT necessarily `entity.mesh`; every LOD level an
-entity has gets its own cache entry, kept alive as long as the entity is
-live (see `_prune_geo_cache`) so switching LOD reuses buffers instead of
-rebuilding. Only the color buffer is rebuilt when the material editor swaps
-`mesh.face_colors` for a new array. Model/normal matrices are per-draw
-uniforms -- one draw call per entity, which is plenty for the entity counts
-this engine deals with.
+`mesh._cache_id` -- `mesh` being whichever LOD `entity.render_mesh()` selects
+this frame (see engine/lod.py), NOT necessarily `entity.mesh`; every LOD
+level an entity has gets its own cache entry, kept alive as long as the
+entity is live (see `_prune_geo_cache`) so switching LOD reuses buffers
+instead of rebuilding. The cache key is a monotonic per-Mesh serial, not
+`id(mesh)`: CPython recycles freed addresses, so a scene rebuild could land
+a new Mesh on a previous one's address and an `id()`-keyed cache would
+return the WRONG entry (see `mesh._mesh_id_counter`). Only the color buffer
+is rebuilt when the material editor swaps `mesh.face_colors` for a new
+array. Model/normal matrices are per-draw uniforms -- one draw call per
+entity, which is plenty for the entity counts this engine deals with.
 
 Translucent materials (`MaterialGraph.blend_mode == "translucent"`, see
 engine/materials.py) draw in a second pass after all opaque geometry: depth
@@ -887,7 +890,10 @@ class GLRenderer:
 
     # ------------------------------------------------------------------
     def _get_geo_cache(self, mesh) -> dict:
-        key = id(mesh)
+        # keyed on the mesh's own monotonic serial, not id(mesh) -- see the
+        # module docstring's "Geometry is..." paragraph for why a raw address
+        # is unsafe (CPython recycles them across a scene rebuild).
+        key = mesh._cache_id
         cache = self._geo_cache.get(key)
         if cache is None:
             pos, nrm, fid, face_id_tri, m = _build_geometry(mesh)
@@ -949,9 +955,9 @@ class GLRenderer:
         # costs at most a fraction more VRAM than caching LOD0 alone.
         live_ids = set()
         for e in live_entities:
-            live_ids.add(id(e.mesh))
+            live_ids.add(e.mesh._cache_id)
             for m in e.lod_meshes:
-                live_ids.add(id(m))
+                live_ids.add(m._cache_id)
         for key in [k for k in self._geo_cache if k not in live_ids]:
             c = self._geo_cache.pop(key)
             c["vao"].release()

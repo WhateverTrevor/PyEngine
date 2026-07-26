@@ -104,12 +104,16 @@ bp_component_checks, bp_runtime_checks.
   texturing; it was skipped only because they said "go ahead" on the
   texturing split. Do this next unless told otherwise. Single-backend, so
   it does NOT need pre-splitting.
-- Both GPU backends key `_geo_cache`/`_entity_uniform_cache` on
-  `id(mesh)`/`id(entity)` with no content check. CPython recycles
-  addresses, so a rebuilt scene can produce a false cache hit (IndexError,
-  or silently wrong geometry if sizes coincide). Hit for real in a
-  benchmark script that rebuilt scenes per iteration; never in normal use,
-  since nothing rebuilds whole scenes per frame. Latent trap for tooling.
+- GPU cache identity: `_geo_cache`/`_entity_uniform_cache` are FIXED (keyed
+  on a monotonic `Mesh._cache_id`/`Entity._cache_id`, not `id()`), with
+  regression tests in gl_checks #11 / wgpu_checks #12 that were proven to
+  fail against pre-fix code. **Still outstanding, same bug class on
+  arrays:** the `color_id`/`pbr_id`/`opacity_id` version stamps inside
+  `_get_geo_cache`'s cache-hit branch, and `_get_env_tex`'s
+  `id(env.image)`. The stamps' failure mode is INVERTED — a false match
+  means "unchanged, skip the rebuild", so a material change silently fails
+  to appear — and it is reachable because `MaterialGraph.apply` assigns new
+  arrays onto a surviving mesh.
 - Per-pixel texturing — PRE-SPLIT INTO 4 RUNS, run 1/4 DONE:
   1. [done] Per-corner UV foundation. `Mesh.corner_uvs` (M,4,2) parallel to
      `faces`; FBX import now preserves the per-polygon-vertex UVs it used

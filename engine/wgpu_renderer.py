@@ -1057,8 +1057,13 @@ class WgpuRenderer:
     # per-mesh / per-entity GPU buffer caches (mirrors GLRenderer)
     # ------------------------------------------------------------------
     def _get_geo_cache(self, mesh) -> dict:
+        # keyed on the mesh's own monotonic serial (`Mesh._cache_id`), not
+        # id(mesh) -- CPython recycles freed addresses, so a scene rebuild
+        # could land a new Mesh on a previous one's address and an
+        # id()-keyed cache would return the WRONG entry (mirrors GLRenderer's
+        # identical fix; see gl_renderer.py's module docstring).
         wgpu = self._wgpu
-        key = id(mesh)
+        key = mesh._cache_id
         cache = self._geo_cache.get(key)
         if cache is None:
             pos, nrm, fid, face_id_tri, m = _build_geometry(mesh)
@@ -1124,9 +1129,9 @@ class WgpuRenderer:
         # comment on its _prune_geo_cache (mirrors this one).
         live_mesh_ids = set()
         for e in live_entities:
-            live_mesh_ids.add(id(e.mesh))
+            live_mesh_ids.add(e.mesh._cache_id)
             for m in e.lod_meshes:
-                live_mesh_ids.add(id(m))
+                live_mesh_ids.add(m._cache_id)
         for key in [k for k in self._geo_cache if k not in live_mesh_ids]:
             c = self._geo_cache.pop(key)
             c["geom_buf"].destroy()
@@ -1134,13 +1139,16 @@ class WgpuRenderer:
             c["pbr_buf"].destroy()
             c["opacity_buf"].destroy()
             c["uv_buf"].destroy()
-        live_ent_ids = {id(e) for e in live_entities}
+        # entity._cache_id, not id(entity) -- same recycled-address hazard
+        # as the geometry cache above, but for the per-entity uniform/bind
+        # group cache (`_get_entity_uniforms`).
+        live_ent_ids = {e._cache_id for e in live_entities}
         for key in [k for k in self._entity_uniform_cache if k not in live_ent_ids]:
             self._entity_uniform_cache.pop(key)["ubo"].destroy()
 
     def _get_entity_uniforms(self, entity) -> dict:
         wgpu = self._wgpu
-        key = id(entity)
+        key = entity._cache_id
         cache = self._entity_uniform_cache.get(key)
         if cache is None:
             ubo = self.device.create_buffer(

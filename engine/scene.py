@@ -1,9 +1,17 @@
 """Scene graph: entities, transforms, and attachable behaviors."""
 from __future__ import annotations
 
+import itertools
+
 from .lighting import DirectionalLight, Fog, PointLight
 from .math3d import Vec3, rotation_x, rotation_y, rotation_z, scaling, translation
 from .mesh import Mesh
+
+# Monotonically increasing per-instance serial for Entity, same rationale as
+# `mesh._mesh_id_counter`: the GPU backends' entity-uniform cache
+# (wgpu_renderer.py's `_get_entity_uniforms`) keys on this instead of
+# `id(entity)`, which CPython can recycle across a scene rebuild.
+_entity_id_counter = itertools.count()
 
 
 class Behavior:
@@ -45,6 +53,10 @@ class Entity:
     def __init__(self, name: str = "entity", mesh: Mesh | None = None,
                  position: Vec3 | None = None, rotation: Vec3 | None = None,
                  scale: Vec3 | None = None, light: PointLight | None = None):
+        # Cache identity for the GPU backends -- see `_entity_id_counter`
+        # above. Not part of the entity's identity anywhere else (never
+        # compared, saved, or round-tripped through scene JSON).
+        self._cache_id = next(_entity_id_counter)
         self.name = name
         self.mesh = mesh
         self.transform = Transform(position, rotation, scale)

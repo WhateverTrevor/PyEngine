@@ -18,15 +18,33 @@ See `Mesh._build_uvs` for exactly how the two are populated/reconciled.
 """
 from __future__ import annotations
 
+import itertools
 import math
 
 import numpy as np
+
+# Monotonically increasing per-instance serial, handed out at construction
+# (see `Mesh.__init__`'s `self._cache_id`). The GPU backends (gl_renderer.py,
+# wgpu_renderer.py) key their geometry caches on this instead of `id(mesh)`:
+# CPython recycles freed object addresses, so a scene rebuild can land a new
+# Mesh on a previous one's address and `id()` alone would return the WRONG
+# cache entry -- silently, if the two meshes' face counts happen to match.
+# A serial can never collide, so a cache miss is never a false hit.
+# `itertools.count().__next__` is a single C-level call, atomic under the
+# GIL, so this is safe if meshes are ever constructed off the main thread
+# (e.g. a blueprint runtime script).
+_mesh_id_counter = itertools.count()
 
 
 class Mesh:
     def __init__(self, vertices, faces, base_color=(200, 200, 200), face_colors=None,
                  face_uvs=None, corner_uvs=None, face_roughness=None, face_metallic=None,
                  face_emissive=None, face_opacity=None):
+        # Cache identity for the GPU backends -- see `_mesh_id_counter` above.
+        # Not part of the mesh's geometric/visual identity: never compared,
+        # saved, or round-tripped through npz/pickling, so it has no effect
+        # on equality assumptions or serialization elsewhere in the engine.
+        self._cache_id = next(_mesh_id_counter)
         self.vertices = np.asarray(vertices, dtype=np.float64)   # (N, 3)
         self._polys = [tuple(int(i) for i in f) for f in faces]
         if face_colors is None:
