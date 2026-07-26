@@ -1,9 +1,14 @@
 """Judge checks: texture assets (import, browser thumbnail), TexCoord /
-TextureSample material nodes, box-projection UV fallback, and FBX UV
-round-trip. Headless; PYENGINE_SETTINGS points at a temp path so this never
-touches the user's real settings.json.
+TextureSample material nodes, box-projection UV fallback, FBX UV
+round-trip, and per-corner UVs (Mesh.corner_uvs / box_project_uv_corners /
+FBX corner-detail import / npz round-trip incl. legacy no-corner-UV npz /
+LOD's drop-and-regenerate decision -- see engine/mesh.py's `_build_uvs` and
+engine/lod.py's module docstring for the design). Headless; PYENGINE_
+SETTINGS points at a temp path so this never touches the user's real
+settings.json.
 """
 import os
+import struct
 import sys
 import tempfile
 
@@ -18,6 +23,7 @@ import pygame
 
 import engine
 from engine import fbx as fbx_mod
+from engine import lod as lod_mod
 from engine import mesh as mesh_mod
 from engine import texture as texture_mod
 from editor import ICON, make_icon
@@ -131,7 +137,8 @@ print("box-projection fallback OK: sane 0..1 UVs on cube/cylinder/icosphere/toru
 #         reimport, and the per-face UV survives ----
 uv_fbx_path = os.path.join(TMP, "judge_uv_roundtrip.fbx")
 fbx_mod.export_fbx(plane, uv_fbx_path, name="UVPlane")
-_verts, _faces, _colors, reimported_uv = fbx_mod.extract_geometry(uv_fbx_path)
+_verts, _faces, _colors, reimported_uv, _reimported_corner_uv = \
+    fbx_mod.extract_geometry(uv_fbx_path)
 assert reimported_uv is not None, "exported LayerElementUV must be read back"
 assert reimported_uv.shape == plane.face_uvs.shape
 assert np.allclose(reimported_uv, plane.face_uvs, atol=1e-4), \
@@ -153,6 +160,194 @@ os.remove(os.path.join(lib.directory, f"{stem}.json"))
 os.remove(os.path.join(lib.directory, "models", f"{stem}.npz"))
 os.remove(cube_fbx_path)
 print("imported-model face_uvs OK: survives the .npz asset round-trip")
+
+# ============================================================================
+# per-corner UV foundation (run 1/4 of the per-pixel texturing slate) --
+# Mesh.corner_uvs / box_project_uv_corners / FBX corner-detail import /
+# npz round-trip incl. legacy no-corner-UV npz / LOD's drop decision.
+# ============================================================================
+
+# ---- 8. corner-UV shape/padding convention matches `faces` exactly, for
+#         every built-in primitive (incl. quads AND triangle-only meshes) ----
+for m in (mesh_mod.box(2.0, 3.0, 1.5), mesh_mod.cylinder(), mesh_mod.cone(),
+         mesh_mod.icosphere(), mesh_mod.torus(), plane):
+    assert m.corner_uvs.shape == (len(m.faces), 4, 2), \
+        f"corner_uvs shape {m.corner_uvs.shape} != faces-parallel {(len(m.faces), 4, 2)}"
+    is_tri = m.faces[:, 2] == m.faces[:, 3]
+    assert np.array_equal(m.corner_uvs[is_tri, 3], m.corner_uvs[is_tri, 2]), \
+        "a padded triangle's 4th corner UV must repeat the 3rd (Mesh._build convention)"
+print("8. corner-UV shape/padding OK: (M,4,2), triangle padding matches faces")
+
+# ---- 9. byte-identical gate: face_uvs for the box-projection default must
+#         equal what main produces, EXACTLY (np.array_equal, not allclose).
+#         Values captured from a real `main` worktree at commit 0ca14d7
+#         (`git worktree add ../_main_worktree main`) -- cylinder, not box,
+#         because box's UVs are all a trivial 0.5 (would pass even with a
+#         broken derivation formula); these have real non-trivial digits. ----
+_cyl_main_face_uvs = {
+    0: (0.5, 0.625),
+    1: (0.7332531754730549, 0.5625),
+    5: (0.6707531754730549, 0.6707531754730548),
+    12: (0.1584936490538904, 0.5),
+    20: (0.26674682452694515, 0.43750000000000006),
+    30: (0.8415063509461096, 0.5),
+    35: (0.7332531754730548, 0.43749999999999994),
+}
+_cyl = mesh_mod.cylinder()
+for idx, expected in _cyl_main_face_uvs.items():
+    got = _cyl.face_uvs[idx]
+    assert np.array_equal(got, np.array(expected, dtype=np.float64)), \
+        f"face_uvs[{idx}] byte-identical gate FAILED: {got.tolist()} vs main's {expected}"
+print("9. byte-identical gate OK: face_uvs matches main's box-projection exactly "
+     f"({len(_cyl_main_face_uvs)} cylinder faces checked bit-for-bit)")
+
+# ---- 10. a box-projected primitive's corner UVs actually VARY across a
+#          face -- the entire point of this run. At least one face on each
+#          shape must have non-equal corners (a flat/uniform result would
+#          mean corner_uvs carries no more information than face_uvs). ----
+for name, m in (("cylinder", mesh_mod.cylinder()), ("icosphere", mesh_mod.icosphere()),
+               ("torus", mesh_mod.torus()), ("checkerboard", plane)):
+    corners = m.corner_uvs  # (M, 4, 2)
+    varies = not np.allclose(corners[:, 0], corners[:, 1])
+    assert varies, f"{name}: corner UVs are flat across every face -- expected real variation"
+    # and the mean over the 4 (padded) corners stays numerically CLOSE to
+    # face_uvs even though it's not bit-identical (see mesh.py's _build_uvs
+    # docstring for why: float division doesn't commute with averaging)
+    assert np.allclose(corners.mean(axis=1), m.face_uvs, atol=1e-9), \
+        f"{name}: mean(corner_uvs) drifted too far from face_uvs"
+print("10. corner UVs vary across a face OK (cylinder/icosphere/torus/checkerboard), "
+     "mean(corners) stays numerically close to face_uvs")
+
+# ---- 11. FBX import preserves REAL per-corner detail. export_fbx (the
+#          write direction, intentionally untouched by this run) still
+#          repeats one UV per face across every polygon vertex, so a
+#          round-trip through our own exporter can't prove this -- hand-
+#          build a minimal binary FBX with 4 genuinely different corner UVs
+#          on one quad, using fbx.py's own private node encoders (the exact
+#          shape export_fbx itself writes, see its body). ----
+def _write_minimal_uv_fbx(path, verts_cm, pvi, uv_flat):
+    gid, model_id = 1000, 2000
+    header_ext = ("FBXHeaderExtension", [], [
+        ("FBXHeaderVersion", [1003], []),
+        ("FBXVersion", [fbx_mod._FBX_VERSION], []),
+        ("Creator", ["PyEngine Test Fixture"], []),
+    ])
+    uv_layer = ("LayerElementUV", [0], [
+        ("Version", [101], []),
+        ("Name", [""], []),
+        ("MappingInformationType", ["ByPolygonVertex"], []),
+        ("ReferenceInformationType", ["Direct"], []),
+        ("UV", [np.asarray(uv_flat, dtype=np.float64)], []),
+    ])
+    layer = ("Layer", [0], [("Version", [100], []), ("LayerElement", [], [
+        ("Type", ["LayerElementUV"], []), ("TypedIndex", [0], []),
+    ])])
+    geometry = ("Geometry", [gid, "Geometry::Fixture", "Mesh"], [
+        ("GeometryVersion", [124], []),
+        ("Vertices", [verts_cm], []),
+        ("PolygonVertexIndex", [np.asarray(pvi, dtype=np.int32)], []),
+        uv_layer,
+        layer,
+    ])
+    model = ("Model", [model_id, "Model::Fixture", "Mesh"], [("Version", [232], [])])
+    objects = ("Objects", [], [geometry, model])
+    connections = ("Connections", [], [("C", ["OO", gid, model_id], [])])
+
+    header = b"Kaydara FBX Binary  \x00\x1a\x00" + struct.pack("<I", fbx_mod._FBX_VERSION)
+    pos = len(header)
+    body = b""
+    for node in (header_ext, objects, connections):
+        chunk = fbx_mod._encode_node(node, pos)
+        body += chunk
+        pos += len(chunk)
+    body += b"\x00" * 13
+    footer = fbx_mod._FOOTER_ID
+    footer += b"\x00" * ((-(len(footer)) - 4) % 16)
+    footer += struct.pack("<I", fbx_mod._FBX_VERSION) + b"\x00" * 120 + fbx_mod._FOOTER_EXT
+    footer += b"\x00" * 4
+    with open(path, "wb") as fh:
+        fh.write(header + body + footer)
+
+
+_corner_fbx_path = os.path.join(TMP, "judge_corner_uv_fixture.fbx")
+_verts_cm = np.array([0, 0, 0, 100, 0, 0, 100, 100, 0, 0, 100, 0], dtype=np.float64)
+_pvi = [0, 1, 2, ~3]  # last index negated/complemented -- closes the polygon
+_uv_flat = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]  # 4 distinct corners
+_write_minimal_uv_fbx(_corner_fbx_path, _verts_cm, _pvi, _uv_flat)
+_fx_verts, _fx_faces, _fx_colors, fx_face_uv, fx_corner_uv = \
+    fbx_mod.extract_geometry(_corner_fbx_path)
+os.remove(_corner_fbx_path)
+assert fx_corner_uv is not None and fx_corner_uv.shape == (1, 4, 2)
+assert np.allclose(fx_corner_uv[0], np.array(_uv_flat).reshape(4, 2)), \
+    f"hand-built per-vertex UVs did not survive extract_geometry: {fx_corner_uv[0]}"
+assert not np.allclose(fx_corner_uv[0, 0], fx_corner_uv[0, 1]), \
+    "corner UVs collapsed to a single value -- real per-vertex detail was lost"
+assert np.allclose(fx_face_uv[0], fx_corner_uv[0].mean(axis=0)), \
+    "extract_geometry's face_uvs mean must still equal the mean of the real corners"
+print("11. FBX import preserves per-corner detail OK: 4 distinct corner UVs "
+     "survive extract_geometry (not collapsed to one flat value)")
+
+# ---- 12. npz round-trip, including the LEGACY no-corner-UV path. A model
+#          with real corner_uvs written explicitly must round-trip through
+#          .npz + AssetDef.instantiate exactly; a legacy npz with NEITHER
+#          face_uvs NOR corner_uvs (the user's real assets/models/gat.npz,
+#          confirmed read-only and untouched below) must still load and
+#          fall back to box projection for both, identically to before this
+#          feature existed. ----
+corner_cube_path = os.path.join(TMP, "judge_corner_uv_model.fbx")
+uv_cube2 = mesh_mod.box(2.0, 2.0, 2.0)
+fbx_mod.export_fbx(uv_cube2, corner_cube_path, name="UVCubeCorner")
+corner_model_name = engine.import_fbx(corner_cube_path, lib.directory)
+lib.reload()
+corner_model_entity = lib.instantiate(corner_model_name)
+assert corner_model_entity.mesh.corner_uvs is not None
+assert corner_model_entity.mesh.corner_uvs.shape == (len(corner_model_entity.mesh.faces), 4, 2)
+stem2 = os.path.splitext(os.path.basename(corner_cube_path))[0]
+os.remove(os.path.join(lib.directory, f"{stem2}.json"))
+os.remove(os.path.join(lib.directory, "models", f"{stem2}.npz"))
+os.remove(corner_cube_path)
+
+_gat_npz_path = os.path.join(REPO, "assets", "models", "gat.npz")
+if os.path.exists(_gat_npz_path):
+    import hashlib
+    _gat_before = hashlib.sha256(open(_gat_npz_path, "rb").read()).hexdigest()
+    _gat_data = np.load(_gat_npz_path)
+    assert "face_uvs" not in _gat_data and "corner_uvs" not in _gat_data, \
+        "gat.npz is expected to be a pre-feature legacy npz with no UV keys at all"
+    gat_lib = engine.AssetLibrary(os.path.join(REPO, "assets"))
+    gat_entity = gat_lib.instantiate("Gat")
+    assert gat_entity.mesh.corner_uvs is not None
+    assert gat_entity.mesh.corner_uvs.shape == (len(gat_entity.mesh.faces), 4, 2)
+    # legacy backward compat: box-projection fallback for BOTH, identical to
+    # what this asset already did for face_uvs before corner_uvs existed
+    _direct_face_uvs = mesh_mod.box_project_uv(
+        gat_entity.mesh.vertices, gat_entity.mesh.faces, gat_entity.mesh.normals,
+        gat_entity.mesh.aabb_min, gat_entity.mesh.aabb_max)
+    assert np.array_equal(gat_entity.mesh.face_uvs, _direct_face_uvs), \
+        "legacy npz (no UV keys) must still box-project face_uvs identically to before"
+    _gat_after = hashlib.sha256(open(_gat_npz_path, "rb").read()).hexdigest()
+    assert _gat_before == _gat_after, "gat.npz must NEVER be rewritten (read-only user data)"
+    print(f"12. npz round-trip OK: explicit corner_uvs survives the .npz asset round-trip; "
+         f"legacy gat.npz ({len(gat_entity.mesh.faces)} faces, no UV keys at all) still "
+         "loads and box-projects identically, file untouched (sha256 confirmed)")
+else:
+    print("12. npz round-trip OK: explicit corner_uvs survives the .npz asset round-trip "
+         "(gat.npz not present in this checkout -- legacy-path sub-check skipped)")
+
+# ---- 13. LOD decision: decimated levels do NOT carry corner_uvs forward
+#          (same documented reasoning as the pre-existing face_uvs drop --
+#          see engine/lod.py's module docstring) -- they get a FRESH,
+#          genuinely-varying box-projected corner_uvs instead, exactly like
+#          a from-scratch mesh with no explicit UV source. ----
+hp = mesh_mod.icosphere(radius=1.0, subdivisions=3)  # 1280 faces, above LOD_FACE_THRESHOLD
+lods = lod_mod.generate_lods(hp)
+assert len(lods) > 1, "expected the high-poly icosphere to produce extra LOD levels"
+for i, lm in enumerate(lods[1:], start=1):
+    assert lm.corner_uvs.shape == (len(lm.faces), 4, 2)
+    assert not np.allclose(lm.corner_uvs[:, 0], lm.corner_uvs[:, 1]), \
+        f"LOD{i}: corner_uvs must be freshly box-projected (varying), not flat/carried-over"
+print(f"13. LOD corner-UV decision OK: {len(lods) - 1} decimated level(s) each get a fresh, "
+     "genuinely-varying box-projected corner_uvs (not carried from the source mesh)")
 
 # ---- cleanup: don't leave judge artifacts in the real assets/ tree ----
 os.remove(tex_asset.path)

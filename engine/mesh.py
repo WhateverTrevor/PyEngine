@@ -7,6 +7,14 @@ pipeline is vectorized over one (M, 4) array; the ray tracer uses a
 triangulated copy (`tri_faces`). Per-face lighting shades each quad as one
 face — walls and floors get one clean shade per panel instead of a diagonal
 tri seam.
+
+UVs come in two parallel forms: `face_uvs` (M, 2), one value per face, is
+what every current shading/material consumer reads (unchanged by the corner
+form below); `corner_uvs` (M, 4, 2), parallel to `faces` with the same
+padded-triangle convention, carries a UV per vertex-corner so a texture can
+eventually be interpolated ACROSS a face instead of sampled once per polygon
+-- the foundation for per-pixel texturing, not yet consumed by any renderer.
+See `Mesh._build_uvs` for exactly how the two are populated/reconciled.
 """
 from __future__ import annotations
 
@@ -17,7 +25,7 @@ import numpy as np
 
 class Mesh:
     def __init__(self, vertices, faces, base_color=(200, 200, 200), face_colors=None,
-                 face_uvs=None, face_roughness=None, face_metallic=None,
+                 face_uvs=None, corner_uvs=None, face_roughness=None, face_metallic=None,
                  face_emissive=None, face_opacity=None):
         self.vertices = np.asarray(vertices, dtype=np.float64)   # (N, 3)
         self._polys = [tuple(int(i) for i in f) for f in faces]
@@ -47,6 +55,13 @@ class Mesh:
         # flips) don't silently discard imported UVs
         self._user_face_uvs = (np.asarray(face_uvs, dtype=np.float64)
                                if face_uvs is not None else None)
+        # explicit per-CORNER UV (M, 4, 2), parallel to `faces` including the
+        # padded-triangle convention (4th corner repeats the 3rd, same as
+        # `faces` itself -- see `_build`). Real per-vertex detail, e.g. from
+        # an FBX LayerElementUV, as opposed to `face_uvs`'s single value per
+        # face. See `_build_uvs` for how the two combine.
+        self._user_corner_uvs = (np.asarray(corner_uvs, dtype=np.float64)
+                                 if corner_uvs is not None else None)
         self._build()
 
     def _build(self) -> None:
@@ -66,11 +81,55 @@ class Mesh:
         self.aabb_min = self.vertices.min(axis=0)
         self.aabb_max = self.vertices.max(axis=0)
         self.bound = float(np.linalg.norm(self.vertices, axis=1).max())
-        if self._user_face_uvs is not None and len(self._user_face_uvs) == len(self.faces):
-            self.face_uvs = self._user_face_uvs               # (M, 2)
+        self._build_uvs()
+
+    def _build_uvs(self) -> None:
+        """Populate `face_uvs` (M, 2) and `corner_uvs` (M, 4, 2), in this
+        precedence:
+
+        1. explicit `face_uvs` supplied (a re-`_build()` after `orient_
+           outward`, or a legacy single-UV-per-face npz/asset): kept EXACTLY
+           as given -- the byte-identical backward-compat contract every
+           existing consumer (materials.py's `_evaluate_common` etc.) relies
+           on. `corner_uvs` becomes that one value broadcast to all 4
+           corners UNLESS real corner data was ALSO supplied -- honest,
+           since a lone per-face value carries no actual per-corner detail
+           to expose, and it keeps a caller's explicit face value from ever
+           being silently replaced by a recomputed one.
+        2. explicit `corner_uvs` supplied (real per-vertex detail, e.g. FBX)
+           with NO accompanying `face_uvs`: `face_uvs` is DERIVED as the
+           mean across the 4 (padded) corners -- genuinely one source of
+           truth for a caller that only has corner data.
+        3. neither supplied (every built-in primitive): `face_uvs` calls the
+           ORIGINAL `box_project_uv` unchanged -- deliberately NOT `corner_
+           uvs.mean(axis=1)` -- because float division does not commute with
+           averaging: projecting a face's centroid and averaging 4
+           independently-projected corners differ by ~1 ULP for non-trivial
+           geometry (confirmed on cylinder/cone/icosphere/torus/checker-
+           board; only the axis-aligned box's clean fractions happened to
+           survive `np.array_equal`). This run's byte-identical gate is
+           exactly this path, so bit-for-bit preservation of the pre-
+           existing formula wins over always-literally-averaging. `corner_
+           uvs` still comes from the same per-axis dominant-normal formula
+           (`_UV_AXIS_PAIRS`) via `box_project_uv_corners`, just evaluated
+           at each raw corner position instead of the precomputed centroid
+           -- one shared formula, two granularities.
+        """
+        m = len(self.faces)
+        if self._user_face_uvs is not None and len(self._user_face_uvs) == m:
+            self.face_uvs = self._user_face_uvs                          # (M, 2)
+            if self._user_corner_uvs is not None and len(self._user_corner_uvs) == m:
+                self.corner_uvs = self._user_corner_uvs                  # (M, 4, 2)
+            else:
+                self.corner_uvs = np.repeat(self.face_uvs[:, None, :], 4, axis=1)
+        elif self._user_corner_uvs is not None and len(self._user_corner_uvs) == m:
+            self.corner_uvs = self._user_corner_uvs                      # (M, 4, 2)
+            self.face_uvs = self.corner_uvs.mean(axis=1)                 # (M, 2), derived
         else:
             self.face_uvs = box_project_uv(self.vertices, self.faces, self.normals,
                                            self.aabb_min, self.aabb_max)
+            self.corner_uvs = box_project_uv_corners(self.vertices, self.faces, self.normals,
+                                                      self.aabb_min, self.aabb_max)
 
     def _face_normals(self) -> np.ndarray:
         tri = self.vertices[self.faces[:, :3]]
@@ -81,10 +140,23 @@ class Mesh:
     def orient_outward(self) -> "Mesh":
         """Flip faces whose normals point toward the origin.
 
-        Only valid for convex meshes centered at the origin.
+        Only valid for convex meshes centered at the origin. No current
+        caller passes explicit corner UVs into a mesh that also calls this
+        (the procedural builders below always call it on bare geometry), but
+        if one ever did, a flipped face's corner order must be permuted the
+        same way `merge_meshes` permutes a negative-determinant part's
+        corner UVs -- otherwise `_user_corner_uvs` would stay indexed to the
+        PRE-flip vertex order after `_build()` reassigns `self.faces`.
         """
         centroids = self.vertices[self.faces].mean(axis=1)
         flip = np.einsum("ij,ij->i", self.normals, centroids) < 0.0
+        if self._user_corner_uvs is not None and len(self._user_corner_uvs) == len(self.faces):
+            is_tri = self.faces[:, 2] == self.faces[:, 3]
+            quad_rev = self._user_corner_uvs[:, [0, 3, 2, 1], :]
+            tri_rev = self._user_corner_uvs[:, [0, 2, 1, 1], :]
+            reordered = np.where(is_tri[:, None, None], tri_rev, quad_rev)
+            self._user_corner_uvs = np.where(flip[:, None, None], reordered,
+                                             self._user_corner_uvs)
         self._polys = [tuple(reversed(f)) if flipped else f
                        for f, flipped in zip(self._polys, flip)]
         self._build()
@@ -108,14 +180,21 @@ def merge_meshes(parts) -> "Mesh | None":
     one entity, not N.
 
     Every part Mesh already carries fully-materialized per-face arrays
-    (face_colors/face_uvs/face_roughness/face_metallic/face_emissive/
-    face_opacity) -- Mesh.__init__ always fills in its backward-compat
-    defaults at construction time, so there's never a "None" array to worry
-    about here; concatenating each part's already-realized arrays in the
-    same order as its (offset) faces keeps everything aligned by
-    construction. face_uvs is taken as-is (not recomputed) so each part
-    keeps its own box-projection/import UVs instead of one computed over
-    the composite's combined bounding box.
+    (face_colors/face_uvs/corner_uvs/face_roughness/face_metallic/
+    face_emissive/face_opacity) -- Mesh.__init__ always fills in its
+    backward-compat defaults at construction time, so there's never a "None"
+    array to worry about here; concatenating each part's already-realized
+    arrays in the same order as its (offset) faces keeps everything aligned
+    by construction. Both face_uvs AND corner_uvs are taken as-is (not
+    recomputed) and passed to the composite Mesh together, so each part
+    keeps its own box-projection/import UV values instead of ones computed
+    over the composite's combined bounding box -- and passing face_uvs
+    explicitly (not just corner_uvs) matters: `Mesh._build_uvs` only
+    DERIVES face_uvs from corner_uvs when no face_uvs was also supplied
+    (see its docstring), and a derived value is ~1-ULP different from the
+    original per-part box-projected one, which would break the byte-
+    identical single-component-at-identity contract this feature is tested
+    against (bp_component_checks.py).
 
     lod_meshes are intentionally NOT merged -- the composite always gets
     lod_meshes=[] and relies on Entity.shadow_mesh()'s on-demand coarse-
@@ -134,21 +213,29 @@ def merge_meshes(parts) -> "Mesh | None":
     if not parts:
         return None
     verts_out, faces_out = [], []
-    colors_out, uvs_out = [], []
+    colors_out, uvs_out, corner_uvs_out = [], [], []
     rough_out, metal_out, emis_out, opac_out = [], [], [], []
     vcount = 0
     for part_mesh, matrix in parts:
         verts_world = part_mesh.vertices @ matrix[:3, :3].T + matrix[:3, 3]
         faces = part_mesh.faces.astype(np.int64) + vcount
+        corner_uv = part_mesh.corner_uvs
         if np.linalg.det(matrix[:3, :3]) < 0.0:
             is_tri = faces[:, 2] == faces[:, 3]           # padding convention (see _build)
             quad_rev = faces[:, [0, 3, 2, 1]]              # reverse a real quad's cycle
             tri_rev = faces[:, [0, 2, 1, 1]]                # reverse + re-pad a triangle
             faces = np.where(is_tri[:, None], tri_rev, quad_rev)
+            # corner UVs must follow the exact same column permutation so
+            # each UV stays attached to the same (now winding-reversed)
+            # vertex -- same is_tri split as the face-index permutation above
+            quad_uv_rev = corner_uv[:, [0, 3, 2, 1], :]
+            tri_uv_rev = corner_uv[:, [0, 2, 1, 1], :]
+            corner_uv = np.where(is_tri[:, None, None], tri_uv_rev, quad_uv_rev)
         verts_out.append(verts_world)
         faces_out.append(faces)
         colors_out.append(part_mesh.face_colors)
         uvs_out.append(part_mesh.face_uvs)
+        corner_uvs_out.append(corner_uv)
         rough_out.append(part_mesh.face_roughness)
         metal_out.append(part_mesh.face_metallic)
         emis_out.append(part_mesh.face_emissive)
@@ -160,6 +247,7 @@ def merge_meshes(parts) -> "Mesh | None":
     return Mesh(vertices, [tuple(int(i) for i in f) for f in faces],
                face_colors=np.concatenate(colors_out, axis=0),
                face_uvs=np.concatenate(uvs_out, axis=0),
+               corner_uvs=np.concatenate(corner_uvs_out, axis=0),
                face_roughness=np.concatenate(rough_out, axis=0),
                face_metallic=np.concatenate(metal_out, axis=0),
                face_emissive=np.concatenate(emis_out, axis=0),
@@ -182,6 +270,32 @@ def box_project_uv(vertices, faces, normals, aabb_min, aabb_max) -> np.ndarray:
         m = dominant == axis
         uv[m, 0] = (centroids[m, ua] - aabb_min[ua]) / extent[ua]
         uv[m, 1] = (centroids[m, va] - aabb_min[va]) / extent[va]
+    return uv
+
+
+def box_project_uv_corners(vertices, faces, normals, aabb_min, aabb_max) -> np.ndarray:
+    """Per-CORNER form of `box_project_uv`: the identical dominant-axis
+    planar projection (same `_UV_AXIS_PAIRS` table, same per-axis affine
+    formula), but evaluated at each of a face's 4 (padded) corner positions
+    individually instead of the face centroid -- so the UV genuinely VARIES
+    across a face, the entire point of this run. Returns (M, 4, 2).
+
+    Deliberately NOT the thing `box_project_uv` is built from (i.e. that
+    function is not reimplemented as `.mean(axis=1)` of this one's output):
+    float division does not commute with averaging, so mean-then-project and
+    project-then-mean differ by ~1 ULP for non-trivial coordinates -- see
+    `Mesh._build_uvs`'s docstring for the empirical proof and why `box_
+    project_uv`'s bit-for-bit output is a hard backward-compat requirement
+    this function must not disturb.
+    """
+    corner_pos = vertices[faces]  # (M, 4, 3) -- includes the padded-triangle dup
+    extent = np.maximum(aabb_max - aabb_min, 1e-9)
+    dominant = np.argmax(np.abs(normals), axis=1)  # 0=x, 1=y, 2=z, one per face
+    uv = np.zeros((len(faces), 4, 2), dtype=np.float64)
+    for axis, (ua, va) in _UV_AXIS_PAIRS.items():
+        m = dominant == axis
+        uv[m, :, 0] = (corner_pos[m, :, ua] - aabb_min[ua]) / extent[ua]
+        uv[m, :, 1] = (corner_pos[m, :, va] - aabb_min[va]) / extent[va]
     return uv
 
 

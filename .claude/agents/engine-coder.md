@@ -56,6 +56,16 @@ agent that judges it before anything is committed.
   padded by repeating the last index; `tri_faces` (T,3) is the triangulated
   copy used ONLY by the ray tracer. Winding is CCW from outside; per-face
   normals derive from it. `face_colors` is (M,3) float 0..255.
+  UVs come in two parallel forms: `face_uvs` (M,2), one per polygon, which
+  every existing consumer reads, and `corner_uvs` (M,4,2), parallel to
+  `faces` with the same padded-triangle convention, added for per-pixel
+  texturing. They are produced by two SEPARATE projections
+  (`box_project_uv` / `box_project_uv_corners`) rather than one deriving
+  from the other — averaging the corners drifts ~1 ULP from projecting the
+  centroid and would break the byte-identical gate. A test asserts they
+  agree within 1e-9; keep it that way if you touch either.
+  `merge_meshes` folds posed parts into one mesh and must permute
+  `corner_uvs` exactly as it permutes `faces` when a part is mirrored.
 - `engine/renderer.py` — two paths. Deferred (default): polygons fill a
   low-res face-ID buffer, numpy reconstructs per-pixel world positions by
   ray-plane intersection, lights evaluate per pixel only on visible pixels

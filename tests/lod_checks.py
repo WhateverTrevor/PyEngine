@@ -102,7 +102,7 @@ def _fake_extract(path):
     m = icosphere(radius=1.0, subdivisions=3, color=(90, 140, 200))
     faces = [tuple(int(i) for i in f) for f in m.faces.tolist()]
     colors = m.face_colors / 255.0  # extract_geometry's contract: 0..1
-    return m.vertices.copy(), faces, colors, None
+    return m.vertices.copy(), faces, colors, None, None
 
 
 with um.patch.object(fbx_mod, "extract_geometry", _fake_extract):
@@ -147,7 +147,7 @@ def _fake_extract_small(path):
     m = engine.cube(1.0)
     faces = [tuple(int(i) for i in f) for f in m.faces.tolist()]
     colors = m.face_colors / 255.0
-    return m.vertices.copy(), faces, colors, None
+    return m.vertices.copy(), faces, colors, None, None
 
 
 fake_small_path = os.path.join(TMP, "fake_small.fbx")

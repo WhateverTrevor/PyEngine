@@ -100,8 +100,26 @@ bp_component_checks, bp_runtime_checks.
     changes; re-placing picks up edits (matches every other asset type).
 - wgpu directional (sun) shadow attenuation on mesh faces (GL's dlShadowTex)
   — the last wgpu visual gap.
-- Per-pixel texturing (materials bake per-face; would unlock texture-mapped
-  roughness/metallic and higher-fidelity textures).
+- Per-pixel texturing — PRE-SPLIT INTO 4 RUNS, run 1/4 DONE:
+  1. [done] Per-corner UV foundation. `Mesh.corner_uvs` (M,4,2) parallel to
+     `faces`; FBX import now preserves the per-polygon-vertex UVs it used
+     to discard. No rendering change.
+  2. [next] CPU renderer: per-pixel barycentric UV from the face-ID buffer
+     + reconstructed world position, then sample the texture per pixel.
+  3. OpenGL parity (textures + UV attributes + GLSL sampling).
+  4. wgpu parity (same in WGSL). Keep 3 and 4 separate — the PBR slate
+     split them that way and produced the two best-behaved runs (135k/140k).
+  **Architectural decision already made for runs 2-4:** the material graph
+  KEEPS baking per-face. Only a texture feeding a channel directly goes
+  per-pixel — one array index per pixel per channel, which maps 1:1 onto
+  GPU sampling. Evaluating the whole graph per pixel is ~285x more samples
+  per frame (≈114k visible pixels vs ~400 faces) on an engine already at
+  ~10 FPS; baking to a UV atlas instead would need real UV unwrapping,
+  which doesn't exist here and breaks on overlapping box-projected UVs.
+  Documented limitation: graph math *around* a texture still bakes per-face.
+  Also still per-face and untouched: `export_fbx` writes one UV repeated
+  per polygon vertex, so a round-trip through our own exporter flattens
+  corner UVs.
 - LOD/decimation is vertex-clustering (not QEM); BVH split is median (not
   SAH); shadow/GI still one-bounce, per-face.
 - No undo system; folder deletion in the content browser; flat-mode (F2)

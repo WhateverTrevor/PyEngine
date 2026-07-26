@@ -83,6 +83,18 @@ class AssetDef:
                                if "face_colors" in data else None)
                 face_uvs = (data["face_uvs"].astype(np.float64)
                            if "face_uvs" in data else None)
+                # corner_uvs is newer than face_uvs -- absent from any npz
+                # written before this feature (e.g. the user's gat.npz,
+                # which additionally has no face_uvs at all either). Mesh's
+                # own precedence (see `_build_uvs`) handles every
+                # combination: corner_uvs+face_uvs both present -> both used
+                # as-is; face_uvs only -> corner_uvs synthesized as that
+                # value broadcast to all 4 corners (an old npz "behaves
+                # identically", the explicit backward-compat requirement);
+                # neither present -> both box-projected fresh, exactly like
+                # before this feature existed.
+                corner_uvs = (data["corner_uvs"].astype(np.float64)
+                             if "corner_uvs" in data else None)
                 # PBR arrays are optional in the npz -- absent for plain
                 # FBX-imported geometry (diffuse-only import, no PBR source);
                 # Mesh supplies the backward-compat defaults when omitted.
@@ -95,7 +107,7 @@ class AssetDef:
                 entity.mesh = mesh_mod.Mesh(
                     data["vertices"], [tuple(f) for f in data["faces"]],
                     base_color=spec.get("color", (170, 170, 175)),
-                    face_colors=face_colors, face_uvs=face_uvs,
+                    face_colors=face_colors, face_uvs=face_uvs, corner_uvs=corner_uvs,
                     face_roughness=face_roughness, face_metallic=face_metallic,
                     face_emissive=face_emissive)
                 # distance-based LOD (see engine/lod.py import_fbx's

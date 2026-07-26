@@ -242,12 +242,18 @@ def extract_geometry(path: str):
     """All geometry in the file, merged.
 
     Returns (vertices (N,3), polygon index tuples, per-face colors (M,3) 0..1,
-    per-face UV (M,2) or None if no geometry carried LayerElementUV data).
+    per-face UV (M,2) or None, per-CORNER UV (M,4,2) or None -- both None
+    together iff no geometry carried LayerElementUV data).
     Face colors come from each geometry's material layer, resolved through the
     FBX connection graph (geometry -> model <- materials, in connection order).
-    Face UV is the mean of the polygon's own UV vertices (this engine bakes
-    materials per-face, so one UV sample per face is the structure that
-    actually gets used -- see materials.py's face-context evaluation)."""
+    Face UV is the mean of the polygon's own UV vertices (kept for backward
+    compatibility -- callers that only want one UV per face, e.g. materials.py
+    baking, use this and never see the change below). Corner UV is the actual
+    per-polygon-vertex data, padded to 4 slots the same way `Mesh._build`
+    pads a triangle's index tuple (4th corner repeats the 3rd) -- this used
+    to be computed and then thrown away after collapsing into the face mean;
+    now it survives to become `Mesh.corner_uvs`, real imported per-vertex UV
+    detail instead of one flat value per polygon."""
     roots, _version = parse_fbx(path)
     up_axis, unit_scale = _global_settings(roots)
     mat_colors = _material_colors(roots)
@@ -273,7 +279,7 @@ def extract_geometry(path: str):
         elif child in mat_colors and parent in model_ids:
             model_mats.setdefault(parent, []).append(child)
 
-    all_verts, all_faces, all_colors, all_uvs = [], [], [], []
+    all_verts, all_faces, all_colors, all_uvs, all_corner_uvs = [], [], [], [], []
     any_uv = False
     offset = 0
     for root in roots:
@@ -316,16 +322,25 @@ def extract_geometry(path: str):
                         all_faces.append(tuple(i + offset for i in poly))
                         all_colors.append(color)
                         all_uvs.append(np.mean(poly_uv, axis=0) if poly_uv else (0.0, 0.0))
+                        if len(poly) == 4:
+                            corner = poly_uv if poly_uv else [(0.0, 0.0)] * 4
+                        else:  # triangle -- pad 4th by repeating the 3rd (Mesh._build convention)
+                            base = poly_uv if poly_uv else [(0.0, 0.0)] * 3
+                            corner = [base[0], base[1], base[2], base[2]]
+                        all_corner_uvs.append(corner)
                     elif len(poly) > 4:  # fan-split n-gons
                         for k in range(1, len(poly) - 1):
                             all_faces.append((poly[0] + offset, poly[k] + offset,
                                               poly[k + 1] + offset))
                             all_colors.append(color)
                             if poly_uv:
-                                all_uvs.append(np.mean(
-                                    [poly_uv[0], poly_uv[k], poly_uv[k + 1]], axis=0))
+                                tri_uv = [poly_uv[0], poly_uv[k], poly_uv[k + 1]]
+                                all_uvs.append(np.mean(tri_uv, axis=0))
                             else:
+                                tri_uv = [(0.0, 0.0)] * 3
                                 all_uvs.append((0.0, 0.0))
+                            all_corner_uvs.append(
+                                [tri_uv[0], tri_uv[1], tri_uv[2], tri_uv[2]])
                     poly = []
                     poly_uv = []
                     poly_i += 1
@@ -344,7 +359,8 @@ def extract_geometry(path: str):
     if up_axis == 2:  # Z-up -> engine Y-up
         vertices = vertices[:, [0, 2, 1]] * np.array([1.0, 1.0, -1.0])
     face_uvs = np.asarray(all_uvs, dtype=np.float64) if any_uv else None
-    return vertices, all_faces, np.asarray(all_colors, dtype=np.float64), face_uvs
+    corner_uvs = np.asarray(all_corner_uvs, dtype=np.float64) if any_uv else None
+    return vertices, all_faces, np.asarray(all_colors, dtype=np.float64), face_uvs, corner_uvs
 
 
 def _prepared_geometry(path: str, up_axis: str = "y", max_bound: float = 4.0):
@@ -358,7 +374,7 @@ def _prepared_geometry(path: str, up_axis: str = "y", max_bound: float = 4.0):
     Shared by `import_fbx` and `fbx_fit_scale` so the dialog's "Fit to ~1
     unit" button measures the exact mesh that would be written at scale=1.
     """
-    vertices, faces, face_colors, face_uvs = extract_geometry(path)
+    vertices, faces, face_colors, face_uvs, corner_uvs = extract_geometry(path)
     if up_axis == "z":
         vertices = vertices[:, [0, 2, 1]] * np.array([1.0, 1.0, -1.0])
 
@@ -368,7 +384,7 @@ def _prepared_geometry(path: str, up_axis: str = "y", max_bound: float = 4.0):
     bound = float(np.abs(vertices).max())
     if bound > max_bound and bound > 0:
         vertices *= max_bound / bound
-    return vertices, faces, face_colors, face_uvs
+    return vertices, faces, face_colors, face_uvs, corner_uvs
 
 
 def fbx_fit_scale(path: str, up_axis: str = "y", max_bound: float = 4.0,
@@ -378,7 +394,7 @@ def fbx_fit_scale(path: str, up_axis: str = "y", max_bound: float = 4.0,
     ground-centering, and the auto max_bound clamp) to `target` units.
     Powers the import dialog's "Fit to ~1 unit" button.
     """
-    vertices, _faces, _colors, _uvs = _prepared_geometry(path, up_axis, max_bound)
+    vertices, _faces, _colors, _uvs, _corner_uvs = _prepared_geometry(path, up_axis, max_bound)
     if len(vertices) == 0:
         return 1.0
     extent = vertices.max(axis=0) - vertices.min(axis=0)
@@ -429,8 +445,18 @@ def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
     A mesh at or below `lod.LOD_FACE_THRESHOLD` faces produces no extra
     levels regardless of this flag -- the .npz comes out byte-for-byte the
     same as if `generate_lods=False`, so small imports are unaffected.
+
+    A `corner_uvs` npz key is written alongside `face_uvs` whenever the
+    source FBX carried a LayerElementUV -- real per-vertex UV detail (see
+    `extract_geometry`), not just the one-value-per-face `face_uvs`. LOD
+    levels never get a `lod{i}_corner_uvs`/`lod{i}_face_uvs` key at all (see
+    engine/lod.py's module docstring for why): a decimated level's faces
+    don't correspond to the source mesh's, so a fresh box projection is
+    more coherent than any UV carried over from a completely different
+    face layout.
     """
-    vertices, faces, face_colors, face_uvs = _prepared_geometry(path, up_axis, max_bound)
+    vertices, faces, face_colors, face_uvs, corner_uvs = _prepared_geometry(
+        path, up_axis, max_bound)
     if scale != 1.0:
         vertices = vertices * scale
 
@@ -443,6 +469,8 @@ def import_fbx(path: str, assets_dir: str, color=(168, 170, 176),
     extra = {}
     if face_uvs is not None:
         extra["face_uvs"] = face_uvs.astype(np.float32)
+    if corner_uvs is not None:
+        extra["corner_uvs"] = corner_uvs.astype(np.float32)
     if generate_lods:
         extra.update(_lod_npz_arrays(vertices, padded, face_colors))
     np.savez_compressed(os.path.join(models_dir, f"{stem}.npz"),

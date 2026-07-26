@@ -16,10 +16,17 @@ average. Documented tradeoff: cheap (falls out of the same `np.unique` call
 that dedupes triangles) and exact for uniformly-colored regions (the common
 case for hard-surface art), at the cost of picking a somewhat arbitrary
 source color at a boundary between two differently-colored regions instead
-of blending them. `face_uvs` are NOT carried -- a decimated face's box
-projection is regenerated from scratch by `Mesh.__init__` (its normal
-default-UV fallback), which is more coherent for a totally different face
-layout than reusing a stale per-source-face UV would be.
+of blending them. Neither `face_uvs` NOR `corner_uvs` are carried -- a
+decimated face's box projection (both forms) is regenerated from scratch by
+`Mesh.__init__`'s default-UV fallback (see mesh.py's `_build_uvs`), which
+is more coherent for a totally different face layout than reusing a stale
+per-source-face UV would be. This is the SAME decision for both forms, same
+reasoning: `decimate()`'s output `Mesh(...)` call below passes neither
+`face_uvs=` nor `corner_uvs=`, so both fall through to the box-projection
+default automatically -- no special-casing needed here. A pleasant side
+effect: a decimated LOD's `corner_uvs` end up genuinely VARYING per corner
+(not the flat broadcast a legacy npz's `corner_uvs` gets), since they come
+from the real per-corner box projection, not a carried-over single value.
 
 Each LOD mesh returned by `generate_lods` (levels 1+, not LOD0) carries a
 bolted-on `.lod_source_faces` attribute: an (M,) int array mapping every
