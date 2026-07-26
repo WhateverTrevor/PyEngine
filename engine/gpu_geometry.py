@@ -39,6 +39,35 @@ def _build_color(mesh, face_id_tri) -> np.ndarray:
     return np.repeat((mesh.face_colors[face_id_tri] / 255.0).astype(np.float32), 3, axis=0)
 
 
+def _build_uv(mesh) -> np.ndarray:
+    """Per-vertex UV (T*3, 2), one row per row of `_build_geometry`'s
+    (pos, nrm, fid) vertex soup -- NOT a per-face repeat like `_build_color`/
+    `_build_pbr`/`_build_opacity` (those broadcast one value to a face's 3
+    triangle-vertices; here each of the 3 vertices carries its OWN corner's
+    UV, so a per-pixel/per-fragment sampler can interpolate ACROSS a face
+    instead of reading one flat value -- this is the whole point of run 3).
+
+    Recomputes `is_tri` from `mesh.faces` independently (cheap: one boolean
+    compare) rather than taking it as a parameter, so this stays decoupled
+    from `_build_geometry`'s return signature -- `wgpu_renderer.py` (run 4)
+    imports `_build_geometry` but not this function, so adding this is
+    zero-behavior-change for wgpu; it doesn't even know this exists yet.
+
+    `mesh.corner_uvs` (M, 4, 2) is ALWAYS populated by `Mesh._build_uvs`
+    (falls back to a box projection when no explicit/imported UV exists --
+    see mesh.py), including every LOD level (which deliberately gets a
+    FRESH box projection, never carries the source mesh's corner_uvs
+    forward -- see lod.py), so there is no "mesh has no UVs" case to guard
+    against here.
+    """
+    faces = mesh.faces
+    is_tri = (faces[:, 3] == faces[:, 2]) | (faces[:, 3] == faces[:, 0])
+    corner_uv = mesh.corner_uvs.astype(np.float32)   # (M, 4, 2)
+    uv1 = corner_uv[:, (0, 1, 2), :]                 # first triangle: corners 0,1,2
+    uv2 = corner_uv[~is_tri][:, (0, 2, 3), :]         # second triangle (quads only): 0,2,3
+    return np.concatenate([uv1, uv2], axis=0).reshape(-1, 2)
+
+
 def _build_pbr(mesh, face_id_tri):
     """Per-vertex (roughness, metallic) and emissive (0..1), same repeat-per-
     triangle-vertex flow as `_build_color` -- these are per-face data baked

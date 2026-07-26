@@ -40,8 +40,9 @@ import math
 import moderngl
 import numpy as np
 
+from . import texture as texture_mod
 from .gpu_geometry import (_build_color, _build_geometry, _build_opacity,
-                           _build_pbr, _entity_world_faces, _lod_gather,
+                           _build_pbr, _build_uv, _entity_world_faces, _lod_gather,
                            _scene_environment)
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
@@ -49,6 +50,11 @@ from .raytrace import GITracer
 from .renderer import (_face_light_strength, _fog_volumes, _gather_lights,
                        _gi_direct_lighting, _gi_receiver_geometry, _is_translucent,
                        _scene_sun)
+
+# Port name -> int code, mirroring materials.py's TextureBinding.port /
+# renderer.py's `_extract_channel` -- read by both sampleTexVec3/Scalar in
+# the fragment shader above.
+_PORT_CODE = {"RGB": 0, "R": 1, "G": 2, "B": 3, "A": 4}
 
 _MAX_LIGHTS = 16
 _MAX_FOG_VOL = 4
@@ -66,6 +72,7 @@ in float in_faceid;
 in vec2 in_rm;
 in vec3 in_emissive;
 in float in_opacity;
+in vec2 in_uv;
 
 uniform mat4 mvp;
 uniform mat4 model;
@@ -79,6 +86,7 @@ out float vRoughness;
 out float vMetallic;
 out vec3 vEmissive;
 out float vOpacity;
+out vec2 vUv;
 
 void main() {
     vec4 world = model * vec4(in_pos, 1.0);
@@ -90,6 +98,7 @@ void main() {
     vMetallic = in_rm.y;
     vEmissive = in_emissive;
     vOpacity = in_opacity;
+    vUv = in_uv;
     gl_Position = mvp * vec4(in_pos, 1.0);
 }
 """
@@ -106,11 +115,41 @@ in float vRoughness;
 in float vMetallic;
 in vec3 vEmissive;
 in float vOpacity;
+in vec2 vUv;
 
 const float PI = 3.14159265359;
 
 uniform vec3 cameraPos;
 uniform int faceOffset;
+
+// Per-pixel texturing (run 3/4 of the per-pixel texturing slate): a
+// material's Output channel bound DIRECTLY to a tex_sample node (see
+// materials.py's MaterialGraph.direct_texture_bindings) samples here in
+// GLSL instead of reading the per-face baked v* varying above -- one
+// dedicated sampler per channel (uHasXTex gates it), set per draw call
+// from the entity's own material (renderer.py's `tex_entities` block is
+// the CPU-side reference this mirrors). Opacity is intentionally NOT
+// included -- translucent entities never reach this opaque-mesh shader
+// (same rule as renderer.py's `if channel == "opacity": continue`).
+uniform int uHasBaseTex;
+uniform sampler2D uBaseTex;
+uniform int uBasePort;
+uniform vec2 uBaseTiling;
+
+uniform int uHasRoughTex;
+uniform sampler2D uRoughTex;
+uniform int uRoughPort;
+uniform vec2 uRoughTiling;
+
+uniform int uHasMetalTex;
+uniform sampler2D uMetalTex;
+uniform int uMetalPort;
+uniform vec2 uMetalTiling;
+
+uniform int uHasEmisTex;
+uniform sampler2D uEmisTex;
+uniform int uEmisPort;
+uniform vec2 uEmisTiling;
 
 uniform vec3 dlDir;
 uniform vec3 dlColor;
@@ -192,6 +231,29 @@ vec3 evalAmbientCube(vec3 n) {{
     return (c / wsum) * envStrength;
 }}
 
+// Port -> shape coercion, mirroring renderer.py's `_extract_channel` exactly
+// (0=RGB, 1=R, 2=G, 3=B, 4=A -- see materials.py's TextureBinding.port,
+// NODE_OUTPUTS["tex_sample"]). Vec3 form is for vector channels
+// (base_color/emissive): a scalar port replicates across R=G=B. Scalar
+// form is for roughness/metallic: a vector port (RGB) mean-reduces.
+vec3 sampleTexVec3(sampler2D tex, vec2 uv, int port) {{
+    vec4 s = texture(tex, uv);
+    if (port == 0) return s.rgb;
+    if (port == 1) return vec3(s.r);
+    if (port == 2) return vec3(s.g);
+    if (port == 3) return vec3(s.b);
+    return vec3(s.a);
+}}
+
+float sampleTexScalar(sampler2D tex, vec2 uv, int port) {{
+    vec4 s = texture(tex, uv);
+    if (port == 0) return (s.r + s.g + s.b) / 3.0;
+    if (port == 1) return s.r;
+    if (port == 2) return s.g;
+    if (port == 3) return s.b;
+    return s.a;
+}}
+
 // Cook-Torrance/GGX specular BRDF, mirroring renderer.py's `_ggx_specular`
 // exactly: Smith-GGX geometry with the direct-lighting k=(a+1)^2/8 remap
 // (Karis/UE4), Schlick Fresnel. Caller multiplies by NdotL*radiance.
@@ -216,6 +278,29 @@ vec3 ggxSpecular(vec3 n, vec3 v, vec3 l, float alpha, vec3 f0) {{
 }}
 
 void main() {{
+    // Per-pixel texturing overrides -- replace the per-face-baked varying
+    // for just the channels a material directly binds a texture to (see
+    // renderer.py's `channel_overrides`: REPLACE, not blend/multiply).
+    // Everything below reads these instead of the raw v* varyings, so an
+    // untextured draw (all uHasXTex == 0) is a pure passthrough -- same
+    // values, same math, byte-identical to before this run.
+    vec3 baseColor = vColor;
+    float roughnessV = vRoughness;
+    float metallicV = vMetallic;
+    vec3 emissiveV = vEmissive;
+    if (uHasBaseTex != 0) {{
+        baseColor = sampleTexVec3(uBaseTex, vUv * uBaseTiling, uBasePort);
+    }}
+    if (uHasRoughTex != 0) {{
+        roughnessV = sampleTexScalar(uRoughTex, vUv * uRoughTiling, uRoughPort);
+    }}
+    if (uHasMetalTex != 0) {{
+        metallicV = sampleTexScalar(uMetalTex, vUv * uMetalTiling, uMetalPort);
+    }}
+    if (uHasEmisTex != 0) {{
+        emissiveV = sampleTexVec3(uEmisTex, vUv * uEmisTiling, uEmisPort);
+    }}
+
     vec3 n = normalize(vNormal);
     vec3 toLight = normalize(-dlDir);
     float lambert = clamp(dot(n, toLight), 0.0, 1.0);
@@ -232,10 +317,10 @@ void main() {{
     // PBR setup -- alpha/f0/specScale mirror renderer.py's per-pixel gather
     // exactly. specScale = 1 - roughness*(1-metallic) is the backward-compat
     // gate: zero at the default params (roughness=1, metallic=0).
-    float alpha = clamp(vRoughness, 0.02, 1.0);
+    float alpha = clamp(roughnessV, 0.02, 1.0);
     alpha *= alpha;
-    vec3 f0 = mix(vec3(0.04), vColor, vMetallic);
-    float specScale = 1.0 - vRoughness * (1.0 - vMetallic);
+    vec3 f0 = mix(vec3(0.04), baseColor, metallicV);
+    float specScale = 1.0 - roughnessV * (1.0 - metallicV);
     vec3 viewDir = normalize(cameraPos - vWorldPos);
     vec3 spec = vec3(0.0);
 
@@ -285,8 +370,8 @@ void main() {{
     // term at once (ambient+directional+GI+point/spot lambert) -- a single
     // scalar multiplier distributes linearly over the sum, matching
     // renderer.py's per-term gating exactly.
-    lum *= (1.0 - vMetallic);
-    vec3 outColor = vColor * lum + spec;
+    lum *= (1.0 - metallicV);
+    vec3 outColor = baseColor * lum + spec;
 
     vec3 viewDelta = vWorldPos - cameraPos;
     float fragDist = length(viewDelta);
@@ -311,7 +396,7 @@ void main() {{
 
     // Emissive is unconditional -- visible even unlit/in shadow, added
     // after fog, matching renderer.py's deferred pass.
-    outColor += vEmissive;
+    outColor += emissiveV;
     fragColor = vec4(clamp(outColor, 0.0, 1.0), vOpacity);
 }}
 """
@@ -434,6 +519,13 @@ class GLRenderer:
     _IES_UNIT = 2
     _DL_SHADOW_UNIT = 3
     _GI_UNIT = 4
+    # Per-pixel texturing (run 3/4): one dedicated unit per Output channel
+    # that can carry a direct texture binding (base_color/roughness/
+    # metallic/emissive -- see materials.py's direct_texture_bindings).
+    _BASE_TEX_UNIT = 5
+    _ROUGH_TEX_UNIT = 6
+    _METAL_TEX_UNIT = 7
+    _EMIS_TEX_UNIT = 8
 
     def __init__(self, ctx: "moderngl.Context", target=None):
         self.ctx = ctx
@@ -450,6 +542,17 @@ class GLRenderer:
         self._gi_tex_obj = None
         self._gi_tex_size = None
         self._gi = GITracer()
+        # Per-pixel texturing: GPU texture objects, cached by the material's
+        # rel path (same key space as texture_mod.load_texture_rel's own
+        # CPU-side float-array cache) -- loaded/uploaded once, reused every
+        # draw/frame until this GLRenderer (and its ctx) is released. A 1x1
+        # white dummy is always bound to the 4 channel units so a sampler
+        # is never left pointing at nothing, even when uHasXTex gates the
+        # shader away from actually reading it.
+        self._material_tex_cache: dict[str, "moderngl.Texture"] = {}
+        self._dummy_tex = ctx.texture((1, 1), 4, dtype="f4")
+        self._dummy_tex.write(np.ones((1, 1, 4), dtype=np.float32).tobytes())
+        self._dummy_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
         self._mesh_prog = ctx.program(vertex_shader=_MESH_VS, fragment_shader=_MESH_FS)
         self._sky_prog = ctx.program(vertex_shader=_SKY_VS, fragment_shader=_SKY_FS)
@@ -603,7 +706,7 @@ class GLRenderer:
         ctx.enable(moderngl.CULL_FACE)
         ctx.cull_face = self._cull_face
 
-        def _draw(entity, rmesh, off) -> int:
+        def _draw(entity, rmesh, off, bindings) -> int:
             cache = self._get_geo_cache(rmesh)
             model = entity.transform.matrix()
             mvp = proj @ view @ model
@@ -615,6 +718,7 @@ class GLRenderer:
                 nmat = np.eye(3)
             _write_mat(prog["normalMat"], nmat)
             prog["faceOffset"].value = int(off)
+            self._set_texture_channel_uniforms(prog, bindings)
             cache["vao"].render(moderngl.TRIANGLES, vertices=cache["count"])
             return cache["count"] // 3
 
@@ -625,7 +729,15 @@ class GLRenderer:
                              if m.faces.shape[0] > 0 and _is_translucent(e)]
 
         for entity, rmesh, off in opaque_pairs:
-            triangles += _draw(entity, rmesh, off)
+            # Per-pixel texturing bindings come from the entity's own
+            # material, exactly as renderer.py's `tex_entities` loop reads
+            # them (`material.direct_texture_bindings()`) -- translucent
+            # entities never reach here (see translucent_pairs below, which
+            # always pass {} to match the CPU path never populating
+            # `tex_entities` for a translucent entity at all).
+            material = getattr(entity, "material", None)
+            bindings = material.direct_texture_bindings() if material is not None else {}
+            triangles += _draw(entity, rmesh, off, bindings)
 
         if translucent_pairs:
             # Back-to-front per-entity painter order (approximates the CPU
@@ -647,7 +759,7 @@ class GLRenderer:
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
             for entity, rmesh, off in translucent_pairs:
-                triangles += _draw(entity, rmesh, off)
+                triangles += _draw(entity, rmesh, off, {})
             ctx.disable(moderngl.BLEND)
             self.target.depth_mask = True
 
@@ -788,14 +900,22 @@ class GLRenderer:
             vbo_pbr = self.ctx.buffer(np.ascontiguousarray(pbr).tobytes())
             opacity = _build_opacity(mesh, face_id_tri)
             vbo_opacity = self.ctx.buffer(np.ascontiguousarray(opacity).tobytes())
+            # UV attribute for per-pixel texturing (run 3/4) -- unlike color/
+            # pbr/opacity, corner_uvs is fixed at mesh construction (never
+            # re-baked by the material editor), so this VBO is built once
+            # here and never rewritten in the cache-hit branch below.
+            uv = _build_uv(mesh)
+            vbo_uv = self.ctx.buffer(np.ascontiguousarray(uv).tobytes())
             vao = self.ctx.vertex_array(self._mesh_prog, [
                 (vbo_geom, "3f 3f 1f", "in_pos", "in_normal", "in_faceid"),
                 (vbo_color, "3f", "in_color"),
                 (vbo_pbr, "2f 3f", "in_rm", "in_emissive"),
                 (vbo_opacity, "1f", "in_opacity"),
+                (vbo_uv, "2f", "in_uv"),
             ])
             cache = {"vbo_geom": vbo_geom, "vbo_color": vbo_color,
-                     "vbo_pbr": vbo_pbr, "vbo_opacity": vbo_opacity, "vao": vao,
+                     "vbo_pbr": vbo_pbr, "vbo_opacity": vbo_opacity,
+                     "vbo_uv": vbo_uv, "vao": vao,
                      "count": pos.shape[0], "num_faces": m,
                      "face_id_tri": face_id_tri, "color_id": id(mesh.face_colors),
                      "pbr_id": (id(mesh.face_roughness), id(mesh.face_metallic),
@@ -839,6 +959,7 @@ class GLRenderer:
             c["vbo_color"].release()
             c["vbo_pbr"].release()
             c["vbo_opacity"].release()
+            c["vbo_uv"].release()
 
     def _get_env_tex(self, env) -> "moderngl.Texture":
         key = id(env.image)
@@ -855,6 +976,81 @@ class GLRenderer:
             tex.repeat_y = False
             self._env_tex_cache[key] = tex
         return tex
+
+    def _get_material_tex(self, rel_path: str) -> "moderngl.Texture | None":
+        """GPU texture for a material's direct texture binding, cached by
+        rel path (see `_material_tex_cache`). Loads through
+        `texture_mod.load_texture_rel` -- the SAME float-array cache the
+        CPU renderer's `_pixel_uv`/`sample_texture` path uses (engine/
+        texture.py), so this never re-decodes an image the CPU path
+        already has in memory. Returns None if the texture can't be
+        resolved (missing at render time) -- caller falls back to the
+        per-face bake exactly like the CPU path's `if img is None: continue`.
+
+        PARITY: NEAREST filter + REPEAT wrap match `texture.sample_texture`'s
+        nearest-neighbor/np.mod(uv,1.0) exactly. Uploaded as plain linear
+        f4 RGBA (no sRGB) matching `texture.load_texture`'s plain /255.0
+        decode -- no gamma anywhere in either path.
+
+        V-FLIP TRAP: `sample_texture`'s `yi = clip((1-v)*h, 0, h-1)` maps
+        v=0 to the image's BOTTOM row (row h-1 of the top-down array
+        `load_texture` produces) and v=1 to the TOP row (row 0) -- the
+        opposite of OpenGL's row-index-increases-with-v default. Flipping
+        the array vertically before upload (so buffer row 0 = image bottom)
+        reproduces that mapping without touching the shader's UV math.
+        """
+        tex = self._material_tex_cache.get(rel_path)
+        if tex is not None:
+            return tex
+        img = texture_mod.load_texture_rel(rel_path)  # (H, W, 4) float64 0..1, row 0 = image top
+        if img is None:
+            return None
+        flipped = np.ascontiguousarray(np.flipud(img), dtype=np.float32)
+        h, w = flipped.shape[:2]
+        tex = self.ctx.texture((w, h), 4, dtype="f4")
+        tex.write(flipped.tobytes())
+        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        tex.repeat_x = True
+        tex.repeat_y = True
+        self._material_tex_cache[rel_path] = tex
+        return tex
+
+    # Output channels a texture can bind to directly on the opaque-mesh
+    # shader, each mapped to its own uniform-name prefix + dedicated
+    # texture unit -- "opacity" is excluded (translucent entities never
+    # draw through this program, see materials.py's direct_texture_bindings
+    # docstring and renderer.py's matching `continue`).
+    _TEX_CHANNELS = (
+        ("base_color", "uBaseTex", "uHasBaseTex", "uBasePort", "uBaseTiling", _BASE_TEX_UNIT),
+        ("roughness", "uRoughTex", "uHasRoughTex", "uRoughPort", "uRoughTiling", _ROUGH_TEX_UNIT),
+        ("metallic", "uMetalTex", "uHasMetalTex", "uMetalPort", "uMetalTiling", _METAL_TEX_UNIT),
+        ("emissive", "uEmisTex", "uHasEmisTex", "uEmisPort", "uEmisTiling", _EMIS_TEX_UNIT),
+    )
+
+    def _set_texture_channel_uniforms(self, prog, bindings: dict) -> None:
+        """Bind (or dummy-bind) each channel's sampler + has/port/tiling
+        uniforms for one draw call, from `MaterialGraph.direct_texture_
+        bindings()`'s result -- called once per entity, mirroring
+        renderer.py's per-entity `tex_entities` loop. A channel with no
+        binding, or whose texture can't be resolved, gets the 1x1 dummy
+        bound and its has-flag cleared -- the shader's `if (uHasXTex != 0)`
+        guard means the dummy is never actually sampled, but a sampler
+        uniform must always point at SOME bound texture unit."""
+        for channel, tex_name, has_name, port_name, tiling_name, unit in self._TEX_CHANNELS:
+            binding = bindings.get(channel)
+            tex = self._get_material_tex(binding.texture) if binding is not None else None
+            if tex is not None:
+                tex.use(location=unit)
+                prog[tex_name].value = unit
+                prog[has_name].value = 1
+                prog[port_name].value = _PORT_CODE.get(binding.port, 0)
+                prog[tiling_name].value = (float(binding.u_tiling), float(binding.v_tiling))
+            else:
+                self._dummy_tex.use(location=unit)
+                prog[tex_name].value = unit
+                prog[has_name].value = 0
+                prog[port_name].value = 0
+                prog[tiling_name].value = (1.0, 1.0)
 
     def _upload_shadow_tex(self, shadow_data: np.ndarray, total_faces: int) -> None:
         size = (self.MAX_LIGHTS, max(total_faces, 1))
@@ -896,6 +1092,10 @@ class GLRenderer:
         for tex in self._env_tex_cache.values():
             tex.release()
         self._env_tex_cache.clear()
+        for tex in self._material_tex_cache.values():
+            tex.release()
+        self._material_tex_cache.clear()
+        self._dummy_tex.release()
         if self._shadow_tex_obj is not None:
             self._shadow_tex_obj.release()
             self._shadow_tex_obj = None

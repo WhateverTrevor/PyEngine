@@ -112,9 +112,21 @@ bp_component_checks, bp_runtime_checks.
      (captured from main @76cb82b — supervisor re-verified it against a real
      main render, 0 px, so it is NOT circular; keep it that way if you
      regenerate it).
-  3. [next] OpenGL parity (textures + UV attributes + GLSL sampling).
-  4. wgpu parity (same in WGSL). Keep 3 and 4 separate — the PBR slate
-     split them that way and produced the two best-behaved runs (135k/140k).
+  3. [done] OpenGL parity. `gpu_geometry._build_uv` gives per-vertex UVs in
+     `_build_geometry`'s triangle-vertex order; GLSL samples per channel.
+     Untextured golden at `tests/fixtures/perpixel_gl_untextured_golden.npy`
+     (supervisor re-verified vs a real main render, 0 px — not circular).
+  4. [next] wgpu parity (same shape in WGSL). **Two traps run 3 hit that
+     will bite again and do NOT transfer automatically:**
+     - **V-FLIP**: the CPU's `sample_texture` maps v=0 to the image's
+       BOTTOM row, opposite the usual GPU convention. GL needed a flip at
+       upload; wgpu must verify this independently rather than copying GL's
+       answer.
+     - **render_scale**: a GPU-vs-CPU pixel comparison at the default
+       render_scale of 3 gave 1587/30000 differing pixels vs 173/30000 at
+       scale 1. Force scale 1 for parity work or the numbers lie.
+     Also: NEAREST filter + REPEAT wrap + no sRGB on upload are what reach
+     CPU parity. `_build_uv` is renderer-agnostic and ready to import.
   Consequences of runs 1-2 now live, NOT yet addressed:
   - **LOD swim**: decimated levels get a fresh box projection, so a textured
     mesh's pattern visibly JUMPS at the LOD switch distance. The most

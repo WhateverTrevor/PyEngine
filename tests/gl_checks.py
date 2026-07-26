@@ -1,4 +1,13 @@
-"""Judge checks for the GPU renderer: parity, IES, cone, shadows, depth."""
+"""Judge checks for the GPU renderer: parity, IES, cone, shadows, depth.
+
+Sections 7-10 cover per-pixel texturing run 3/4 (OpenGL): a byte-identical-
+with-main regression gate for untextured scenes (same pattern as texture_
+checks.py's CPU golden, engine/gl_renderer.py's UV attribute + texture
+sampling must be a pure no-op when no material directly binds a texture),
+real per-pixel variation within one GPU-rasterized face (not vacuous),
+GL-vs-CPU textured parity with a numerically-justified tolerance, and
+tiling reaching the GLSL sampler.
+"""
 import os
 import sys
 import tempfile
@@ -12,6 +21,8 @@ import numpy as np
 import pygame
 
 import engine
+from engine import mesh as mesh_mod
+from engine import texture as texture_mod
 from engine.gl_renderer import GLRenderer
 from engine.renderer import Renderer
 
@@ -180,5 +191,155 @@ img_dark_emis = gl_frame(build_pbr_dark_scene((220.0, 40.0, 40.0)), pbr_cam).ast
 assert img_dark_off.max() <= 2, f"expected near-black with no lights/emissive: {img_dark_off.max()}"
 assert img_dark_emis.max() > 100, f"emissive face not bright in the dark on GL: {img_dark_emis.max()}"
 print(f"gl emissive-in-dark OK: off max={img_dark_off.max():.0f} emissive max={img_dark_emis.max():.0f}")
+
+# 7. UNTEXTURED REGRESSION GATE: this run's shader/geometry changes (UV
+#    attribute in `_get_geo_cache`, texture-sampling uniforms and the
+#    baseColor/roughnessV/metallicV/emissiveV override locals in _MESH_FS)
+#    must not move a single pixel on a scene with no direct texture
+#    bindings. `perpixel_gl_untextured_golden.npy` was captured from a
+#    `git worktree add ... main` at 01a55c8 (this run's branch point),
+#    rendering the SAME `build_scene()`/`cam` as check #1 above through
+#    `GLRenderer.standalone` at the same 400x300 -- confirmed reproducible
+#    (rendered twice in one worktree process, 0 diff) before being treated
+#    as golden, same discipline as texture_checks.py's CPU golden.
+_golden_path = os.path.join(REPO, "tests", "fixtures", "perpixel_gl_untextured_golden.npy")
+assert os.path.exists(_golden_path), f"no golden at {_golden_path}"
+_golden = np.load(_golden_path).astype(np.int32)
+_gcurrent = img_gpu.astype(np.int32)  # same scene/cam/resolution as check #1, reused as-is
+_gdiff = np.abs(_gcurrent - _golden)
+assert _gdiff.max() == 0 and _gdiff.mean() == 0.0, (
+    f"UNTEXTURED REGRESSION: GL render differs from main by up to {_gdiff.max()} "
+    f"(mean {_gdiff.mean()}) on a scene with no direct texture bindings")
+print(f"7. untextured regression gate OK: 0 of {_golden.shape[0] * _golden.shape[1]} pixels "
+     "differ vs a main (01a55c8) GL render of the identical scene")
+
+# ---------------------------------------------------------------------
+# Per-pixel texturing (run 3/4): same quad-scene model as texture_checks.py
+# #17 (direct-bind vs multiply-wrapped fallback control), extended with a
+# GL-vs-CPU pixel comparison and a tiling check. See engine/gl_renderer.py's
+# `_get_material_tex` / `_set_texture_channel_uniforms` / the new _MESH_FS
+# uniforms + sampleTexVec3/sampleTexScalar helpers.
+# ---------------------------------------------------------------------
+_tex_tmp = os.path.join(TMP, "judge_perpixel_run3_assets")
+_tex_dir = os.path.join(_tex_tmp, "textures")
+os.makedirs(_tex_dir, exist_ok=True)
+_tex_path = os.path.join(_tex_dir, "grad.png")
+_grad_surf = pygame.Surface((8, 8))
+for _yy in range(8):
+    for _xx in range(8):
+        _grad_surf.set_at((_xx, _yy), (_xx * 32 % 256, _yy * 32 % 256, (_xx * 7 + _yy * 13) % 256))
+pygame.image.save(_grad_surf, _tex_path)
+texture_mod.set_texture_root(_tex_tmp)
+texture_mod.clear_cache()
+
+_quad_verts = [(-2, -2, -5), (2, -2, -5), (2, 2, -5), (-2, 2, -5)]  # box-projected UVs vary 0..1 across it
+_quad_cam = engine.Camera(position=engine.Vec3(0.0, 0.0, 0.0), yaw=0.0, pitch=0.0)
+
+
+def _build_quad_scene(direct_bind: bool, u_tiling: float = 1.0, v_tiling: float = 1.0):
+    scene9 = engine.Scene(light=engine.DirectionalLight(
+        engine.Vec3(0, -1, 0), ambient=1.0, color=(255, 255, 255), intensity=0.0))
+    ent9 = engine.Entity("quad", mesh=mesh_mod.Mesh(_quad_verts, [(0, 1, 2, 3)]))
+    g9 = engine.MaterialGraph()
+    ts9 = g9.add("tex_sample", (0, 0))
+    g9.nodes[ts9]["texture"] = "textures/grad.png"
+    if direct_bind:
+        if u_tiling != 1.0 or v_tiling != 1.0:
+            tc9 = g9.add("tex_coord", (0, 0))
+            g9.nodes[tc9]["params"]["u_tiling"] = u_tiling
+            g9.nodes[tc9]["params"]["v_tiling"] = v_tiling
+            assert g9.connect(tc9, ts9, "uv")
+        assert g9.connect(ts9, g9.output_id(), "base_color", "RGB")
+    else:
+        mul9 = g9.add("multiply", (0, 0))
+        one9 = g9.add("constant3vector", (0, 0))
+        assert g9.connect(ts9, mul9, "a", "RGB")
+        assert g9.connect(one9, mul9, "b")
+        assert g9.connect(mul9, g9.output_id(), "base_color")
+    ent9.material = g9
+    g9.apply(ent9)
+    scene9.add(ent9)
+    return scene9
+
+
+_QW, _QH = 200, 150
+_gl_quad = GLRenderer.standalone(_QW, _QH)
+
+
+def _gl_quad_frame(scene9):
+    _gl_quad.render(scene9, _quad_cam, (_QW, _QH), None)
+    raw9 = _gl_quad.target.read(components=3)
+    return np.frombuffer(raw9, dtype=np.uint8).reshape(_QH, _QW, 3)[::-1]
+
+
+_bg9 = np.asarray(engine.Scene().background)
+_img_gl_direct = _gl_quad_frame(_build_quad_scene(True)).astype(np.int32)
+_mask9 = ~np.all(_img_gl_direct == _bg9[None, None, :], axis=2)
+_distinct_gl_direct = len(np.unique(_img_gl_direct[_mask9].reshape(-1, 3), axis=0))
+
+_img_gl_fallback = _gl_quad_frame(_build_quad_scene(False)).astype(np.int32)
+_mask9b = ~np.all(_img_gl_fallback == _bg9[None, None, :], axis=2)
+_distinct_gl_fallback = len(np.unique(_img_gl_fallback[_mask9b].reshape(-1, 3), axis=0))
+
+assert _mask9.sum() > 1000, "quad should cover a substantial part of the frame"
+assert _distinct_gl_direct > 50, f"expected many distinct colors from GL per-pixel sampling, got {_distinct_gl_direct}"
+assert _distinct_gl_fallback == 1, f"expected exactly 1 color from the per-face bake control, got {_distinct_gl_fallback}"
+print(f"8. GL per-pixel variation OK (not vacuous): direct-bind base_color shows "
+     f"{_distinct_gl_direct} distinct colors across {int(_mask9.sum())} pixels of ONE "
+     f"face on the GPU; multiply-wrapped fallback (same graph, same face) gives exactly "
+     f"{_distinct_gl_fallback} -- confirms the GLSL sampler, not lighting, is the source "
+     "of variation")
+
+# 9. NEW GATE: GL-vs-CPU textured parity. render_scale MUST be forced to 1
+#    for a fair full-resolution comparison -- the default (3) renders the
+#    CPU path at 1/3 internal resolution then upscales, which alone
+#    produces a much larger, meaningless diff at texel-cell boundaries
+#    (caught during implementation: 1587/30000 differing px at the default
+#    scale vs 173/30000 at scale=1, same scene/camera/texture).
+_r9 = Renderer()
+_r9.render_scale = 1
+_surf_cpu9 = pygame.Surface((_QW, _QH))
+_r9.render(_surf_cpu9, _build_quad_scene(True), _quad_cam)
+_img_cpu_direct = pygame.surfarray.array3d(_surf_cpu9).transpose(1, 0, 2).astype(np.int32)
+_pdiff = np.abs(_img_gl_direct - _img_cpu_direct)
+_pndiff = int((_pdiff.sum(axis=2) > 0).sum())
+_pfrac = _pndiff / (_QW * _QH)
+# Tolerance, justified by measurement (this exact scene, numbers found
+# during implementation): mean diff 0.27, max diff 212, 173/30000 (0.58%)
+# differing pixels. The nonzero diffs are NEAREST-neighbor texel-boundary
+# aliasing: GL's hardware perspective-correct interpolation and the CPU's
+# numpy barycentric world-space math are two independently-implemented,
+# both-correct interpolants that can disagree by one texel index right at
+# a shared cell edge; this test texture is a deliberately maximal-contrast
+# 8x8 gradient so a single-texel edge miss shows up as a big color jump.
+# Bounding at mean<3.0 / differing-fraction<3% is >5x the measured
+# 0.27 / 0.58% -- tight enough that a real sampling bug (wrong channel,
+# wrong UV, missing tiling, wrong V orientation -- any of which would
+# desync entire regions, not just edge pixels) would blow through it,
+# loose enough not to be a coin-flip on rasterizer rounding.
+assert _pdiff.mean() < 3.0, f"GL/CPU textured mean diff too high: {_pdiff.mean():.3f}"
+assert _pfrac < 0.03, f"GL/CPU textured differing-pixel fraction too high: {_pfrac:.4f}"
+print(f"9. textured parity OK: mean diff={_pdiff.mean():.3f} (tolerance <3.0), "
+     f"max diff={_pdiff.max()}, {_pndiff}/{_QW * _QH} differing px "
+     f"({100 * _pfrac:.2f}%, tolerance <3%) -- diffs are nearest-neighbor "
+     "texel-boundary aliasing between two independent rasterizers, not a "
+     "systematic bug (both rendered at render_scale=1 -- see comment above)")
+
+# 10. tiling reaches the GLSL sampler: u_tiling/v_tiling actually change the
+#     GL render (still samples the same 8x8 palette -- repeats, doesn't
+#     distort or go out of range -- while visibly differing from untiled).
+_img_gl_tiled = _gl_quad_frame(_build_quad_scene(True, u_tiling=3.0, v_tiling=3.0)).astype(np.int32)
+_mask9c = ~np.all(_img_gl_tiled == _bg9[None, None, :], axis=2)
+_distinct_gl_tiled = len(np.unique(_img_gl_tiled[_mask9c].reshape(-1, 3), axis=0))
+assert _distinct_gl_tiled > 50, f"tiled GL render should still sample the full palette, got {_distinct_gl_tiled}"
+assert not np.array_equal(_img_gl_tiled, _img_gl_direct), "tiling=3 must render differently than tiling=1 on GL"
+print(f"10. GL tiling OK: {_distinct_gl_tiled} distinct colors (still the full palette, "
+     "repeated), differs from the untiled GL render")
+
+_gl_quad.release()
+texture_mod.clear_cache()
+texture_mod.set_texture_root(os.path.join(REPO, "assets"))
+import shutil as _shutil9
+_shutil9.rmtree(_tex_tmp, ignore_errors=True)
 
 print("JUDGE GPU CHECKS PASSED")
