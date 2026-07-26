@@ -98,8 +98,18 @@ bp_component_checks, bp_runtime_checks.
     actually light anything.
   - An already-placed instance does not auto-update when its blueprint
     changes; re-placing picks up edits (matches every other asset type).
-- wgpu directional (sun) shadow attenuation on mesh faces (GL's dlShadowTex)
-  — the last wgpu visual gap.
+- **wgpu directional (sun) shadow attenuation on mesh faces (GL's
+  dlShadowTex) — the last wgpu visual gap, and the ONLY item left from the
+  user's own stated priority list.** They ranked it above per-pixel
+  texturing; it was skipped only because they said "go ahead" on the
+  texturing split. Do this next unless told otherwise. Single-backend, so
+  it does NOT need pre-splitting.
+- Both GPU backends key `_geo_cache`/`_entity_uniform_cache` on
+  `id(mesh)`/`id(entity)` with no content check. CPython recycles
+  addresses, so a rebuilt scene can produce a false cache hit (IndexError,
+  or silently wrong geometry if sizes coincide). Hit for real in a
+  benchmark script that rebuilt scenes per iteration; never in normal use,
+  since nothing rebuilds whole scenes per frame. Latent trap for tooling.
 - Per-pixel texturing — PRE-SPLIT INTO 4 RUNS, run 1/4 DONE:
   1. [done] Per-corner UV foundation. `Mesh.corner_uvs` (M,4,2) parallel to
      `faces`; FBX import now preserves the per-polygon-vertex UVs it used
@@ -116,17 +126,21 @@ bp_component_checks, bp_runtime_checks.
      `_build_geometry`'s triangle-vertex order; GLSL samples per channel.
      Untextured golden at `tests/fixtures/perpixel_gl_untextured_golden.npy`
      (supervisor re-verified vs a real main render, 0 px — not circular).
-  4. [next] wgpu parity (same shape in WGSL). **Two traps run 3 hit that
-     will bite again and do NOT transfer automatically:**
-     - **V-FLIP**: the CPU's `sample_texture` maps v=0 to the image's
-       BOTTOM row, opposite the usual GPU convention. GL needed a flip at
-       upload; wgpu must verify this independently rather than copying GL's
-       answer.
-     - **render_scale**: a GPU-vs-CPU pixel comparison at the default
-       render_scale of 3 gave 1587/30000 differing pixels vs 173/30000 at
-       scale 1. Force scale 1 for parity work or the numbers lie.
-     Also: NEAREST filter + REPEAT wrap + no sRGB on upload are what reach
-     CPU parity. `_build_uv` is renderer-agnostic and ready to import.
+  4. [done] wgpu/DX12 parity, in WGSL. Notably did NOT copy GL's V-flip:
+     it uses `textureLoad` (no sampler — `rgba32float` is unfilterable-float
+     and can't back `textureSample` without a non-portable feature) and
+     hand-rolls the index to reproduce `sample_texture`'s own formula, so
+     no flip is needed. Golden at
+     `tests/fixtures/perpixel_wgpu_untextured_golden.npy`.
+  **The slate is COMPLETE across CPU / OpenGL / wgpu.**
+
+  Cross-backend facts worth keeping: NEAREST filter + REPEAT wrap + no sRGB
+  on upload are what reach CPU parity; force `render_scale = 1` for any
+  GPU-vs-CPU pixel comparison (scale 3 gives 1587/30000 differing px vs
+  173/30000 at scale 1); textured GPU-vs-CPU parity is mean 0.266 /
+  173 of 30000 px on BOTH GPU backends, and a silent flat-per-face
+  regression measures mean ~13.3 / ~25% — that gap is what makes the
+  mean<3.0 / <3% gates real gates.
   Consequences of runs 1-2 now live, NOT yet addressed:
   - **LOD swim**: decimated levels get a fresh box projection, so a textured
     mesh's pattern visibly JUMPS at the LOD switch distance. The most

@@ -95,6 +95,39 @@ be available on this dev machine's adapter, but this renderer does not
 request it, to keep device creation portable across vendors/backends) -- so
 there is no wireframe rendering path in this backend. F1 is a documented
 no-op on dx12/vulkan in `engine/core.py`.
+
+Per-pixel texturing (run 4/4 of the slate, mirroring `gl_renderer.py`'s run
+3): `gpu_geometry._build_uv(mesh)` supplies a per-vertex UV vertex buffer
+(`shader_location=7`), and a material's `direct_texture_bindings()` (see
+materials.py) is sampled per pixel in WGSL for whichever Output channels a
+`tex_sample` node feeds directly -- everything else keeps reading the
+per-face-baked color/roughness/metallic/emissive attributes untouched, so
+an untextured draw is a byte-identical passthrough. Texture sampling here
+uses `textureLoad` (see `tex_texel()` in `_MESH_WGSL`), NOT `textureSample`
++ a `sampler`: a `sampler`-based path would need the texture's sample type
+to be "float" (filterable), but an rgba32float texture is "unfilterable-
+float" without requesting the non-portable `float32-filterable` device
+feature -- `textureLoad` has no such restriction and needs no sampler
+object at all, exactly like this file's existing `shadow_tex`/`gi_tex`/
+`ies_tex` exact-texel reads. Because sampling is hand-rolled, the V-FLIP
+question (`texture.sample_texture`'s `yi = clip((1-v)*h, ...)`, which maps
+v=0 to the image's BOTTOM row) is answered by literally reproducing that
+formula in `tex_texel()` against an UNFLIPPED upload (row 0 of the CPU
+array = texel row 0), rather than by flipping the array to match some
+hardware sampler convention the way `GLRenderer._get_material_tex` does --
+there is no implicit v-convention to fight when every index is computed by
+hand. Verified by the wgpu-vs-CPU pixel parity gate in `tests/wgpu_checks.
+py` (a flipped upload would mirror every textured pixel and blow the parity
+gate wide open). Per-entity texture views live in bind group 2 (4 fixed
+slots: base_color/roughness/metallic/emissive, always dummy-filled --
+`_dummy_tex_view` -- when a channel has no binding, since WebGPU bind
+groups can't have "optional" entries), cached like the entity uniform bind
+group and rebuilt only when the resolved view identities change; per-
+channel has/port/tiling metadata rides in `EntityUniforms.tex_meta` (see
+`_pack_entity_uniforms`), grown by one `array<vec4<f32>, 4>` (verify
+`_ENTITY_UBO_SIZE` if this struct changes again). Translucent entities
+always get `{}` bindings here too (never even resolved), same rule as GL/
+CPU -- opacity is not a sampleable channel on this shader.
 """
 from __future__ import annotations
 
@@ -102,8 +135,9 @@ import math
 
 import numpy as np
 
+from . import texture as texture_mod
 from .gpu_geometry import (_build_color, _build_geometry, _build_opacity,
-                           _build_pbr, _entity_world_faces, _lod_gather,
+                           _build_pbr, _build_uv, _entity_world_faces, _lod_gather,
                            _scene_environment)
 from .lighting import _IES_CURVES
 from .math3d import rotation_x, rotation_y
@@ -117,6 +151,11 @@ _MAX_FOG_VOL = 4
 _FOG_SKY_FAR = 260.0  # path-length clip for fog volumes behind the sky, matches GLRenderer
 _BACKEND_ENV = {"dx12": "D3D12", "vulkan": "Vulkan"}
 _BACKEND_MODE = {"D3D12": "dx12", "Vulkan": "vulkan"}
+
+# Port name -> int code, mirroring materials.py's TextureBinding.port /
+# GLRenderer's `_PORT_CODE` / renderer.py's `_extract_channel` -- read by
+# both sample_port_vec3/sample_port_scalar in the fragment shader below.
+_PORT_CODE = {"RGB": 0, "R": 1, "G": 2, "B": 3, "A": 4}
 
 # ---------------------------------------------------------------------------
 # WGSL shaders
@@ -152,6 +191,10 @@ struct LightData {{
 struct LightArray {{ items: array<LightData, MAX_LIGHTS> }};
 
 // EntityUniforms field order+size must match `_pack_entity_uniforms` below.
+// tex_meta[i] = (has, port_code, u_tiling, v_tiling) for channel i, fixed
+// order (base_color, roughness, metallic, emissive) matching `_TEX_CHANNELS`
+// and bind group 2's 4 texture slots below -- grown onto the end of the
+// struct (run 4/4 of the per-pixel texturing slate; see module docstring).
 struct EntityUniforms {{
     mvp: mat4x4<f32>,
     model: mat4x4<f32>,
@@ -159,6 +202,7 @@ struct EntityUniforms {{
     normal_mat1: vec4<f32>,  // normal matrix column 1, xyz used
     normal_mat2: vec4<f32>,  // normal matrix column 2, xyz used
     face_offset: vec4<f32>,  // x = this entity's face offset into the shadow texture
+    tex_meta: array<vec4<f32>, 4>,
 }};
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -167,6 +211,16 @@ struct EntityUniforms {{
 @group(0) @binding(3) var ies_tex: texture_2d<f32>;
 @group(0) @binding(4) var gi_tex: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> entity: EntityUniforms;
+// Per-pixel texturing: 4 fixed texture slots (base_color/roughness/
+// metallic/emissive -- "opacity" is excluded, see module docstring), always
+// bound to SOMETHING (a 1x1 dummy when a channel has no direct binding --
+// WebGPU bind groups can't have optional entries), read via `textureLoad`
+// (no sampler -- see module docstring on why `textureSample` doesn't fit
+// an unfilterable-float rgba32float texture here).
+@group(2) @binding(0) var uBaseTex: texture_2d<f32>;
+@group(2) @binding(1) var uRoughTex: texture_2d<f32>;
+@group(2) @binding(2) var uMetalTex: texture_2d<f32>;
+@group(2) @binding(3) var uEmisTex: texture_2d<f32>;
 
 struct VOut {{
     @builtin(position) clip_pos: vec4<f32>,
@@ -178,13 +232,14 @@ struct VOut {{
     @location(5) metallic: f32,
     @location(6) emissive: vec3<f32>,
     @location(7) opacity: f32,
+    @location(8) uv: vec2<f32>,
 }};
 
 @vertex
 fn vs_main(@location(0) in_pos: vec3<f32>, @location(1) in_normal: vec3<f32>,
            @location(2) in_faceid: f32, @location(3) in_color: vec3<f32>,
            @location(4) in_rm: vec2<f32>, @location(5) in_emissive: vec3<f32>,
-           @location(6) in_opacity: f32) -> VOut {{
+           @location(6) in_opacity: f32, @location(7) in_uv: vec2<f32>) -> VOut {{
     var out: VOut;
     let world = entity.model * vec4<f32>(in_pos, 1.0);
     out.world_pos = world.xyz;
@@ -196,6 +251,7 @@ fn vs_main(@location(0) in_pos: vec3<f32>, @location(1) in_normal: vec3<f32>,
     out.metallic = in_rm.y;
     out.emissive = in_emissive;
     out.opacity = in_opacity;
+    out.uv = in_uv;
     out.clip_pos = entity.mvp * vec4<f32>(in_pos, 1.0);
     return out;
 }}
@@ -273,8 +329,71 @@ fn ggx_specular(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, alpha: f32, f0: vec3<f
     return (d * g / max(4.0 * ndotv * ndotl, 1e-4)) * f;
 }}
 
+// Nearest-neighbor exact-texel fetch with REPEAT wrap, replicating
+// texture.sample_texture's formula exactly (see module docstring):
+// `u = mod(uv.x, 1)`, `v = mod(uv.y, 1)`, `xi = clip(u*w, 0, w-1)`,
+// `yi = clip((1-v)*h, 0, h-1)` -- the (1-v) is the V-FLIP: v=0 lands on the
+// array's LAST row (image bottom), v=1 on row 0 (image top), matching an
+// UNFLIPPED upload of `texture.load_texture`'s (row 0 = image top) array.
+fn tex_texel(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {{
+    let dims = vec2<i32>(textureDimensions(tex));
+    let u = uv.x - floor(uv.x);
+    let v = uv.y - floor(uv.y);
+    let xi = clamp(i32(u * f32(dims.x)), 0, dims.x - 1);
+    let yi = clamp(i32((1.0 - v) * f32(dims.y)), 0, dims.y - 1);
+    return textureLoad(tex, vec2<i32>(xi, yi), 0);
+}}
+
+// Port -> shape coercion, mirroring GLRenderer's sampleTexVec3/Scalar /
+// renderer.py's `_extract_channel` exactly (0=RGB, 1=R, 2=G, 3=B, 4=A --
+// see materials.py's TextureBinding.port). Vec3 form is for vector
+// channels (base_color/emissive): a scalar port replicates across R=G=B.
+// Scalar form is for roughness/metallic: a vector port (RGB) mean-reduces.
+fn sample_port_vec3(s: vec4<f32>, port: i32) -> vec3<f32> {{
+    if (port == 0) {{ return s.rgb; }}
+    if (port == 1) {{ return vec3<f32>(s.r); }}
+    if (port == 2) {{ return vec3<f32>(s.g); }}
+    if (port == 3) {{ return vec3<f32>(s.b); }}
+    return vec3<f32>(s.a);
+}}
+
+fn sample_port_scalar(s: vec4<f32>, port: i32) -> f32 {{
+    if (port == 0) {{ return (s.r + s.g + s.b) / 3.0; }}
+    if (port == 1) {{ return s.r; }}
+    if (port == 2) {{ return s.g; }}
+    if (port == 3) {{ return s.b; }}
+    return s.a;
+}}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    // Per-pixel texturing overrides -- replace the per-face-baked value for
+    // just the channels a material directly binds a texture to (REPLACE,
+    // not blend/multiply -- mirrors renderer.py's `channel_overrides` and
+    // GLRenderer's uHasXTex block exactly). Untextured draws leave every
+    // tex_meta[i].x at 0, so this is a pure passthrough -- same values as
+    // before this run.
+    var base_color = in.color;
+    var roughness_v = in.roughness;
+    var metallic_v = in.metallic;
+    var emissive_v = in.emissive;
+    if (entity.tex_meta[0].x > 0.5) {{
+        let s = tex_texel(uBaseTex, in.uv * entity.tex_meta[0].zw);
+        base_color = sample_port_vec3(s, i32(entity.tex_meta[0].y + 0.5));
+    }}
+    if (entity.tex_meta[1].x > 0.5) {{
+        let s = tex_texel(uRoughTex, in.uv * entity.tex_meta[1].zw);
+        roughness_v = sample_port_scalar(s, i32(entity.tex_meta[1].y + 0.5));
+    }}
+    if (entity.tex_meta[2].x > 0.5) {{
+        let s = tex_texel(uMetalTex, in.uv * entity.tex_meta[2].zw);
+        metallic_v = sample_port_scalar(s, i32(entity.tex_meta[2].y + 0.5));
+    }}
+    if (entity.tex_meta[3].x > 0.5) {{
+        let s = tex_texel(uEmisTex, in.uv * entity.tex_meta[3].zw);
+        emissive_v = sample_port_vec3(s, i32(entity.tex_meta[3].y + 0.5));
+    }}
+
     let n = normalize(in.normal);
     let to_light = normalize(-frame.dl_dir.xyz);
     let lambert = clamp(dot(n, to_light), 0.0, 1.0);
@@ -290,10 +409,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // PBR setup -- alpha/f0/specScale mirror renderer.py's/GLRenderer's
     // per-pixel gather exactly. specScale = 1 - roughness*(1-metallic) is the
     // backward-compat gate: zero at the default params (roughness=1, metallic=0).
-    var alpha = clamp(in.roughness, 0.02, 1.0);
+    var alpha = clamp(roughness_v, 0.02, 1.0);
     alpha = alpha * alpha;
-    let f0 = mix(vec3<f32>(0.04), in.color, in.metallic);
-    let spec_scale = 1.0 - in.roughness * (1.0 - in.metallic);
+    let f0 = mix(vec3<f32>(0.04), base_color, metallic_v);
+    let spec_scale = 1.0 - roughness_v * (1.0 - metallic_v);
     let view_dir = normalize(frame.camera_pos.xyz - in.world_pos);
     var spec = vec3<f32>(0.0);
 
@@ -345,8 +464,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // term at once (ambient+directional+GI+point/spot lambert) -- a single
     // scalar multiplier distributes linearly over the sum, matching
     // renderer.py's/GLRenderer's per-term gating exactly.
-    lum = lum * (1.0 - in.metallic);
-    var out_color = in.color * lum + spec;
+    lum = lum * (1.0 - metallic_v);
+    var out_color = base_color * lum + spec;
 
     let view_delta = in.world_pos - frame.camera_pos.xyz;
     let frag_dist = length(view_delta);
@@ -363,7 +482,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 
     // Emissive is unconditional -- visible even unlit/in shadow, added
     // after fog, matching renderer.py's/GLRenderer's ordering.
-    out_color = out_color + in.emissive;
+    out_color = out_color + emissive_v;
     return vec4<f32>(clamp(out_color, vec3<f32>(0.0), vec3<f32>(1.0)), in.opacity);
 }}
 """
@@ -507,7 +626,8 @@ class WgpuRenderer:
     # FrameUniforms: 6 header vec4 + 6 ambient_cube vec4 + 3x MAX_FOG_VOL fog-vol vec4
     _FRAME_UBO_SIZE = 192 + 48 * _MAX_FOG_VOL
     _LIGHT_UBO_SIZE = 64 * _MAX_LIGHTS  # LightData = 4 vec4 = 64B, x16 lights
-    _ENTITY_UBO_SIZE = 192  # 2x mat4x4 (64B) + 3x vec4 (48B) + 1x vec4 (16B)
+    # 2x mat4x4 (64B) + 3x vec4 (48B) + 1x vec4 (16B) + 4x vec4 tex_meta (64B)
+    _ENTITY_UBO_SIZE = 256
     # SkyUniforms: 12 header vec4 (incl. camera_pos/sun_*) + 3x MAX_FOG_VOL fog-vol vec4
     _SKY_UBO_SIZE = 192 + 48 * _MAX_FOG_VOL
 
@@ -534,6 +654,12 @@ class WgpuRenderer:
         self._env_tex_cache: dict[int, dict] = {}
         self._last_sky_env_view = None
         self._gi = GITracer()
+        # Per-pixel texturing (run 4/4): GPU texture objects for a
+        # material's direct texture binding, cached by the material's rel
+        # path -- same key space as `texture_mod.load_texture_rel`'s own
+        # CPU-side float-array cache and GLRenderer's `_material_tex_cache`
+        # -- loaded/uploaded once, reused every draw/frame.
+        self._material_tex_cache: dict[str, dict] = {}
 
         self._build_pipelines()
         self._build_static_resources()
@@ -586,6 +712,10 @@ class WgpuRenderer:
                         "array_stride": 4, "step_mode": "vertex",
                         "attributes": [{"format": "float32", "offset": 0, "shader_location": 6}],
                     },
+                    {  # uv(2f) -- matches _build_uv's per-vertex-corner output (run 4/4)
+                        "array_stride": 4 * 2, "step_mode": "vertex",
+                        "attributes": [{"format": "float32x2", "offset": 0, "shader_location": 7}],
+                    },
                 ],
             },
             primitive={"topology": "triangle-list", "front_face": "ccw", "cull_mode": "back"},
@@ -596,6 +726,10 @@ class WgpuRenderer:
         )
         self._mesh_bgl0 = self._mesh_pipeline.get_bind_group_layout(0)
         self._mesh_bgl1 = self._mesh_pipeline.get_bind_group_layout(1)
+        # Per-pixel texturing (run 4/4): group 2 is the 4 fixed texture
+        # slots (base_color/roughness/metallic/emissive), auto-inferred from
+        # the fragment shader's @group(2) declarations same as bgl0/bgl1.
+        self._mesh_bgl2 = self._mesh_pipeline.get_bind_group_layout(2)
         # Translucent pass: same shader + vertex layout, sharing an explicit
         # pipeline layout (built from the opaque pipeline's auto-inferred
         # bind group layouts) so bind groups created once work for either
@@ -605,9 +739,13 @@ class WgpuRenderer:
         # again. Differs from the opaque pipeline only in depth-write
         # (off, so back-to-front translucent faces blend instead of
         # occluding each other -- occlusion by opaque geometry still
-        # happens via depth-test-on) and standard alpha blending.
+        # happens via depth-test-on) and standard alpha blending. Group 2
+        # must be included even though translucent entities always pass
+        # `{}` bindings (see module docstring) -- the shared fragment shader
+        # references @group(2) structurally, so every draw through this
+        # pipeline needs SOME bind group 2 set (the all-dummy one).
         mesh_pipeline_layout = device.create_pipeline_layout(
-            bind_group_layouts=[self._mesh_bgl0, self._mesh_bgl1])
+            bind_group_layouts=[self._mesh_bgl0, self._mesh_bgl1, self._mesh_bgl2])
         self._mesh_translucent_pipeline = device.create_render_pipeline(
             layout=mesh_pipeline_layout,
             vertex={
@@ -626,6 +764,8 @@ class WgpuRenderer:
                     ]},
                     {"array_stride": 4, "step_mode": "vertex", "attributes": [
                         {"format": "float32", "offset": 0, "shader_location": 6}]},
+                    {"array_stride": 4 * 2, "step_mode": "vertex", "attributes": [
+                        {"format": "float32x2", "offset": 0, "shader_location": 7}]},
                 ],
             },
             primitive={"topology": "triangle-list", "front_face": "ccw", "cull_mode": "back"},
@@ -710,6 +850,20 @@ class WgpuRenderer:
             size=(1, 1, 1), format="rgba32float",
             usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
         self._gi_view = self._gi_tex.create_view()
+
+        # Per-pixel texturing (run 4/4): 1x1 opaque-white dummy, always
+        # bound to whichever of the 4 channel slots (group 2) a material
+        # doesn't directly bind a texture to -- mirrors GLRenderer's
+        # `_dummy_tex`. rgba32float (not rgba8unorm) so it matches
+        # `_get_material_tex_view`'s upload format exactly -- a bind group
+        # can't mix sample types across draws using the same layout.
+        self._dummy_tex = device.create_texture(
+            size=(1, 1, 1), format="rgba32float",
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        device.queue.write_texture(
+            {"texture": self._dummy_tex}, np.ones(4, dtype=np.float32).tobytes(),
+            {"bytes_per_row": 16, "rows_per_image": 1}, (1, 1, 1))
+        self._dummy_tex_view = self._dummy_tex.create_view()
 
         self._frame_bind_group = self._make_frame_bind_group()
         self._sky_bind_group = self._make_sky_bind_group(self._dummy_env_view)
@@ -817,6 +971,88 @@ class WgpuRenderer:
             self._env_tex_cache[key] = cache
         return cache["view"]
 
+    def _get_material_tex_view(self, rel_path: str) -> "object | None":
+        """GPU texture view for a material's direct texture binding, cached
+        by rel path (see `_material_tex_cache`) -- mirrors GLRenderer's
+        `_get_material_tex`. Loads through `texture_mod.load_texture_rel`,
+        the SAME float-array cache the CPU renderer's `_pixel_uv`/
+        `sample_texture` path uses, so this never re-decodes an image the
+        CPU path already has in memory. Returns None if the texture can't
+        be resolved (missing at render time) -- caller falls back to the
+        per-face bake exactly like GL's/CPU's `if img is None`.
+
+        Uploaded as plain linear rgba32float (no sRGB, no flip) -- see
+        `tex_texel()` in `_MESH_WGSL` for why no flip is needed here: this
+        renderer computes its own nearest-neighbor texel index by hand
+        (`textureLoad`, not `textureSample`), reproducing `texture.
+        sample_texture`'s v-to-row formula directly against an unflipped
+        upload, instead of fighting a hardware sampler's implicit
+        v-convention the way GLRenderer's flip-before-upload does."""
+        cached = self._material_tex_cache.get(rel_path)
+        if cached is not None:
+            return cached["view"]
+        img = texture_mod.load_texture_rel(rel_path)  # (H, W, 4) float64 0..1, row 0 = image top
+        if img is None:
+            return None
+        wgpu = self._wgpu
+        data = np.ascontiguousarray(img, dtype=np.float32)
+        h, w = data.shape[:2]
+        tex = self.device.create_texture(
+            size=(w, h, 1), format="rgba32float",
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        self.device.queue.write_texture(
+            {"texture": tex}, data.tobytes(),
+            {"bytes_per_row": w * 16, "rows_per_image": h}, (w, h, 1))
+        cache = {"tex": tex, "view": tex.create_view()}
+        self._material_tex_cache[rel_path] = cache
+        return cache["view"]
+
+    # Output channels a texture can bind to directly on the mesh shader,
+    # in FIXED order matching both `EntityUniforms.tex_meta`'s 4 slots and
+    # bind group 2's 4 texture bindings -- "opacity" is excluded (translucent
+    # entities never resolve real bindings here, see module docstring).
+    _TEX_CHANNELS = ("base_color", "roughness", "metallic", "emissive")
+
+    def _tex_meta_and_views(self, bindings: dict):
+        """(meta (4,4) float32, views [4]) for one draw call's texture
+        channel state, from `MaterialGraph.direct_texture_bindings()`'s
+        result -- mirrors GLRenderer's `_set_texture_channel_uniforms`.
+        meta[i] = (has, port_code, u_tiling, v_tiling); a channel with no
+        binding, or whose texture can't be resolved, gets has=0 and the
+        1x1 dummy view -- the shader's `tex_meta[i].x > 0.5` guard means
+        the dummy is never actually sampled, but bind group 2 must always
+        point at SOME texture in every slot."""
+        meta = np.zeros((4, 4), dtype=np.float32)
+        meta[:, 2:4] = 1.0  # default tiling, harmless when has=0
+        views = [self._dummy_tex_view] * 4
+        for i, channel in enumerate(self._TEX_CHANNELS):
+            binding = bindings.get(channel)
+            if binding is None:
+                continue
+            view = self._get_material_tex_view(binding.texture)
+            if view is None:
+                continue
+            views[i] = view
+            meta[i] = (1.0, float(_PORT_CODE.get(binding.port, 0)),
+                      float(binding.u_tiling), float(binding.v_tiling))
+        return meta, views
+
+    def _get_entity_tex_bind_group(self, entity, views):
+        """Bind group 2 (the 4 texture channel slots) for one entity, cached
+        like `_get_entity_uniforms`'s bind group and rebuilt only when the
+        resolved view identities change (rare -- a material edit, not a
+        per-frame event); `views` identities are stable across frames since
+        `_material_tex_cache`/`_dummy_tex_view` entries are permanent once
+        created, so an unchanged material's key never rebuilds this."""
+        cache = self._get_entity_uniforms(entity)
+        key = tuple(id(v) for v in views)
+        if cache.get("tex_key") != key:
+            cache["tex_bind_group"] = self.device.create_bind_group(
+                layout=self._mesh_bgl2,
+                entries=[{"binding": i, "resource": v} for i, v in enumerate(views)])
+            cache["tex_key"] = key
+        return cache["tex_bind_group"]
+
     # ------------------------------------------------------------------
     # per-mesh / per-entity GPU buffer caches (mirrors GLRenderer)
     # ------------------------------------------------------------------
@@ -839,8 +1075,16 @@ class WgpuRenderer:
             opacity = _build_opacity(mesh, face_id_tri)
             opacity_buf = self.device.create_buffer_with_data(
                 data=np.ascontiguousarray(opacity).tobytes(), usage=wgpu.BufferUsage.VERTEX)
+            # UV attribute for per-pixel texturing (run 4/4) -- unlike color/
+            # pbr/opacity, corner_uvs is fixed at mesh construction (never
+            # re-baked by the material editor), so this buffer is built once
+            # here and never rewritten in the cache-hit branch below (same
+            # as GLRenderer's vbo_uv).
+            uv = _build_uv(mesh)
+            uv_buf = self.device.create_buffer_with_data(
+                data=np.ascontiguousarray(uv).tobytes(), usage=wgpu.BufferUsage.VERTEX)
             cache = {"geom_buf": geom_buf, "color_buf": color_buf, "pbr_buf": pbr_buf,
-                     "opacity_buf": opacity_buf,
+                     "opacity_buf": opacity_buf, "uv_buf": uv_buf,
                      "count": pos.shape[0], "face_id_tri": face_id_tri,
                      "color_id": id(mesh.face_colors),
                      "pbr_id": (id(mesh.face_roughness), id(mesh.face_metallic),
@@ -889,6 +1133,7 @@ class WgpuRenderer:
             c["color_buf"].destroy()
             c["pbr_buf"].destroy()
             c["opacity_buf"].destroy()
+            c["uv_buf"].destroy()
         live_ent_ids = {id(e) for e in live_entities}
         for key in [k for k in self._entity_uniform_cache if k not in live_ent_ids]:
             self._entity_uniform_cache.pop(key)["ubo"].destroy()
@@ -914,13 +1159,16 @@ class WgpuRenderer:
     # ------------------------------------------------------------------
     @staticmethod
     def _pack_entity_uniforms(mvp: np.ndarray, model: np.ndarray, normal_mat: np.ndarray,
-                              face_offset: int) -> bytes:
+                              face_offset: int, tex_meta: np.ndarray) -> bytes:
         """EntityUniforms: mvp(64B) + model(64B) + 3x normal_mat column
-        vec4(48B) + face_offset vec4(16B) = 192B. Matrices are written
-        `.T`-flattened (row i of the transpose = column i of the original)
-        to match WGSL's column-major mat4x4/vec4-column storage, same trick
-        as GLRenderer's `_write_mat`."""
-        buf = np.zeros(48, dtype=np.float32)
+        vec4(48B) + face_offset vec4(16B) + 4x tex_meta vec4(64B) = 256B.
+        Matrices are written `.T`-flattened (row i of the transpose =
+        column i of the original) to match WGSL's column-major
+        mat4x4/vec4-column storage, same trick as GLRenderer's
+        `_write_mat`. `tex_meta` is `_tex_meta_and_views`'s (4, 4) array,
+        one (has, port_code, u_tiling, v_tiling) row per channel, in the
+        fixed order `_TEX_CHANNELS` / bind group 2's slots agree on."""
+        buf = np.zeros(64, dtype=np.float32)
         buf[0:16] = np.ascontiguousarray(mvp.T, dtype=np.float32).ravel()
         buf[16:32] = np.ascontiguousarray(model.T, dtype=np.float32).ravel()
         nmat_t = np.ascontiguousarray(normal_mat.T, dtype=np.float32)  # nmat_t[c] = column c
@@ -928,6 +1176,7 @@ class WgpuRenderer:
         buf[36:39] = nmat_t[1]
         buf[40:43] = nmat_t[2]
         buf[44] = float(face_offset)
+        buf[48:64] = np.ascontiguousarray(tex_meta, dtype=np.float32).ravel()
         return buf.tobytes()
 
     def _pack_frame_uniforms(self, scene, camera, env, lights, vols) -> bytes:
@@ -1122,7 +1371,7 @@ class WgpuRenderer:
 
         pass_enc.set_bind_group(0, self._frame_bind_group)
 
-        def _draw(entity, rmesh, off) -> int:
+        def _draw(entity, rmesh, off, bindings) -> int:
             geo = self._get_geo_cache(rmesh)
             ent = self._get_entity_uniforms(entity)
             model = entity.transform.matrix()
@@ -1131,13 +1380,17 @@ class WgpuRenderer:
                 nmat = np.linalg.inv(model[:3, :3]).T
             except np.linalg.LinAlgError:
                 nmat = np.eye(3)
+            tex_meta, tex_views = self._tex_meta_and_views(bindings)
+            tex_bg = self._get_entity_tex_bind_group(entity, tex_views)
             self.device.queue.write_buffer(
-                ent["ubo"], 0, self._pack_entity_uniforms(mvp, model, nmat, off))
+                ent["ubo"], 0, self._pack_entity_uniforms(mvp, model, nmat, off, tex_meta))
             pass_enc.set_bind_group(1, ent["bind_group"])
+            pass_enc.set_bind_group(2, tex_bg)
             pass_enc.set_vertex_buffer(0, geo["geom_buf"])
             pass_enc.set_vertex_buffer(1, geo["color_buf"])
             pass_enc.set_vertex_buffer(2, geo["pbr_buf"])
             pass_enc.set_vertex_buffer(3, geo["opacity_buf"])
+            pass_enc.set_vertex_buffer(4, geo["uv_buf"])
             pass_enc.draw(geo["count"])
             return geo["count"] // 3
 
@@ -1149,7 +1402,15 @@ class WgpuRenderer:
 
         pass_enc.set_pipeline(self._mesh_pipeline)
         for entity, rmesh, off in opaque_pairs:
-            triangles += _draw(entity, rmesh, off)
+            # Per-pixel texturing bindings come from the entity's own
+            # material, exactly as GLRenderer's opaque-pass loop reads them
+            # -- translucent entities never resolve real bindings (see
+            # translucent_pairs below, which always passes {} to match the
+            # CPU path never populating `tex_entities` for a translucent
+            # entity at all).
+            material = getattr(entity, "material", None)
+            bindings = material.direct_texture_bindings() if material is not None else {}
+            triangles += _draw(entity, rmesh, off, bindings)
 
         if translucent_pairs:
             # Back-to-front per-entity order, mirroring GLRenderer's
@@ -1161,7 +1422,7 @@ class WgpuRenderer:
                     p[0].transform.matrix()[:3, 3] - cam_pos)))
             pass_enc.set_pipeline(self._mesh_translucent_pipeline)
             for entity, rmesh, off in translucent_pairs:
-                triangles += _draw(entity, rmesh, off)
+                triangles += _draw(entity, rmesh, off, {})
         pass_enc.end()
         self.device.queue.submit([encoder.finish()])
 
@@ -1188,6 +1449,9 @@ class WgpuRenderer:
         for cache in self._env_tex_cache.values():
             cache["tex"].destroy()
         self._env_tex_cache.clear()
+        for cache in self._material_tex_cache.values():
+            cache["tex"].destroy()
+        self._material_tex_cache.clear()
         if self._color_tex is not None:
             self._color_tex.destroy()
             self._depth_tex.destroy()
@@ -1195,3 +1459,4 @@ class WgpuRenderer:
         self._gi_tex.destroy()
         self._ies_tex.destroy()
         self._dummy_env_tex.destroy()
+        self._dummy_tex.destroy()

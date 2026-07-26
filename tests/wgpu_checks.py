@@ -1,4 +1,15 @@
-"""Judge checks for the wgpu backend: DX12 parity vs GL/CPU + correctness."""
+"""Judge checks for the wgpu backend: DX12 parity vs GL/CPU + correctness.
+
+Sections 8-11 cover per-pixel texturing run 4/4 (wgpu/dx12), mirroring
+gl_checks.py's sections 7-10 (its run 3/4 equivalent): a byte-identical-
+with-main regression gate for untextured scenes (engine/wgpu_renderer.py's
+UV vertex buffer + WGSL texture sampling must be a pure no-op when no
+material directly binds a texture), real per-pixel variation within one
+GPU-rasterized face (not vacuous) with a multiply-wrapped fallback control,
+wgpu-vs-CPU textured parity with a numerically-justified tolerance PLUS a
+discrimination check (the fallback control must blow past that tolerance),
+and tiling reaching the WGSL sampler.
+"""
 import os
 import sys
 import tempfile
@@ -12,6 +23,8 @@ import numpy as np
 import pygame
 
 import engine
+from engine import mesh as mesh_mod
+from engine import texture as texture_mod
 from engine.gl_renderer import GLRenderer
 from engine.renderer import Renderer
 from engine.wgpu_renderer import WgpuRenderer
@@ -272,5 +285,175 @@ assert img_dark_off_dx.max() <= 2, f"expected near-black with no lights/emissive
 assert img_dark_emis_dx.max() > 100, f"emissive face not bright in the dark on dx12: {img_dark_emis_dx.max()}"
 print(f"dx12 emissive-in-dark OK: off max={img_dark_off_dx.max():.0f} "
       f"emissive max={img_dark_emis_dx.max():.0f}")
+
+# ---------------------------------------------------------------------
+# 8. UNTEXTURED REGRESSION GATE: this run's shader/geometry changes (UV
+#    vertex buffer in `_get_geo_cache`, bind group 2 + tex_meta uniforms,
+#    the base_color/roughness_v/metallic_v/emissive_v override locals in
+#    fs_main) must not move a single pixel on a scene with no direct
+#    texture bindings. `perpixel_wgpu_untextured_golden.npy` was captured
+#    from a `git worktree add ... main` at e298d80 (this run's branch
+#    point), rendering the SAME `build_scene()`/`cam` as the parity check
+#    at the top of this file through `WgpuRenderer("dx12")` at the same
+#    400x300 -- confirmed reproducible (rendered twice in the SAME worktree
+#    process, 0 diff, AND re-rendered in a SEPARATE fresh process against
+#    the saved .npy, 0 diff -- not just "captured carefully") before being
+#    treated as golden, same discipline as texture_checks.py's CPU golden
+#    and gl_checks.py's GL golden.
+# ---------------------------------------------------------------------
+_golden_path = os.path.join(REPO, "tests", "fixtures", "perpixel_wgpu_untextured_golden.npy")
+assert os.path.exists(_golden_path), f"no golden at {_golden_path}"
+_golden = np.load(_golden_path).astype(np.int32)
+_wcurrent = img_dx.astype(np.int32)  # same scene/cam/resolution as the top-of-file parity check
+_wdiff = np.abs(_wcurrent - _golden)
+assert _wdiff.max() == 0 and _wdiff.mean() == 0.0, (
+    f"UNTEXTURED REGRESSION: dx12 render differs from main by up to {_wdiff.max()} "
+    f"(mean {_wdiff.mean()}) on a scene with no direct texture bindings")
+print(f"8. untextured regression gate OK: 0 of {_golden.shape[0] * _golden.shape[1]} pixels "
+     "differ vs a main (e298d80) dx12 render of the identical scene")
+
+# ---------------------------------------------------------------------
+# Per-pixel texturing (run 4/4): same quad-scene model as gl_checks.py's
+# sections 8-10 (its own run 3/4 equivalent) and texture_checks.py's #17,
+# extended with a wgpu-vs-CPU pixel comparison, a discrimination check, and
+# a tiling check. See engine/wgpu_renderer.py's `_get_material_tex_view` /
+# `_tex_meta_and_views` / `tex_texel()`+sample_port_vec3/scalar in _MESH_WGSL.
+# ---------------------------------------------------------------------
+_tex_tmp = os.path.join(TMP, "judge_perpixel_run4_assets")
+_tex_dir = os.path.join(_tex_tmp, "textures")
+os.makedirs(_tex_dir, exist_ok=True)
+_tex_path = os.path.join(_tex_dir, "grad.png")
+_grad_surf = pygame.Surface((8, 8))
+for _yy in range(8):
+    for _xx in range(8):
+        _grad_surf.set_at((_xx, _yy), (_xx * 32 % 256, _yy * 32 % 256, (_xx * 7 + _yy * 13) % 256))
+pygame.image.save(_grad_surf, _tex_path)
+texture_mod.set_texture_root(_tex_tmp)
+texture_mod.clear_cache()
+
+_quad_verts = [(-2, -2, -5), (2, -2, -5), (2, 2, -5), (-2, 2, -5)]  # box-projected UVs vary 0..1 across it
+_quad_cam = engine.Camera(position=engine.Vec3(0.0, 0.0, 0.0), yaw=0.0, pitch=0.0)
+
+
+def _build_quad_scene(direct_bind: bool, u_tiling: float = 1.0, v_tiling: float = 1.0):
+    scene9 = engine.Scene(light=engine.DirectionalLight(
+        engine.Vec3(0, -1, 0), ambient=1.0, color=(255, 255, 255), intensity=0.0))
+    ent9 = engine.Entity("quad", mesh=mesh_mod.Mesh(_quad_verts, [(0, 1, 2, 3)]))
+    g9 = engine.MaterialGraph()
+    ts9 = g9.add("tex_sample", (0, 0))
+    g9.nodes[ts9]["texture"] = "textures/grad.png"
+    if direct_bind:
+        if u_tiling != 1.0 or v_tiling != 1.0:
+            tc9 = g9.add("tex_coord", (0, 0))
+            g9.nodes[tc9]["params"]["u_tiling"] = u_tiling
+            g9.nodes[tc9]["params"]["v_tiling"] = v_tiling
+            assert g9.connect(tc9, ts9, "uv")
+        assert g9.connect(ts9, g9.output_id(), "base_color", "RGB")
+    else:
+        mul9 = g9.add("multiply", (0, 0))
+        one9 = g9.add("constant3vector", (0, 0))
+        assert g9.connect(ts9, mul9, "a", "RGB")
+        assert g9.connect(one9, mul9, "b")
+        assert g9.connect(mul9, g9.output_id(), "base_color")
+    ent9.material = g9
+    g9.apply(ent9)
+    scene9.add(ent9)
+    return scene9
+
+
+_QW, _QH = 200, 150
+
+
+def _wgpu_quad_frame(scene9):
+    wr.render(scene9, _quad_cam, (_QW, _QH))
+    return np.frombuffer(wr.read_frame(), np.uint8).reshape(_QH, _QW, 4)[..., :3]
+
+
+_bg9 = np.asarray(engine.Scene().background)
+_img_dx_direct = _wgpu_quad_frame(_build_quad_scene(True)).astype(np.int32)
+_mask9 = ~np.all(_img_dx_direct == _bg9[None, None, :], axis=2)
+_distinct_dx_direct = len(np.unique(_img_dx_direct[_mask9].reshape(-1, 3), axis=0))
+
+_img_dx_fallback = _wgpu_quad_frame(_build_quad_scene(False)).astype(np.int32)
+_mask9b = ~np.all(_img_dx_fallback == _bg9[None, None, :], axis=2)
+_distinct_dx_fallback = len(np.unique(_img_dx_fallback[_mask9b].reshape(-1, 3), axis=0))
+
+assert _mask9.sum() > 1000, "quad should cover a substantial part of the frame"
+assert _distinct_dx_direct > 50, f"expected many distinct colors from wgpu per-pixel sampling, got {_distinct_dx_direct}"
+assert _distinct_dx_fallback == 1, f"expected exactly 1 color from the per-face bake control, got {_distinct_dx_fallback}"
+print(f"9. dx12 per-pixel variation OK (not vacuous): direct-bind base_color shows "
+     f"{_distinct_dx_direct} distinct colors across {int(_mask9.sum())} pixels of ONE "
+     f"face on the GPU; multiply-wrapped fallback (same graph, same face) gives exactly "
+     f"{_distinct_dx_fallback} -- confirms the WGSL tex_texel() sampler, not lighting, is "
+     "the source of variation")
+
+# 10. dx12-vs-CPU textured parity + discrimination. render_scale MUST be
+#     forced to 1 for a fair full-resolution comparison -- the default (3)
+#     renders the CPU path at 1/3 internal resolution then upscales, which
+#     alone produces a much larger, meaningless diff at texel-cell
+#     boundaries (see gl_checks.py's identical note; measured here too:
+#     forcing scale=1 is what keeps these numbers meaningful).
+_r10 = Renderer()
+_r10.render_scale = 1
+_surf_cpu10 = pygame.Surface((_QW, _QH))
+_r10.render(_surf_cpu10, _build_quad_scene(True), _quad_cam)
+_img_cpu_direct = pygame.surfarray.array3d(_surf_cpu10).transpose(1, 0, 2).astype(np.int32)
+_pdiff = np.abs(_img_dx_direct - _img_cpu_direct)
+_pndiff = int((_pdiff.sum(axis=2) > 0).sum())
+_pfrac = _pndiff / (_QW * _QH)
+# Tolerance, justified by measurement (this exact scene, numbers found
+# during implementation): mean diff 0.266, max diff 212, 173/30000 (0.58%)
+# differing pixels -- essentially identical to gl_checks.py's own run-3
+# numbers for the same scene/texture. The nonzero diffs are NEAREST-
+# neighbor texel-boundary aliasing: dx12's hardware-rasterized, per-vertex-
+# interpolated UV and the CPU's numpy barycentric world-space math are two
+# independently-implemented, both-correct interpolants that can disagree by
+# one texel index right at a shared cell edge; this test texture is a
+# deliberately maximal-contrast 8x8 gradient so a single-texel edge miss
+# shows up as a big color jump. Bounding at mean<3.0 / differing-fraction<3%
+# is >10x the measured 0.266 / 0.58% -- tight enough that a real sampling
+# bug (wrong channel, wrong UV, missing tiling, wrong V orientation -- any
+# of which would desync entire regions, not just edge pixels) would blow
+# through it, loose enough not to be a coin-flip on rasterizer rounding.
+assert _pdiff.mean() < 3.0, f"dx12/CPU textured mean diff too high: {_pdiff.mean():.3f}"
+assert _pfrac < 0.03, f"dx12/CPU textured differing-pixel fraction too high: {_pfrac:.4f}"
+print(f"10. textured parity OK: mean diff={_pdiff.mean():.3f} (tolerance <3.0), "
+     f"max diff={_pdiff.max()}, {_pndiff}/{_QW * _QH} differing px "
+     f"({100 * _pfrac:.2f}%, tolerance <3%) -- diffs are nearest-neighbor "
+     "texel-boundary aliasing between two independent rasterizers, not a "
+     "systematic bug (both rendered at render_scale=1 -- see comment above)")
+
+# 10b. DISCRIMINATION CHECK: the gate above is only meaningful if a real
+# sampling bug would actually blow through it. Compare the wgpu FALLBACK
+# render (multiply-wrapped tex_sample -> falls back to the per-face bake,
+# same failure mode as a broken direct-binding implementation) against the
+# CPU's correct direct-bind reference -- this simulates exactly what
+# tolerance #10 exists to catch.
+_disc_diff = np.abs(_img_dx_fallback - _img_cpu_direct)
+_disc_ndiff = int((_disc_diff.sum(axis=2) > 0).sum())
+_disc_frac = _disc_ndiff / (_QW * _QH)
+assert _disc_diff.mean() > 3.0 and _disc_frac > 0.03, (
+    f"discrimination check FAILED: a broken (flat per-face) render only differs by "
+    f"mean={_disc_diff.mean():.3f} frac={_disc_frac:.4f} -- tolerance #10 would not catch it")
+print(f"10b. discrimination check OK: a flat per-face fallback (simulating a broken "
+     f"per-pixel implementation) diverges from the CPU reference by mean="
+     f"{_disc_diff.mean():.3f} ({100*_disc_frac:.2f}% differing px) -- both well past the "
+     "mean<3.0/3% gate above, confirming it isn't a rubber stamp")
+
+# 11. tiling reaches the WGSL sampler: u_tiling/v_tiling actually change the
+#     dx12 render (still samples the same 8x8 palette -- repeats, doesn't
+#     distort or go out of range -- while visibly differing from untiled).
+_img_dx_tiled = _wgpu_quad_frame(_build_quad_scene(True, u_tiling=3.0, v_tiling=3.0)).astype(np.int32)
+_mask9c = ~np.all(_img_dx_tiled == _bg9[None, None, :], axis=2)
+_distinct_dx_tiled = len(np.unique(_img_dx_tiled[_mask9c].reshape(-1, 3), axis=0))
+assert _distinct_dx_tiled > 50, f"tiled dx12 render should still sample the full palette, got {_distinct_dx_tiled}"
+assert not np.array_equal(_img_dx_tiled, _img_dx_direct), "tiling=3 must render differently than tiling=1 on dx12"
+print(f"11. dx12 tiling OK: {_distinct_dx_tiled} distinct colors (still the full palette, "
+     "repeated), differs from the untiled dx12 render")
+
+texture_mod.clear_cache()
+texture_mod.set_texture_root(os.path.join(REPO, "assets"))
+import shutil as _shutil10
+_shutil10.rmtree(_tex_tmp, ignore_errors=True)
 
 print("JUDGE DX12 CHECKS PASSED")
