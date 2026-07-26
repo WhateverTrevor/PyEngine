@@ -24,7 +24,7 @@ import numpy as np
 
 from . import behaviors as behaviors_mod
 from . import mesh as mesh_mod
-from .blueprint import DEFAULT_BLUEPRINT_SCRIPT
+from .blueprint import DEFAULT_BLUEPRINT_SCRIPT, instantiate_behavior
 from .camera import Camera
 from .environment import Environment, load_hdr
 from .lighting import DirectionalLight, Fog, FogVolume, PointLight, SpotLight, SunDisc
@@ -182,14 +182,28 @@ class BlueprintAsset:
          "script": "<python source>", "compile_result": dict | None}
     `rotation` is Euler radians, same convention as `Transform.rotation`.
 
+    Already-placed vs re-placed (posed mesh AND script, same rule for both):
+    an instance placed in the scene does NOT retroactively pick up a later
+    edit to this asset -- its mesh was merged and its Behavior compiled at
+    the moment `instantiate()` ran, and both are then owned by that Entity
+    alone. Editing the script/components and dragging a FRESH instance from
+    the content browser picks up the edit; the old instance keeps running
+    whatever it compiled against when it was placed. Matches every other
+    asset type here (see engine/assets.py's `AssetDef.instantiate` and
+    editor.py's `_duplicate_selected`, which both re-instantiate from
+    scratch rather than mutating a live entity in place).
+
     `instantiate()` resolves each component's `asset_name` through the
     library, merges the posed meshes into ONE composite entity (see
-    `instantiate`'s own docstring for why one entity, not N) -- this run is
-    MESH-ONLY: a component asset's light/sun/fog_volume/environment aspects
-    are ignored entirely, only its LOD0 `.mesh` is used. Attaching the
-    compiled script's Behavior to the instantiated entity, and guarding
-    against infinite loops in that Behavior's update, are run 2b's job
-    (engine/blueprint.py's compile_blueprint), not this one's.
+    `instantiate`'s own docstring for why one entity, not N) -- this is
+    still MESH-ONLY: a component asset's light/sun/fog_volume/environment
+    aspects are ignored entirely, only its LOD0 `.mesh` is used. The script
+    half: `instantiate()` also compiles `self.script` (via
+    engine/blueprint.py's `instantiate_behavior`, worker-thread timeout
+    guard included) and attaches the resulting error-isolated Behavior to
+    the entity, so a placed blueprint runs its own code per-frame. A blank,
+    non-compiling, or Behavior-less script just means no behavior gets
+    attached -- the entity still places fine as a static posed mesh.
     """
 
     def __init__(self, data: dict, path: str):
@@ -216,13 +230,13 @@ class BlueprintAsset:
 
         One entity, not N: engine/scene.py's Entity has no parent/child
         hierarchy, so N loose entities would break the gizmo, selection,
-        save/load, and would leave run 2b's Behavior attach without a
-        single owner to attach to. A component naming a missing asset is
-        skipped (logged, never raised) so one bad component can't break
-        the whole blueprint. A blueprint with zero (usable) components
-        returns an entity with mesh=None -- callers (render_mesh,
-        base_height, etc.) already handle that for light-only/pseudo
-        entities, so this is not a new case for them.
+        save/load, and would leave the compiled script's Behavior (attached
+        below) without a single owner to attach to. A component naming a
+        missing asset is skipped (logged, never raised) so one bad
+        component can't break the whole blueprint. A blueprint with zero
+        (usable) components returns an entity with mesh=None -- callers
+        (render_mesh, base_height, etc.) already handle that for
+        light-only/pseudo entities, so this is not a new case for them.
         """
         entity = Entity(name or self.name)
         entity.blueprint_name = self.name
@@ -244,6 +258,14 @@ class BlueprintAsset:
                          Vec3(*comp.get("scale", (1.0, 1.0, 1.0))))
             parts.append((comp_mesh, t.matrix()))
         entity.mesh = merge_meshes(parts)
+        if self.script.strip():
+            from . import console_log
+            behavior = instantiate_behavior(self.script, self.name)
+            if behavior is not None:
+                entity.add_behavior(behavior)
+                console_log.log_info(
+                    f"blueprint '{self.name}': attached Behavior "
+                    f"'{behavior.inner.__class__.__name__}' to '{entity.name}'")
         return entity
 
 

@@ -39,14 +39,20 @@ survival horror game. Repo: https://github.com/WhateverTrevor/PyEngine.
 
 ## Verification (run these as judge; all must pass before merging)
 
-The battery is now **26 suites** (`py tests\<name>.py`). Name ALL of them in
+The battery is now **27 suites** (`py tests\<name>.py`). Name ALL of them in
 every engine-coder brief and run every one before merging:
 smoke_test, gl_checks, wgpu_checks, env_checks, window_checks, browser_checks,
 toolbar_checks, texture_checks, material_checks, mat_ui_checks, pbr_checks,
 transparency_checks, snap_checks, multiselect_checks, pivot_checks,
 marquee_checks, cursor_checks, docktab_checks, import_checks, lod_checks,
 blueprint_checks, console_checks, fps_checks, async_bake_checks, bvh_checks,
-bp_component_checks.
+bp_component_checks, bp_runtime_checks.
+
+- `bp_runtime_checks` takes ~80s, most of it one 15-frame render — it holds
+  a live runaway thread on purpose (see below) and a moving shadow caster.
+  That's expected, not a hang. Anything that leaves an extra ANIMATED
+  caster in its scene makes that render ~8x worse; remove such entities
+  once they've proved their point.
 
 - **Exit code is the pass signal.** Most suites also print an
   "ALL ... PASSED"/"JUDGE ... PASSED" line, but `window_checks`,
@@ -74,19 +80,24 @@ bp_component_checks.
 
 ## Known gaps / natural backlog
 
-- Blueprint RUNTIME (run 2b, the remaining half of the blueprint feature):
-  posed-mesh `components` + composite instantiation + the compose UI
-  shipped in run 2a. Still TODO: attach the compiled Behavior to an
-  instantiated blueprint entity and run it per-frame with per-entity error
-  isolation (catch update errors, log once, disable a repeatedly-failing
-  behavior rather than spamming). Also: NO infinite-loop guard on script
-  exec — a `while True:` hangs the editor (worker-thread timeout is the
-  fix). Smaller follow-ups from 2a's review: blueprint instantiation is
-  MESH-ONLY (a component asset's light/sun/fog_volume/environment aspects
-  are ignored); an already-placed instance does not auto-update when its
-  blueprint changes; and `bp_component_checks` drives Ctrl+D/Del by
-  calling `_duplicate_selected`/`_delete_selected` directly instead of
-  through the real key path.
+- Blueprint feature is COMPLETE (runs 2a + 2b): posed-mesh `components`,
+  composite instantiation, compose UI, drag-place, runtime Behavior attach
+  with per-entity error isolation, and the exec timeout guard. Residual
+  limitations, in rough priority order:
+  - **A timed-out script is abandoned, not stopped** — CPython cannot kill
+    a thread. Each survivor burns a core and contends for the GIL: measured
+    8.8 FPS clean → 0.66 with one alive (13x) on the starter scene's CPU
+    renderer. Capped at `MAX_RUNAWAY_THREADS` = 2 so it can't accumulate,
+    and the user is told to restart, but the first one's cost is real. The
+    only true fix is OS-process isolation (subprocess + kill) — a genuine
+    feature, and the natural run 3 if this ever bites in practice.
+  - An infinite loop inside a Behavior's `update()` (as opposed to module
+    level) still hangs the frame — the guard covers script exec only.
+  - Blueprint instantiation is MESH-ONLY: a component asset's light / sun /
+    fog_volume / environment aspects are ignored. A lamp component won't
+    actually light anything.
+  - An already-placed instance does not auto-update when its blueprint
+    changes; re-placing picks up edits (matches every other asset type).
 - wgpu directional (sun) shadow attenuation on mesh faces (GL's dlShadowTex)
   — the last wgpu visual gap.
 - Per-pixel texturing (materials bake per-face; would unlock texture-mapped

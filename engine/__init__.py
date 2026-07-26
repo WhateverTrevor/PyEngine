@@ -1,7 +1,8 @@
 """PyEngine — a compact real-time 3D game engine in pure Python (pygame + numpy)."""
 from . import behaviors
 from .assets import AssetLibrary, BlueprintAsset, MaterialAsset, load_scene, save_scene
-from .blueprint import DEFAULT_BLUEPRINT_SCRIPT, compile_blueprint
+from .blueprint import (DEFAULT_BLUEPRINT_SCRIPT, BlueprintBehaviorProxy, compile_blueprint,
+                        compile_blueprint_with_class, instantiate_behavior)
 from .camera import Camera
 from .core import Engine
 from .environment import Environment, import_hdri, load_hdr, save_hdr
@@ -26,7 +27,8 @@ __all__ = [
     "export_asset_fbx", "fbx_fit_scale", "has_mesh", "import_texture", "texture",
     "MaterialGraph", "NODE_DEFS", "NODE_OUTPUTS", "PARAM_RANGES",
     "AssetLibrary", "MaterialAsset", "save_scene", "load_scene",
-    "BlueprintAsset", "compile_blueprint", "DEFAULT_BLUEPRINT_SCRIPT",
+    "BlueprintAsset", "compile_blueprint", "compile_blueprint_with_class",
+    "instantiate_behavior", "BlueprintBehaviorProxy", "DEFAULT_BLUEPRINT_SCRIPT",
     "ShadowTracer", "GITracer", "pick_entity",
     "behaviors",
 ]

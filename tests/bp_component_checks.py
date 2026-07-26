@@ -145,6 +145,18 @@ def type_text(s: str) -> None:
         key(pygame.K_a, unicode=ch)  # physical key doesn't matter, only e.unicode
 
 
+def ctrl_key(k) -> None:
+    """A KEYDOWN for `k` with Ctrl reported held -- editor.py's Ctrl+D
+    binding reads the modifier via `inp.held(pygame.K_LCTRL)` (pygame.key.
+    get_pressed()), not the KEYDOWN event's own `mod` field, so held
+    modifiers need the OS-boundary patch per the project's UI-test rule
+    (see marquee_checks.py / snap_checks.py) -- a plain KEYDOWN with
+    mod=KMOD_CTRL alone would NOT trigger it."""
+    with um.patch.object(pygame.key, "get_pressed",
+                         return_value=FakeKeys(held=(pygame.K_LCTRL,))):
+        step([pygame.event.Event(pygame.KEYDOWN, key=k, unicode="", mod=pygame.KMOD_CTRL)])
+
+
 try:
     # ========================================================================
     # 1. merge_meshes: byte-identical single-component-at-identity gate
@@ -274,23 +286,27 @@ try:
     print("6b. press+drag-beyond-threshold+release-over-viewport places one entity OK")
 
     # ========================================================================
-    # 7. Ctrl+D duplicate and Del delete of a blueprint instance
+    # 7. Ctrl+D duplicate and Del delete of a blueprint instance -- driven
+    #    through the REAL key event path (eng.input.process + editor.update),
+    #    not by calling _duplicate_selected()/_delete_selected() directly
+    #    (that was this suite's own violation of the project's UI-test rule
+    #    -- see ctrl_key()'s docstring for why Ctrl needs the held-key patch)
     # ========================================================================
     editor.selected = placed
     editor.selection = [placed]
     n_before = len(scene.entities)
-    editor._duplicate_selected()
+    ctrl_key(pygame.K_d)
     assert len(scene.entities) == n_before + 1, "Ctrl+D must duplicate a blueprint instance"
     dup = editor.selected
     assert dup is not placed and dup.blueprint_name == "PlaceableBP"
-    print("7a. Ctrl+D duplicate of a blueprint instance OK")
+    print("7a. Ctrl+D duplicate of a blueprint instance OK (real key event)")
 
     editor.selection = [dup]
     editor.selected = dup
     n_before = len(scene.entities)
-    editor._delete_selected()
+    key(pygame.K_DELETE)
     assert len(scene.entities) == n_before - 1 and dup not in scene.entities
-    print("7b. Del delete of a blueprint instance OK")
+    print("7b. Del delete of a blueprint instance OK (real key event)")
 
     # ========================================================================
     # 8. scene save/load round-trip for a blueprint instance

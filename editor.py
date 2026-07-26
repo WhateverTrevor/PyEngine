@@ -5508,8 +5508,14 @@ class ScriptEditorUI:
     """Blueprint Python-script editor: a real multi-line text buffer with a
     line-number gutter, arrow-key/Home/End caret navigation, and an
     in-engine Compile step (engine.blueprint.compile_blueprint) that
-    catches SyntaxError, definition-time exceptions, and a missing
-    Behavior subclass without ever crashing or hanging the editor.
+    catches SyntaxError, definition-time exceptions, a missing Behavior
+    subclass, and (this run) a module-level infinite loop (the exec stage
+    runs on a worker thread with a timeout -- see engine/blueprint.py's
+    module docstring for the honest limit of what that guard does and
+    doesn't do) without ever crashing or hanging the editor. The compiled
+    Behavior itself is attached and run per-frame on a placed instance --
+    see engine.assets.BlueprintAsset.instantiate and
+    engine.blueprint.instantiate_behavior/BlueprintBehaviorProxy.
 
     Floating window, same chrome as MaterialEditorUI: drag the title bar
     to move it, X/Esc closes (both auto-save, see `close()`). No
